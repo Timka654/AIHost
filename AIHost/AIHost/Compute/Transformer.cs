@@ -14,7 +14,6 @@ public class Transformer : IDisposable
     private readonly int _numLayers;
     private readonly int _dModel;
     private readonly int _numHeads;
-    private readonly int _vocabSize;
     private bool _disposed;
 
     // Model weights
@@ -35,13 +34,8 @@ public class Transformer : IDisposable
         _numLayers = metadata.GetValue<int>(GGUFMetadata.KeyBlockCount, 22);
         _dModel = metadata.GetValue<int>(GGUFMetadata.KeyEmbeddingLength, 2048);
         _numHeads = metadata.GetValue<int>(GGUFMetadata.KeyAttentionHeadCount, 32);
-        _vocabSize = metadata.GetValue<int>(GGUFMetadata.KeyVocabSize, 32000);
 
-        Console.WriteLine($"Transformer initialized:");
-        Console.WriteLine($"  Layers: {_numLayers}");
-        Console.WriteLine($"  d_model: {_dModel}");
-        Console.WriteLine($"  Num heads: {_numHeads}");
-        Console.WriteLine($"  Vocab size: {_vocabSize}\n");
+        Console.WriteLine($"Transformer initialized: layers={_numLayers} d_model={_dModel} heads={_numHeads}");
     }
 
     /// <summary>

@@ -12,32 +12,6 @@ namespace AIHost.Compute;
 /// </summary>
 public static class QuantizationFormats
 {
-    // Common GLSL helpers shared by all shaders
-    private const string GlslHelpers = @"
-float f16tof32(uint h) {
-    uint s = (h >> 15u) & 1u;
-    uint e = (h >> 10u) & 31u;
-    uint m = h & 1023u;
-    if (e == 0u) {
-        if (m == 0u) return s != 0u ? -0.0 : 0.0;
-        e = 1u;
-        while ((m & 1024u) == 0u) { m <<= 1u; e -= 1u; }
-        m &= 1023u;
-    } else if (e == 31u) {
-        return m != 0u ? uintBitsToFloat(0x7FC00000u) :
-               (s != 0u ? uintBitsToFloat(0xFF800000u) : uintBitsToFloat(0x7F800000u));
-    }
-    e = e - 15u + 127u;
-    return uintBitsToFloat((s << 31u) | (e << 23u) | (m << 13u));
-}
-uint readU8(uint off) {
-    return (inBuf.data[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu;
-}
-uint readU16(uint off) {
-    return readU8(off) | (readU8(off + 1u) << 8u);
-}
-";
-
     /// <summary>
     /// Q2_K: 256 elements, 84 bytes/block
     ///   scales[16] low-nibble = scale factor, high-nibble = min factor
