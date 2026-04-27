@@ -53,13 +53,17 @@ public class Transformer : IDisposable
 
         // Token embedding
         _tokenEmbedding = LoadWeight("token_embd.weight");
+#if DEEP_DEBUG
         Console.WriteLine($"  token_embd.weight: {_tokenEmbedding.Shape}");
+#endif
 
         // Output layers
         _outputNormWeight = LoadWeight("output_norm.weight");
         _outputWeight = LoadWeight("output.weight");
+#if DEEP_DEBUG
         Console.WriteLine($"  output_norm.weight: {_outputNormWeight.Shape}");
         Console.WriteLine($"  output.weight: {_outputWeight.Shape}");
+#endif
 
         Console.WriteLine($"✓ Weights loaded\n");
     }
@@ -73,30 +77,39 @@ public class Transformer : IDisposable
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
 
         int seqLen = tokenIds.Length;
+#if DEEP_DEBUG
         Console.WriteLine($"Forward pass: {seqLen} tokens starting at position {startPosition}");
+#endif
 
         // 1. Token embedding lookup
         var x = EmbeddingLookup(_tokenEmbedding, tokenIds);
+#if DEEP_DEBUG
         Console.WriteLine($"  Embedding: {x.Shape}");
+#endif
 
         // 2. Apply all transformer layers
         for (int i = 0; i < _numLayers; i++)
         {
+#if DEEP_DEBUG
             if (i % 5 == 0 || i == _numLayers - 1)
                 Console.WriteLine($"  Applying layer {i}/{_numLayers}...");
-
+#endif
             x = ApplyLayer(x, i, startPosition, kvCache);
             _device.Synchronize();
         }
 
         // 3. Final layer norm
         _ops.LayerNorm(x, _outputNormWeight!);
+#if DEEP_DEBUG
         Console.WriteLine($"  Final norm: {x.Shape}");
+#endif
 
         // 4. Project to vocab
         var logits = _ops.MatMul(x, _outputWeight!, "logits");
         x.Dispose();
+#if DEEP_DEBUG
         Console.WriteLine($"  Logits: {logits.Shape}");
+#endif
 
         return logits;
     }

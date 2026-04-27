@@ -521,7 +521,9 @@ public class ComputeOps : IDisposable
     /// </summary>
     public Tensor MultiHeadAttention(Tensor Q, Tensor K, Tensor V, int numHeads, string? resultName = null)
     {
+#if DEEP_DEBUG
         Console.WriteLine($"  [MHA Debug] Q shape: {Q.Shape}, K shape: {K.Shape}, V shape: {V.Shape}");
+#endif
         
         if (Q.Shape.Rank != 2 || K.Shape.Rank != 2 || V.Shape.Rank != 2)
             throw new ArgumentException("Q, K, V must be 2D tensors");
@@ -693,29 +695,30 @@ public class ComputeOps : IDisposable
 
         // 1.2 Q, K, V projections
         var Q = MatMul(xNorm, wQ, "Q");
-        Console.WriteLine($"  [TransLayer Debug] After MatMul: Q shape = {Q.Shape}");
         var K = MatMul(xNorm, wK, "K");
-        Console.WriteLine($"  [TransLayer Debug] After MatMul: K shape = {K.Shape}, wK shape = {wK.Shape}");
         var V = MatMul(xNorm, wV, "V");
-        Console.WriteLine($"  [TransLayer Debug] After MatMul: V shape = {V.Shape}");
+#if DEEP_DEBUG
+        Console.WriteLine($"  [TransLayer] Q={Q.Shape} K={K.Shape} V={V.Shape} wK={wK.Shape}");
+#endif
         xNorm.Dispose();
 
         // 1.3 Multi-head attention with KV-cache
         Tensor attnOut;
         if (kvCache != null)
         {
-            Console.WriteLine($"  [KVCache Debug] Before Add: layer={layerIdx}, K shape={K.Shape}, V shape={V.Shape}");
-            
+#if DEEP_DEBUG
+            Console.WriteLine($"  [KVCache] layer={layerIdx} K={K.Shape} V={V.Shape}");
+#endif
             // Add current K, V to cache (will concatenate internally)
             kvCache.Add(layerIdx, K, V);
-            
+
             // Get full cached K, V for attention
             var (cachedK, cachedV) = kvCache.Get(layerIdx);
             if (cachedK == null || cachedV == null)
                 throw new InvalidOperationException($"Failed to retrieve cached K,V for layer {layerIdx}");
-            
-            Console.WriteLine($"  [KVCache Debug] After Get: cachedK shape={cachedK.Shape}, cachedV shape={cachedV.Shape}");
-            Console.WriteLine($"  [KVCache Debug] Q shape={Q.Shape} for attention");
+#if DEEP_DEBUG
+            Console.WriteLine($"  [KVCache] cached K={cachedK.Shape} V={cachedV.Shape} Q={Q.Shape}");
+#endif
             
             // Use cached K, V for attention
             attnOut = MultiHeadAttention(Q, cachedK, cachedV, numHeads, "attn_out");
