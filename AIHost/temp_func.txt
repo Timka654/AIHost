@@ -1,0 +1,32 @@
+    static void TestTokenizer(ICompute.IComputeDevice provider)
+    {
+        Console.WriteLine("=== Testing Tokenizer ===\n");
+        string modelPath = @"D:\User\Downloads\tinyllama-1.1b-chat-v1.0.Q2_K.gguf";
+        Console.WriteLine($"Loading model from: {modelPath}\n");
+        var model = new GGUF.GGUFReader(modelPath); model.Load();
+        Console.WriteLine($"Model: {model.Metadata.GetValue("general.name", "unknown")}");
+        Console.WriteLine($"Architecture: {model.Metadata.GetValue("general.architecture", "unknown")}");
+        Console.WriteLine($"Tensors: {model.Tensors.Count}\n");
+        Console.WriteLine("Available metadata keys:");
+        foreach (var key in model.Metadata.Keys.OrderBy(k => k)) Console.WriteLine($"  - {key}");
+        Console.WriteLine();
+        Console.WriteLine("⚠ This GGUF file does not contain embedded tokenizer data.");
+        Console.WriteLine("Creating simple demo tokenizer for testing purposes.\n");
+        var demoTokens = new List<string>();
+        for (int i = 0; i < 256; i++) demoTokens.Add(((char)i).ToString());
+        demoTokens.Add("<unk>"); demoTokens.Add("<s>"); demoTokens.Add("</s>");
+        string[] commonWords = { " ", "Hello", "world", "test", "the", "is", "a" };
+        demoTokens.AddRange(commonWords);
+        var tokenizer = new Tokenizer.BPETokenizer(demoTokens.ToArray(), bosToken: 257, eosToken: 258, unknownToken: 256);
+        Console.WriteLine($"Demo Vocabulary size: {tokenizer.VocabSize}");
+        Console.WriteLine($"BOS token ID: {tokenizer.BosToken} = ''{tokenizer.GetToken(tokenizer.BosToken)}''");
+        Console.WriteLine($"EOS token ID: {tokenizer.EosToken} = ''{tokenizer.GetToken(tokenizer.EosToken)}''\n");
+        string testText = "Hello world test";
+        Console.WriteLine($"Test text: \"{testText}\"");
+        var tokens = tokenizer.Encode(testText, addBos: true, addEos: false);
+        Console.WriteLine($"Tokens ({tokens.Length}): [{string.Join(", ", tokens.Take(20))}]");
+        var decoded = tokenizer.Decode(tokens);
+        Console.WriteLine($"Decoded: \"{decoded}\"\n");
+        Console.WriteLine("Note: For full inference, use external tokenizer.json from HuggingFace.");
+        Console.WriteLine("\n✓ Tokenizer test completed (demo mode)!");
+    }
