@@ -942,15 +942,8 @@ void main() {
         var transformer = new Compute.Transformer(provider, model);
         transformer.LoadWeights();
 
-        // Create demo tokenizer (in real scenario, load from tokenizer.json)
-        var demoTokens = new List<string>();
-        for (int i = 0; i < 256; i++) demoTokens.Add(((char)i).ToString());
-        demoTokens.Add("<unk>"); // 256
-        demoTokens.Add("<s>");   // 257 (BOS)
-        demoTokens.Add("</s>");  // 258 (EOS)
-        string[] words = { " ", "Hello", "world", "test", "!", "AI", "is", "working", "The", "answer" };
-        demoTokens.AddRange(words);
-        var tokenizer = new Tokenizer.BPETokenizer(demoTokens.ToArray(), bosToken: 257, eosToken: 258, unknownToken: 256);
+        // Load real tokenizer from GGUF metadata
+        var tokenizer = Tokenizer.BPETokenizer.FromGGUF(model.Reader);
 
         // Create compute ops for KV-cache
         using var ops = new Compute.ComputeOps(provider);

@@ -228,17 +228,26 @@ public class ComputeOps : IDisposable
     /// </summary>
     public void LayerNorm(Tensor tensor, Tensor weight, float eps = 1e-5f)
     {
-        float[] paramsData = { (float)tensor.Shape.TotalElements, eps };
-        var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(float)), BufferType.Storage, DataType.F32);
-        paramsBuffer.Write(paramsData);
+        // For 1D tensor treat as single row; for 2D apply per-row (per-token) RMSNorm.
+        int rows = tensor.Shape.Rank >= 2 ? tensor.Shape[0] : 1;
+        int cols = tensor.Shape.Rank >= 2 ? tensor.Shape[1] : tensor.Shape[0];
+
+        // Params layout must match shader struct: { uint rows; uint cols; float eps; }
+        // Pack as raw bytes: rows (4 bytes) + cols (4 bytes) + eps (4 bytes)
+        var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
+        var paramBytes = new byte[12];
+        BitConverter.GetBytes((uint)rows).CopyTo(paramBytes, 0);
+        BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
+        BitConverter.GetBytes(eps).CopyTo(paramBytes, 8);
+        paramsBuffer.Write(paramBytes);
 
         var kernel = GetOrCreateKernel("layer_norm", ComputeShaders.LayerNorm);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, weight.Buffer);
         kernel.SetArgument(2, paramsBuffer);
 
-        uint[] globalWorkSize = { (uint)((tensor.Shape.TotalElements + 255) / 256) };
-        _queue.Dispatch(kernel, globalWorkSize, null);
+        // One workgroup per row — each workgroup of 256 threads handles one token's vector
+        _queue.Dispatch(kernel, new[] { (uint)rows }, null);
         _queue.Flush();
 
         paramsBuffer.Dispose();
@@ -681,9 +690,12 @@ public class ComputeOps : IDisposable
         var xData = x.ReadData();
         xNorm.Buffer.Write(xData);
         LayerNorm(xNorm, attnNormWeight, eps);
+        { var d = xNorm.ReadData(); Console.WriteLine($"  [DBG] post-attnNorm NaN={d.Any(float.IsNaN)} min={d.Min():F3} max={d.Max():F3}"); }
 
         // 1.2 Q, K, V projections
+        { var d = wQ.ReadData(); Console.WriteLine($"  [DBG] wQ NaN={d.Any(float.IsNaN)} Inf={d.Any(float.IsInfinity)} min={d.Where(float.IsFinite).DefaultIfEmpty().Min():F3} max={d.Where(float.IsFinite).DefaultIfEmpty().Max():F3}"); }
         var Q = MatMul(xNorm, wQ, "Q");
+        { var d = Q.ReadData(); Console.WriteLine($"  [DBG] post-Q NaN={d.Any(float.IsNaN)} min={d.Min():F3} max={d.Max():F3}"); }
         Console.WriteLine($"  [TransLayer Debug] After MatMul: Q shape = {Q.Shape}");
         var K = MatMul(xNorm, wK, "K");
         Console.WriteLine($"  [TransLayer Debug] After MatMul: K shape = {K.Shape}, wK shape = {wK.Shape}");

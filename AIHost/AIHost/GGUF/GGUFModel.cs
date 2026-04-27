@@ -15,6 +15,7 @@ public class GGUFModel : IDisposable
     public GGUFHeader Header => _reader.Header;
     public GGUFMetadata Metadata => _reader.Metadata;
     public IReadOnlyList<GGUFTensorInfo> Tensors => _reader.Tensors;
+    public GGUFReader Reader => _reader;
 
     public GGUFModel(string filePath, IComputeDevice device)
     {

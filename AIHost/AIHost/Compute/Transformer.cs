@@ -83,13 +83,17 @@ public class Transformer : IDisposable
         for (int i = 0; i < _numLayers; i++)
         {
             if (i % 5 == 0 || i == _numLayers - 1)
-            {
                 Console.WriteLine($"  Applying layer {i}/{_numLayers}...");
-            }
+
             x = ApplyLayer(x, i, startPosition, kvCache);
-            
-            // Sync GPU after each layer to prevent command buffer overflow
             _device.Synchronize();
+
+            var xd = x.ReadData();
+            if (xd.Any(float.IsNaN))
+            {
+                Console.WriteLine($"  *** NaN first appeared after layer {i} ***");
+                break;
+            }
         }
 
         // 3. Final layer norm
@@ -193,7 +197,11 @@ public class Transformer : IDisposable
 
     private Tensor EmbeddingLookup(Tensor embeddingTable, int[] tokenIds)
     {
-        return _ops.EmbeddingLookup(tokenIds, embeddingTable, "embeddings");
+        var result = _ops.EmbeddingLookup(tokenIds, embeddingTable, "embeddings");
+        var d = result.ReadData();
+        bool hasNaN = d.Any(float.IsNaN);
+        Console.WriteLine($"  [Embed] tok={tokenIds[0]} first5={string.Join(",", d.Take(5).Select(v => v.ToString("F3")))} NaN={hasNaN}");
+        return result;
     }
 
     public void Dispose()

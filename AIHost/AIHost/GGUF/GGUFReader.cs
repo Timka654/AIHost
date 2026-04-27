@@ -128,14 +128,46 @@ public class GGUFReader : IDisposable
     {
         var elementType = (GGUFValueType)_reader.ReadUInt32();
         ulong length = _reader.ReadUInt64();
-        var array = new List<object>((int)length);
-        
-        for (ulong i = 0; i < length; i++)
+
+        switch (elementType)
         {
-            array.Add(ReadValue(elementType));
+            case GGUFValueType.String:
+            {
+                var arr = new string[length];
+                for (ulong i = 0; i < length; i++) arr[i] = ReadString();
+                return arr;
+            }
+            case GGUFValueType.Float32:
+            {
+                var arr = new float[length];
+                for (ulong i = 0; i < length; i++) arr[i] = _reader.ReadSingle();
+                return arr;
+            }
+            case GGUFValueType.Int32:
+            {
+                var arr = new int[length];
+                for (ulong i = 0; i < length; i++) arr[i] = _reader.ReadInt32();
+                return arr;
+            }
+            case GGUFValueType.UInt32:
+            {
+                var arr = new uint[length];
+                for (ulong i = 0; i < length; i++) arr[i] = _reader.ReadUInt32();
+                return arr;
+            }
+            case GGUFValueType.Int8:
+            {
+                var arr = new sbyte[length];
+                for (ulong i = 0; i < length; i++) arr[i] = _reader.ReadSByte();
+                return arr;
+            }
+            default:
+            {
+                var arr = new object[length];
+                for (ulong i = 0; i < length; i++) arr[i] = ReadValue(elementType);
+                return arr;
+            }
         }
-        
-        return array;
     }
 
     /// <summary>

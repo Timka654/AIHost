@@ -115,6 +115,11 @@ public class InferenceEngine : IDisposable
 
     private int Sample(float[] logits, GenerationConfig config)
     {
+        bool hasNaN = logits.Any(float.IsNaN);
+        bool hasInf = logits.Any(float.IsInfinity);
+        float maxL = logits.Max(), minL = logits.Min();
+        Console.WriteLine($"  [Logits] min={minL:F3} max={maxL:F3} NaN={hasNaN} Inf={hasInf}");
+
         // Apply temperature
         if (Math.Abs(config.Temperature - 1.0f) > 0.001f)
         {
@@ -138,6 +143,10 @@ public class InferenceEngine : IDisposable
         {
             probs = ApplyTopP(probs, config.TopP);
         }
+
+        // DEBUG: show top-5 tokens before sampling
+        var top5 = probs.Select((p, i) => (p, i)).OrderByDescending(x => x.p).Take(5).ToArray();
+        Console.WriteLine($"  [Sampler] top5: {string.Join(", ", top5.Select(x => $"tok{x.i}={x.p:F4}"))}");
 
         // Sample from distribution
         return SampleFromDistribution(probs);

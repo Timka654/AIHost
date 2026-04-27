@@ -48,25 +48,29 @@ shared float tileB[16][16];
 void main() {
     uint row = gl_GlobalInvocationID.y;
     uint col = gl_GlobalInvocationID.x;
-    if (row >= params.M || col >= params.N) return;
+    uint tileRow = gl_LocalInvocationID.y;
+    uint tileCol = gl_LocalInvocationID.x;
     float sum = 0.0;
     uint numTiles = (params.K + 15u) / 16u;
     for (uint t = 0u; t < numTiles; t++) {
-        uint tileRow = gl_LocalInvocationID.y;
-        uint tileCol = gl_LocalInvocationID.x;
         uint aRow = row;
         uint aCol = t * 16u + tileCol;
         uint bRow = t * 16u + tileRow;
         uint bCol = col;
-        tileA[tileRow][tileCol] = (aCol < params.K) ? A.data[aRow * params.K + aCol] : 0.0;
-        tileB[tileRow][tileCol] = (bRow < params.K) ? B.data[bRow * params.N + bCol] : 0.0;
+        // All threads must participate in shared memory loads to avoid garbage reads.
+        // Out-of-bounds threads load 0.0 so they don't pollute the tile.
+        tileA[tileRow][tileCol] = (aRow < params.M && aCol < params.K) ? A.data[aRow * params.K + aCol] : 0.0;
+        tileB[tileRow][tileCol] = (bRow < params.K && bCol < params.N) ? B.data[bRow * params.N + bCol] : 0.0;
         barrier();
         for (uint k = 0u; k < 16u; k++) {
             sum += tileA[tileRow][k] * tileB[k][tileCol];
         }
         barrier();
     }
-    C.data[row * params.N + col] = sum;
+    // Only write result for valid output positions
+    if (row < params.M && col < params.N) {
+        C.data[row * params.N + col] = sum;
+    }
 }
 ";
 
@@ -107,38 +111,35 @@ void main() {
 }
 ";
 
+    // Row-wise RMSNorm (as used in LLaMA): each workgroup handles one row (token).
+    // out[row,i] = x[row,i] / sqrt(mean(x[row]^2) + eps) * weight[i]
     public const string LayerNorm = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
 layout(set = 0, binding = 1) readonly buffer WeightBuf { float data[]; } weight;
-layout(set = 0, binding = 2) readonly buffer Params { uint size; float eps; } params;
-shared float sMean[256];
-shared float sVar[256];
+layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint cols; float eps; } params;
+shared float sharedMem[256];
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
-    float val = (gid < params.size) ? buf.data[gid] : 0.0;
-    sMean[lid] = val;
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= params.rows) return;
+    uint rowOffset = row * params.cols;
+    float localSumSq = 0.0;
+    for (uint i = tid; i < params.cols; i += 256u) {
+        float x = buf.data[rowOffset + i];
+        localSumSq += x * x;
+    }
+    sharedMem[tid] = localSumSq;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) sMean[lid] += sMean[lid + s];
+        if (tid < s) sharedMem[tid] += sharedMem[tid + s];
         barrier();
     }
-    float mean = sMean[0] / float(params.size);
-    if (gid < params.size) val = buf.data[gid] - mean;
-    else val = 0.0;
-    sVar[lid] = val * val;
+    float rms = sqrt(sharedMem[0] / float(params.cols) + params.eps);
     barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) sVar[lid] += sVar[lid + s];
-        barrier();
-    }
-    float variance = sVar[0] / float(params.size);
-    float stddev = sqrt(variance + params.eps);
-    if (gid < params.size) {
-        float normalized = (buf.data[gid] - mean) / stddev;
-        buf.data[gid] = normalized * weight.data[gid];
+    for (uint i = tid; i < params.cols; i += 256u) {
+        buf.data[rowOffset + i] = (buf.data[rowOffset + i] / rms) * weight.data[i];
     }
 }
 ";
