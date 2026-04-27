@@ -51,10 +51,17 @@ public class InferenceEngine : IDisposable
         var tokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
         Console.WriteLine($"Prompt tokens: [{string.Join(", ", tokens)}]");
 
-        // Initialize KV cache if enabled
+        // Initialize or reset KV cache for this generation
         if (config.UseKVCache)
         {
-            _kvCache ??= new KVCache(_ops);
+            if (_kvCache == null)
+                _kvCache = new KVCache(_ops);
+            else
+                _kvCache.Clear();
+        }
+        else
+        {
+            _kvCache?.Clear();
         }
 
         // Generation loop
@@ -113,7 +120,14 @@ public class InferenceEngine : IDisposable
 
         if (config.UseKVCache)
         {
-            _kvCache ??= new KVCache(_ops);
+            if (_kvCache == null)
+                _kvCache = new KVCache(_ops);
+            else
+                _kvCache.Clear();
+        }
+        else
+        {
+            _kvCache?.Clear();
         }
 
         int eosToken = _tokenizer.EosToken;

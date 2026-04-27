@@ -66,17 +66,21 @@ public class BPETokenizer
         if (addBos)
             tokens.Add(_bosToken);
 
+        // SentencePiece convention: spaces are represented as ▁ prefix on tokens.
+        // Prepend ▁ and replace all spaces so greedy matching finds real vocab entries.
+        string normalized = "▁" + text.Replace(" ", "▁");
+
         // Simple greedy tokenization: try longest match first
         int pos = 0;
-        while (pos < text.Length)
+        while (pos < normalized.Length)
         {
             int bestMatchLen = 0;
             int bestTokenId = _unknownToken;
 
             // Try to find longest matching token
-            for (int len = Math.Min(text.Length - pos, 50); len > 0; len--)
+            for (int len = Math.Min(normalized.Length - pos, 50); len > 0; len--)
             {
-                string substr = text.Substring(pos, len);
+                string substr = normalized.Substring(pos, len);
                 if (_tokenToId.TryGetValue(substr, out int tokenId))
                 {
                     bestMatchLen = len;
@@ -93,7 +97,7 @@ public class BPETokenizer
             else
             {
                 // Fallback: try to find single byte token
-                char c = text[pos];
+                char c = normalized[pos];
                 string charStr = c.ToString();
                 if (_tokenToId.TryGetValue(charStr, out int charTokenId))
                 {
@@ -124,15 +128,18 @@ public class BPETokenizer
         {
             if (tokenId >= 0 && tokenId < _tokens.Length)
             {
-                // Skip special tokens in output
                 if (tokenId == _bosToken || tokenId == _eosToken)
                     continue;
 
-                result.Append(_tokens[tokenId]);
+                // SentencePiece: ▁ marks word boundary (space before word)
+                result.Append(_tokens[tokenId].Replace('▁', ' '));
             }
         }
 
-        return result.ToString();
+        // Leading space is an artifact of the ▁ prepended during encoding
+        return result.Length > 0 && result[0] == ' '
+            ? result.ToString(1, result.Length - 1)
+            : result.ToString();
     }
 
     /// <summary>

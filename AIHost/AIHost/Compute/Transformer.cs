@@ -32,10 +32,10 @@ public class Transformer : IDisposable
         _model = model;
 
         var metadata = model.Metadata;
-        _numLayers = metadata.GetValue<int>("llama.block_count", 22);
-        _dModel = metadata.GetValue<int>("llama.embedding_length", 2048);
-        _numHeads = metadata.GetValue<int>("llama.attention.head_count", 32);
-        _vocabSize = 32000; // TinyLlama vocab size
+        _numLayers = metadata.GetValue<int>(GGUFMetadata.KeyBlockCount, 22);
+        _dModel = metadata.GetValue<int>(GGUFMetadata.KeyEmbeddingLength, 2048);
+        _numHeads = metadata.GetValue<int>(GGUFMetadata.KeyAttentionHeadCount, 32);
+        _vocabSize = metadata.GetValue<int>(GGUFMetadata.KeyVocabSize, 32000);
 
         Console.WriteLine($"Transformer initialized:");
         Console.WriteLine($"  Layers: {_numLayers}");
