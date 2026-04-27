@@ -690,12 +690,9 @@ public class ComputeOps : IDisposable
         var xData = x.ReadData();
         xNorm.Buffer.Write(xData);
         LayerNorm(xNorm, attnNormWeight, eps);
-        { var d = xNorm.ReadData(); Console.WriteLine($"  [DBG] post-attnNorm NaN={d.Any(float.IsNaN)} min={d.Min():F3} max={d.Max():F3}"); }
 
         // 1.2 Q, K, V projections
-        { var d = wQ.ReadData(); Console.WriteLine($"  [DBG] wQ NaN={d.Any(float.IsNaN)} Inf={d.Any(float.IsInfinity)} min={d.Where(float.IsFinite).DefaultIfEmpty().Min():F3} max={d.Where(float.IsFinite).DefaultIfEmpty().Max():F3}"); }
         var Q = MatMul(xNorm, wQ, "Q");
-        { var d = Q.ReadData(); Console.WriteLine($"  [DBG] post-Q NaN={d.Any(float.IsNaN)} min={d.Min():F3} max={d.Max():F3}"); }
         Console.WriteLine($"  [TransLayer Debug] After MatMul: Q shape = {Q.Shape}");
         var K = MatMul(xNorm, wK, "K");
         Console.WriteLine($"  [TransLayer Debug] After MatMul: K shape = {K.Shape}, wK shape = {wK.Shape}");

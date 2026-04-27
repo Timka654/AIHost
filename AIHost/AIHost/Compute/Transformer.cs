@@ -87,13 +87,6 @@ public class Transformer : IDisposable
 
             x = ApplyLayer(x, i, startPosition, kvCache);
             _device.Synchronize();
-
-            var xd = x.ReadData();
-            if (xd.Any(float.IsNaN))
-            {
-                Console.WriteLine($"  *** NaN first appeared after layer {i} ***");
-                break;
-            }
         }
 
         // 3. Final layer norm
@@ -197,11 +190,7 @@ public class Transformer : IDisposable
 
     private Tensor EmbeddingLookup(Tensor embeddingTable, int[] tokenIds)
     {
-        var result = _ops.EmbeddingLookup(tokenIds, embeddingTable, "embeddings");
-        var d = result.ReadData();
-        bool hasNaN = d.Any(float.IsNaN);
-        Console.WriteLine($"  [Embed] tok={tokenIds[0]} first5={string.Join(",", d.Take(5).Select(v => v.ToString("F3")))} NaN={hasNaN}");
-        return result;
+        return _ops.EmbeddingLookup(tokenIds, embeddingTable, "embeddings");
     }
 
     public void Dispose()
