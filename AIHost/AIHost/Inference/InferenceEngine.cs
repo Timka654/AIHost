@@ -42,67 +42,7 @@ public class InferenceEngine : IDisposable
     /// </summary>
     public string Generate(string prompt, GenerationConfig config)
     {
-        if (config.Seed >= 0)
-        {
-            _random = new Random(config.Seed);
-        }
-
-        // Encode prompt
-        var tokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
-        Console.WriteLine($"Prompt tokens: [{string.Join(", ", tokens)}]");
-
-        // Initialize or reset KV cache for this generation
-        if (config.UseKVCache)
-        {
-            if (_kvCache == null)
-                _kvCache = new KVCache(_ops);
-            else
-                _kvCache.Clear();
-        }
-        else
-        {
-            _kvCache?.Clear();
-        }
-
-        // Generation loop
-        int eosToken = _tokenizer.EosToken;
-        
-        for (int i = 0; i < config.MaxNewTokens; i++)
-        {
-            // Forward pass
-            uint startPos = _kvCache != null ? (uint)_kvCache.SequenceLength : 0;
-            
-            // With KV-cache: pass only new tokens after first iteration
-            int[] inputTokens;
-            if (_kvCache != null && _kvCache.SequenceLength > 0)
-            {
-                // Only the last token (newly generated)
-                inputTokens = new[] { tokens[^1] };
-            }
-            else
-            {
-                // First iteration: all tokens
-                inputTokens = tokens.ToArray();
-            }
-            
-            var logits = _model.Forward(inputTokens, startPos, _kvCache);
-
-            // Get logits for last token
-            var lastLogits = ExtractLastToken(logits);
-            logits.Dispose();
-
-            // Sample next token
-            int nextToken = Sample(lastLogits, config);
-
-            tokens.Add(nextToken);
-
-            if (nextToken == eosToken)
-            {
-                break;
-            }
-        }
-
-        // Decode
+        var tokens = PrepareAndRun(prompt, config, onToken: null);
         return _tokenizer.Decode(tokens.ToArray());
     }
 
@@ -111,12 +51,17 @@ public class InferenceEngine : IDisposable
     /// </summary>
     public void GenerateStreaming(string prompt, GenerationConfig config, Action<string> onTokenGenerated)
     {
+        PrepareAndRun(prompt, config, onToken: tokenId =>
+            onTokenGenerated(_tokenizer.GetToken(tokenId)));
+    }
+
+    private List<int> PrepareAndRun(string prompt, GenerationConfig config, Action<int>? onToken)
+    {
         if (config.Seed >= 0)
-        {
             _random = new Random(config.Seed);
-        }
 
         var tokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
+        Console.WriteLine($"Prompt tokens: [{string.Join(", ", tokens)}]");
 
         if (config.UseKVCache)
         {
@@ -135,35 +80,23 @@ public class InferenceEngine : IDisposable
         for (int i = 0; i < config.MaxNewTokens; i++)
         {
             uint startPos = _kvCache != null ? (uint)_kvCache.SequenceLength : 0;
-            
-            // With KV-cache: pass only new tokens after first iteration
-            int[] inputTokens;
-            if (_kvCache != null && _kvCache.SequenceLength > 0)
-            {
-                inputTokens = new[] { tokens[^1] };
-            }
-            else
-            {
-                inputTokens = tokens.ToArray();
-            }
-            
-            var logits = _model.Forward(inputTokens, startPos, _kvCache);
+            int[] inputTokens = _kvCache != null && _kvCache.SequenceLength > 0
+                ? new[] { tokens[^1] }
+                : tokens.ToArray();
 
+            var logits = _model.Forward(inputTokens, startPos, _kvCache);
             var lastLogits = ExtractLastToken(logits);
             logits.Dispose();
 
             int nextToken = Sample(lastLogits, config);
             tokens.Add(nextToken);
-
-            // Stream token
-            string tokenText = _tokenizer.GetToken(nextToken);
-            onTokenGenerated(tokenText);
+            onToken?.Invoke(nextToken);
 
             if (nextToken == eosToken)
-            {
                 break;
-            }
         }
+
+        return tokens;
     }
 
     private float[] ExtractLastToken(Tensor logits)

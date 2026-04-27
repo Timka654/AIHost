@@ -767,6 +767,44 @@ public class ComputeOps : IDisposable
 
     #endregion
 
+    #region Embedding
+
+    /// <summary>
+    /// GPU embedding lookup: select rows from table by token IDs.
+    /// table: [vocabSize × dModel], tokenIds: [seqLen] → result: [seqLen × dModel]
+    /// </summary>
+    public Tensor EmbeddingLookup(int[] tokenIds, Tensor table, string? resultName = null)
+    {
+        int seqLen = tokenIds.Length;
+        int dModel = table.Shape[0]; // GGUF: ne[0] is innermost dim (embedding_dim), ne[1] is vocab_size
+
+        var result = Tensor.Create(_device, TensorShape.Matrix(seqLen, dModel), DataType.F32, resultName);
+
+        var tokenBuf = _device.CreateBuffer((ulong)(seqLen * sizeof(int)), BufferType.Storage, DataType.I32);
+        tokenBuf.Write(tokenIds);
+
+        uint[] paramsData = { (uint)seqLen, (uint)dModel };
+        var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
+        paramsBuffer.Write(paramsData);
+
+        var kernel = GetOrCreateKernel("embedding_lookup", ComputeShaders.EmbeddingLookup);
+        kernel.SetArgument(0, tokenBuf);
+        kernel.SetArgument(1, table.Buffer);
+        kernel.SetArgument(2, result.Buffer);
+        kernel.SetArgument(3, paramsBuffer);
+
+        uint total = (uint)(seqLen * dModel);
+        _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        _queue.Flush();
+
+        tokenBuf.Dispose();
+        paramsBuffer.Dispose();
+
+        return result;
+    }
+
+    #endregion
+
     public void Dispose()
     {
         if (_disposed) return;

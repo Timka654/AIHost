@@ -148,7 +148,7 @@ public class BPETokenizer
     public string GetToken(int tokenId)
     {
         if (tokenId >= 0 && tokenId < _tokens.Length)
-            return _tokens[tokenId];
+            return _tokens[tokenId].Replace('▁', ' ');
         return "<unk>";
     }
 }

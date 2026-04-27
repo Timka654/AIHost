@@ -21,9 +21,20 @@ internal class Program
         Console.WriteLine("  10. Test transformer forward pass");
         Console.WriteLine("  11. Test autoregressive inference");
         Console.WriteLine("  12. Test InferenceEngine (with real model)");
-        Console.Write("\nChoice (1-12): ");
-        
-        string? choice = Console.ReadLine();
+        string? choice;
+        string? argModelPath = null;
+
+        if (args.Length >= 1)
+        {
+            choice = args[0];
+            argModelPath = args.Length >= 2 ? args[1] : null;
+            Console.WriteLine($"Choice (1-12): {choice}");
+        }
+        else
+        {
+            Console.Write("\nChoice (1-12): ");
+            choice = Console.ReadLine();
+        }
         Console.WriteLine();
 
         try
@@ -75,7 +86,7 @@ internal class Program
             }
             else if (choice == "12")
             {
-                TestInferenceEngine(provider);
+                TestInferenceEngine(provider, argModelPath);
             }
             else
             {
@@ -905,14 +916,16 @@ void main() {
         Console.WriteLine("     - KV cache for efficiency");
     }
 
-    static void TestInferenceEngine(ICompute.IComputeDevice provider)
+    static void TestInferenceEngine(ICompute.IComputeDevice provider, string? modelPath = null)
     {
         Console.WriteLine("=== Testing InferenceEngine with Real Model ===\n");
-        
-        // Path to TinyLlama model
-        Console.Write("Enter path to GGUF model (e.g., tinyllama-1.1b-chat-v1.0.Q2_K.gguf): ");
-        string? modelPath = Console.ReadLine();
-        
+
+        if (string.IsNullOrWhiteSpace(modelPath))
+        {
+            Console.Write("Enter path to GGUF model (e.g., tinyllama-1.1b-chat-v1.0.Q2_K.gguf): ");
+            modelPath = Console.ReadLine();
+        }
+
         if (string.IsNullOrWhiteSpace(modelPath) || !File.Exists(modelPath))
         {
             Console.WriteLine("Model file not found. Using demo mode with mock model.\n");

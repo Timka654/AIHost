@@ -193,23 +193,7 @@ public class Transformer : IDisposable
 
     private Tensor EmbeddingLookup(Tensor embeddingTable, int[] tokenIds)
     {
-        // Simplified: create tensor and copy rows from embedding table
-        // Full GPU implementation would use a compute shader
-        
-        int seqLen = tokenIds.Length;
-        float[] embData = embeddingTable.ReadData();
-        float[] result = new float[seqLen * _dModel];
-
-        for (int i = 0; i < seqLen; i++)
-        {
-            int tokenId = tokenIds[i];
-            if (tokenId >= 0 && tokenId < _vocabSize)
-            {
-                Array.Copy(embData, tokenId * _dModel, result, i * _dModel, _dModel);
-            }
-        }
-
-        return Tensor.FromData(_device, result, TensorShape.Matrix(seqLen, _dModel), "embeddings");
+        return _ops.EmbeddingLookup(tokenIds, embeddingTable, "embeddings");
     }
 
     public void Dispose()
