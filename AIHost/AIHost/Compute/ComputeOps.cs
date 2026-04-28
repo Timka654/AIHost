@@ -1,4 +1,7 @@
+using AIHost.GGUF;
 using AIHost.ICompute;
+using AIHost.Inference;
+using System.Runtime.InteropServices;
 
 namespace AIHost.Compute;
 
@@ -11,6 +14,8 @@ public class ComputeOps : IDisposable
     private readonly IComputeCommandQueue _queue;
     private readonly Dictionary<string, IComputeKernel> _kernelCache = new();
     private bool _disposed;
+
+    public IComputeDevice Device => _device;
 
     public ComputeOps(IComputeDevice device)
     {
@@ -677,7 +682,7 @@ public class ComputeOps : IDisposable
         Tensor wGate, Tensor wUp, Tensor wDown,
         int numHeads,
         uint position,
-        Inference.KVCache? kvCache = null,
+        KVCache? kvCache = null,
         int layerIdx = 0,
         float eps = 1e-5f,
         string? resultName = null)

@@ -8,20 +8,29 @@ public static class ComputeShaders
 {
     private const string DefaultProvider = "Vulkan";
 
-    // Quantization shaders (inline for now, TODO: move to files)
-    public const string DequantizeQ2K = QuantizationFormats.DequantizeQ2K_Correct;
-    public const string DequantizeQ3K = QuantizationFormats.DequantizeQ3K_Correct;
-    public const string DequantizeQ4K = QuantizationFormats.DequantizeQ4K_Correct;
-    public const string DequantizeQ5K = QuantizationFormats.DequantizeQ5K_Correct;
-    public const string DequantizeQ6K = QuantizationFormats.DequantizeQ6K_Correct;
+    // Quantization shaders - lazy loaded from files with inline fallbacks
+    public static string DequantizeQ2K => TryLoadOrInline("dequant_q2k", QuantizationFormats.DequantizeQ2K_Correct);
+    public static string DequantizeQ3K => TryLoadOrInline("dequant_q3k", QuantizationFormats.DequantizeQ3K_Correct);
+    public static string DequantizeQ4K => TryLoadOrInline("dequant_q4k", QuantizationFormats.DequantizeQ4K_Correct);
+    public static string DequantizeQ5K => TryLoadOrInline("dequant_q5k", QuantizationFormats.DequantizeQ5K_Correct);
+    public static string DequantizeQ6K => TryLoadOrInline("dequant_q6k", QuantizationFormats.DequantizeQ6K_Correct);
 
-    // Core operations - lazy loaded from files
+    // Core operations - lazy loaded from files with inline fallbacks
     public static string MatMulF32 => TryLoadOrInline("matmul", _inlineMatMul);
     public static string Softmax => TryLoadOrInline("softmax", _inlineSoftmax);
     public static string SiLU => TryLoadOrInline("silu", _inlineSiLU);
     public static string ElementWiseAdd => TryLoadOrInline("add", _inlineAdd);
     public static string ConcatAxis1 => TryLoadOrInline("concat_axis1", _inlineConcat);
     public static string ConcatAxis0 => TryLoadOrInline("concat_axis0", _inlineConcatAxis0);
+    
+    // Additional operations - lazy loaded from files with inline fallbacks
+    public static string LayerNorm => TryLoadOrInline("layernorm", _inlineLayerNorm);
+    public static string ElementWiseMul => TryLoadOrInline("elementwise_mul", _inlineElementWiseMul);
+    public static string RoPE => TryLoadOrInline("rope", _inlineRoPE);
+    public static string Transpose => TryLoadOrInline("transpose", _inlineTranspose);
+    public static string RowwiseSoftmax => TryLoadOrInline("rowwise_softmax", _inlineRowwiseSoftmax);
+    public static string Scale => TryLoadOrInline("scale", _inlineScale);
+    public static string EmbeddingLookup => TryLoadOrInline("embedding_lookup", _inlineEmbeddingLookup);
 
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {
@@ -113,7 +122,7 @@ void main() {
 
     // Row-wise RMSNorm (as used in LLaMA): each workgroup handles one row (token).
     // out[row,i] = x[row,i] / sqrt(mean(x[row]^2) + eps) * weight[i]
-    public const string LayerNorm = @"
+    private const string _inlineLayerNorm = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
@@ -158,7 +167,7 @@ void main() {
 }
 ";
 
-    public const string ElementWiseMul = @"
+    private const string _inlineElementWiseMul = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer BufA { float data[]; } A;
@@ -247,7 +256,7 @@ void main() {
 }
 ";
 
-    public const string RoPE = @"
+    private const string _inlineRoPE = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
@@ -279,7 +288,7 @@ void main() {
 }
 ";
 
-    public const string Transpose = @"
+    private const string _inlineTranspose = @"
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) readonly buffer MatrixA { float data[]; } A;
@@ -293,7 +302,7 @@ void main() {
 }
 ";
 
-    public const string RowwiseSoftmax = @"
+    private const string _inlineRowwiseSoftmax = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
@@ -351,7 +360,7 @@ void main() {
 }
 ";
 
-    public const string Scale = @"
+    private const string _inlineScale = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
@@ -363,7 +372,7 @@ void main() {
 }
 ";
 
-    public const string EmbeddingLookup = @"
+    private const string _inlineEmbeddingLookup = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer TokenIds { int ids[]; } tokenIds;

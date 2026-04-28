@@ -1,0 +1,29 @@
+# Docker ignore patterns
+**/.git
+**/.gitignore
+**/.vscode
+**/.vs
+**/bin
+**/obj
+**/packages
+**/*.user
+**/*.suo
+**/.dockerignore
+**/Dockerfile*
+**/docker-compose*
+**/node_modules
+**/.env
+**/secrets.json
+
+# Exclude build outputs
+**/bin/
+**/obj/
+**/out/
+
+# Exclude data directory (will be mounted as volume)
+data/models/
+data/logs/
+data/cache/
+
+# Keep config templates
+!data/config/

@@ -1,59 +1,92 @@
 namespace AIHost.ICompute.ROCm;
 
 /// <summary>
-/// ROCm/HIP command queue (stream)
-/// TODO: Implement with HIP streams
+/// ROCm/HIP command queue using HIP streams
 /// </summary>
-public class ROCmComputeCommandQueue : IComputeCommandQueue
+public unsafe class ROCmComputeCommandQueue : ComputeCommandQueueBase
 {
-    private readonly ROCmComputeDevice _device;
+    private IntPtr _stream;
     private bool _disposed;
 
-    // TODO: Store hipStream_t
-    // private IntPtr _stream;
-
-    public ROCmComputeCommandQueue(ROCmComputeDevice device)
+    public ROCmComputeCommandQueue()
     {
-        _device = device;
-        
-        // TODO: Create stream
-        // hipStreamCreate(&_stream);
+        // Create HIP stream
+        HipApi.CheckError(HipApi.hipStreamCreate(out _stream), "hipStreamCreate");
     }
 
-    public void Dispatch(IComputeKernel kernel, uint[] globalWorkSize, uint[]? localWorkSize)
+    public override void Dispatch(IComputeKernel kernel, uint[] globalWorkSize, uint[]? localWorkSize)
     {
-        // TODO: Launch kernel on stream
-        // Calculate grid and block dimensions
-        // hipLaunchKernel(_function, gridDim, blockDim, args, 0, _stream);
-        throw new NotImplementedException("ROCm kernel dispatch not implemented");
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ROCmComputeCommandQueue));
+
+        // Dispatch is handled by kernel itself
+        kernel.Dispatch(globalWorkSize, localWorkSize);
     }
 
-    public void WriteBuffer(IComputeBuffer buffer, ulong offset, byte[] data)
+    public override void WriteBuffer(IComputeBuffer buffer, ulong offset, byte[] data)
     {
-        throw new NotImplementedException();
-        // TODO: hipMemcpy
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ROCmComputeCommandQueue));
+
+        if (buffer is not ROCmComputeBuffer rocmBuffer)
+            throw new ArgumentException("Buffer must be ROCmComputeBuffer", nameof(buffer));
+
+        var ptr = rocmBuffer.GetPointer();
+        fixed (byte* pData = data)
+        {
+            HipApi.CheckError(
+                HipApi.hipMemcpyAsync(
+                    ptr + (nint)offset,
+                    (IntPtr)pData,
+                    (ulong)data.Length,
+                    HipApi.HipMemcpyKind.HostToDevice,
+                    _stream),
+                "hipMemcpyAsync HostToDevice");
+        }
     }
 
-    public void ReadBuffer(IComputeBuffer buffer, ulong offset, byte[] data)
+    public override void ReadBuffer(IComputeBuffer buffer, ulong offset, byte[] data)
     {
-        throw new NotImplementedException();
-        // TODO: hipMemcpy
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ROCmComputeCommandQueue));
+
+        if (buffer is not ROCmComputeBuffer rocmBuffer)
+            throw new ArgumentException("Buffer must be ROCmComputeBuffer", nameof(buffer));
+
+        var ptr = rocmBuffer.GetPointer();
+        fixed (byte* pData = data)
+        {
+            HipApi.CheckError(
+                HipApi.hipMemcpyAsync(
+                    (IntPtr)pData,
+                    ptr + (nint)offset,
+                    (ulong)data.Length,
+                    HipApi.HipMemcpyKind.DeviceToHost,
+                    _stream),
+                "hipMemcpyAsync DeviceToHost");
+        }
     }
 
-    public void Flush()
+    public override void Flush()
     {
-        // TODO: hipStreamSynchronize(_stream);
-        throw new NotImplementedException();
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ROCmComputeCommandQueue));
+
+        // Synchronize stream to ensure all commands complete
+        HipApi.CheckError(HipApi.hipStreamSynchronize(_stream), "hipStreamSynchronize");
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (_disposed) return;
-        
-        // TODO: Destroy stream
-        // if (_stream != IntPtr.Zero)
-        //     hipStreamDestroy(_stream);
-        
+
+        if (_stream != IntPtr.Zero)
+        {
+            HipApi.hipStreamSynchronize(_stream); // Don't throw in Dispose
+            HipApi.hipStreamDestroy(_stream);
+            _stream = IntPtr.Zero;
+        }
+
         _disposed = true;
     }
 }

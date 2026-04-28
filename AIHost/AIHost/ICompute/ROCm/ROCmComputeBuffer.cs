@@ -2,11 +2,10 @@ namespace AIHost.ICompute.ROCm;
 
 /// <summary>
 /// ROCm/HIP GPU memory buffer
-/// TODO: Implement with hipMalloc/hipMemcpy
 /// </summary>
 public unsafe class ROCmComputeBuffer : IComputeBuffer
 {
-    private void* _devicePtr;
+    private IntPtr _devicePtr;
     private bool _disposed;
 
     public ulong Size { get; }
@@ -20,42 +19,60 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
         Type = type;
         DataType = dataType;
 
-        // TODO: Allocate device memory
-        // hipError_t err = hipMalloc(&_devicePtr, size);
-        // if (err != hipSuccess) throw new Exception($"hipMalloc failed: {err}");
-        
-        throw new NotImplementedException("ROCm buffer not implemented");
+        // Allocate device memory
+        HipApi.CheckError(HipApi.hipMalloc(out _devicePtr, size), "hipMalloc");
     }
 
     public void Write<T>(T[] data) where T : unmanaged
     {
-        // TODO: Copy host to device
-        // hipMemcpy(_devicePtr, data, sizeof(T) * data.Length, hipMemcpyHostToDevice);
-        throw new NotImplementedException();
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ROCmComputeBuffer));
+
+        var size = (ulong)(sizeof(T) * data.Length);
+        if (size > Size)
+            throw new ArgumentException($"Data size {size} exceeds buffer size {Size}");
+
+        fixed (T* ptr = data)
+        {
+            HipApi.CheckError(
+                HipApi.hipMemcpy(_devicePtr, (IntPtr)ptr, size, HipApi.HipMemcpyKind.HostToDevice),
+                "hipMemcpy HostToDevice");
+        }
     }
 
     public T[] Read<T>() where T : unmanaged
     {
-        // TODO: Copy device to host
-        // T[] result = new T[Size / sizeof(T)];
-        // hipMemcpy(result, _devicePtr, Size, hipMemcpyDeviceToHost);
-        // return result;
-        throw new NotImplementedException();
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(ROCmComputeBuffer));
+
+        var count = (int)(Size / (ulong)sizeof(T));
+        var result = new T[count];
+
+        fixed (T* ptr = result)
+        {
+            HipApi.CheckError(
+                HipApi.hipMemcpy((IntPtr)ptr, _devicePtr, Size, HipApi.HipMemcpyKind.DeviceToHost),
+                "hipMemcpy DeviceToHost");
+        }
+
+        return result;
     }
 
     public nint GetPointer()
     {
-        return (nint)_devicePtr;
+        return _devicePtr;
     }
 
     public void Dispose()
     {
         if (_disposed) return;
-        
-        // TODO: Free device memory
-        // if (_devicePtr != null)
-        //     hipFree(_devicePtr);
-        
+
+        if (_devicePtr != IntPtr.Zero)
+        {
+            HipApi.hipFree(_devicePtr); // Don't throw in Dispose
+            _devicePtr = IntPtr.Zero;
+        }
+
         _disposed = true;
     }
 }

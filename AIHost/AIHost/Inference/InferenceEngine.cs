@@ -13,8 +13,10 @@ public class GenerationConfig
     public float Temperature { get; set; } = 0.7f;
     public int TopK { get; set; } = 50;
     public float TopP { get; set; } = 0.9f;
+    public float RepetitionPenalty { get; set; } = 1.0f;
     public int Seed { get; set; } = -1;
     public bool UseKVCache { get; set; } = true;
+    public KVCacheQuantization KVCacheQuantization { get; set; } = KVCacheQuantization.None;
 }
 
 /// <summary>
@@ -28,6 +30,8 @@ public class InferenceEngine : IDisposable
     private Random _random;
     private KVCache? _kvCache;
     private bool _disposed;
+
+    public BPETokenizer Tokenizer => _tokenizer;
 
     public InferenceEngine(Transformer model, BPETokenizer tokenizer, ComputeOps ops)
     {
@@ -53,6 +57,23 @@ public class InferenceEngine : IDisposable
     {
         PrepareAndRun(prompt, config, onToken: tokenId =>
             onTokenGenerated(_tokenizer.GetToken(tokenId)));
+    }
+
+    /// <summary>
+    /// Generate text from multiple prompts in batch (sequential with individual KV-caches)
+    /// </summary>
+    public string[] BatchGenerate(string[] prompts, GenerationConfig config)
+    {
+        var results = new string[prompts.Length];
+        
+        for (int i = 0; i < prompts.Length; i++)
+        {
+            // Each prompt gets its own clean KV-cache
+            _kvCache?.Clear();
+            results[i] = Generate(prompts[i], config);
+        }
+        
+        return results;
     }
 
     private List<int> PrepareAndRun(string prompt, GenerationConfig config, Action<int>? onToken)
@@ -88,7 +109,7 @@ public class InferenceEngine : IDisposable
             var lastLogits = ExtractLastToken(logits);
             logits.Dispose();
 
-            int nextToken = Sample(lastLogits, config);
+            int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
             onToken?.Invoke(nextToken);
 
@@ -113,8 +134,14 @@ public class InferenceEngine : IDisposable
         return lastLogits;
     }
 
-    private int Sample(float[] logits, GenerationConfig config)
+    private int Sample(float[] logits, List<int> generatedTokens, GenerationConfig config)
     {
+        // Apply repetition penalty
+        if (config.RepetitionPenalty != 1.0f)
+        {
+            logits = ApplyRepetitionPenalty(logits, generatedTokens, config.RepetitionPenalty);
+        }
+
         // Apply temperature
         if (Math.Abs(config.Temperature - 1.0f) > 0.001f)
         {
@@ -220,6 +247,28 @@ public class InferenceEngine : IDisposable
         }
 
         return filtered;
+    }
+
+    private float[] ApplyRepetitionPenalty(float[] logits, List<int> tokens, float penalty)
+    {
+        if (penalty == 1.0f || tokens.Count == 0)
+            return logits;
+
+        float[] penalized = (float[])logits.Clone();
+        
+        foreach (int tokenId in tokens)
+        {
+            if (tokenId >= 0 && tokenId < penalized.Length)
+            {
+                // If logit is positive, divide; if negative, multiply
+                if (penalized[tokenId] > 0)
+                    penalized[tokenId] /= penalty;
+                else
+                    penalized[tokenId] *= penalty;
+            }
+        }
+
+        return penalized;
     }
 
     private int SampleFromDistribution(float[] probs)

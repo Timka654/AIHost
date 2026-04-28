@@ -1,5 +1,6 @@
 using AIHost.GGUF;
 using AIHost.ICompute;
+using AIHost.Inference;
 
 namespace AIHost.Compute;
 
@@ -23,6 +24,8 @@ public class Transformer : IDisposable
     
     // Weight cache to avoid repeated dequantization
     private readonly Dictionary<string, Tensor> _weightCache = new();
+
+    public int LayerCount => _numLayers;
 
     public Transformer(IComputeDevice device, GGUFModel model)
     {
@@ -65,7 +68,7 @@ public class Transformer : IDisposable
     /// <summary>
     /// Forward pass through transformer
     /// </summary>
-    public Tensor Forward(int[] tokenIds, uint startPosition = 0, Inference.KVCache? kvCache = null)
+    public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null)
     {
         if (_tokenEmbedding == null)
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
@@ -108,7 +111,7 @@ public class Transformer : IDisposable
         return logits;
     }
 
-    private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, Inference.KVCache? kvCache = null)
+    private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null)
     {
         // Load layer weights
         string prefix = $"blk.{layerIdx}";

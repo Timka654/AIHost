@@ -1,70 +1,78 @@
-using System.Runtime.InteropServices;
-
 namespace AIHost.ICompute.ROCm;
 
 /// <summary>
 /// ROCm/HIP compute device implementation for AMD GPUs
-/// TODO: Implement HIP API bindings and device management
 /// </summary>
-public class ROCmComputeDevice : IComputeDevice
+public class ROCmComputeDevice : ComputeProviderBase
 {
+    private readonly int _deviceId;
     private bool _disposed;
 
-    public string ProviderName => "ROCm/HIP";
-    public string ApiVersion => "HIP 6.0"; // TODO: Get actual version from hipGetDeviceProperties
+    public override string ProviderName => "ROCm/HIP";
+    public override string ApiVersion { get; }
 
-    public ROCmComputeDevice()
+    public ROCmComputeDevice(int deviceId = 0)
     {
-        // TODO: Initialize HIP runtime
-        // hipInit(0);
-        // hipSetDevice(0);
-        
-        throw new NotImplementedException("ROCm provider not yet implemented. Requires HIP API bindings.");
+        _deviceId = deviceId;
+
+        // Initialize HIP runtime
+        HipApi.CheckError(HipApi.hipInit(0), "hipInit");
+
+        // Get device count
+        HipApi.CheckError(HipApi.hipGetDeviceCount(out int deviceCount), "hipGetDeviceCount");
+        if (deviceCount == 0)
+            throw new InvalidOperationException("No HIP-capable devices found");
+
+        if (deviceId >= deviceCount)
+            throw new ArgumentException($"Device ID {deviceId} not available. Found {deviceCount} device(s)");
+
+        // Set device
+        HipApi.CheckError(HipApi.hipSetDevice(_deviceId), "hipSetDevice");
+
+        // Get device properties
+        HipApi.CheckError(HipApi.hipGetDeviceProperties(out var props, _deviceId), "hipGetDeviceProperties");
+
+        var deviceName = System.Text.Encoding.UTF8.GetString(props.name).TrimEnd('\0');
+        ApiVersion = $"HIP {props.major}.{props.minor}";
+
+        Console.WriteLine($"ROCm Device: {deviceName}");
+        Console.WriteLine($"API Version: {ApiVersion}");
+        Console.WriteLine($"Compute Capability: {props.major}.{props.minor}");
+        Console.WriteLine($"Multiprocessors: {props.multiProcessorCount}");
+        Console.WriteLine($"Global Memory: {props.totalGlobalMem / (1024 * 1024)} MB\n");
     }
 
-    public IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType dataType)
+    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32)
     {
-        throw new NotImplementedException();
-        // TODO: Implement hipMalloc for buffer allocation
-        // return new ROCmComputeBuffer(size, type, dataType);
+        return new ROCmComputeBuffer(size, type, elementType);
     }
 
-    public IComputeKernel CreateKernel(string source, string entryPoint)
+    public override IComputeKernel CreateKernel(string source, string entryPoint)
     {
-        throw new NotImplementedException();
-        // TODO: Implement HIP kernel compilation from source
-        // - Use hiprtcCompileProgram for runtime compilation
-        // - Load compiled module with hipModuleLoad
-        // return new ROCmComputeKernel(source, entryPoint, this);
+        return new ROCmComputeKernel(source, entryPoint);
     }
 
-    public IComputeKernel CreateKernelFromFile(string filePath, string entryPoint)
+    public override IComputeKernel CreateKernelFromFile(string filePath, string entryPoint)
     {
-        throw new NotImplementedException();
-        // TODO: Load and compile HIP kernel from file
+        var source = File.ReadAllText(filePath);
+        return new ROCmComputeKernel(source, entryPoint);
     }
 
-    public IComputeCommandQueue CreateCommandQueue()
+    public override IComputeCommandQueue CreateCommandQueue()
     {
-        throw new NotImplementedException();
-        // TODO: Create HIP stream
-        // return new ROCmComputeCommandQueue(this);
+        return new ROCmComputeCommandQueue();
     }
 
-    public void Synchronize()
+    public override void Synchronize()
     {
-        // TODO: hipDeviceSynchronize();
-        throw new NotImplementedException();
+        HipApi.CheckError(HipApi.hipDeviceSynchronize(), "hipDeviceSynchronize");
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (_disposed) return;
-        
-        // TODO: Cleanup HIP resources
-        // hipDeviceReset();
-        
+
+        Synchronize();
         _disposed = true;
-        GC.SuppressFinalize(this);
     }
 }
