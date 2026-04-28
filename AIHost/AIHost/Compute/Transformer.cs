@@ -26,6 +26,7 @@ public class Transformer : IDisposable
     private readonly Dictionary<string, Tensor> _weightCache = new();
 
     public int LayerCount => _numLayers;
+    public ComputeOps Ops => _ops;
 
     public Transformer(IComputeDevice device, IGGUFModel model)
     {
@@ -210,6 +211,11 @@ public class Transformer : IDisposable
         _tokenEmbedding?.Dispose();
         _outputNormWeight?.Dispose();
         _outputWeight?.Dispose();
+
+        foreach (var tensor in _weightCache.Values)
+            tensor.Dispose();
+        _weightCache.Clear();
+
         _ops.Dispose();
 
         _disposed = true;

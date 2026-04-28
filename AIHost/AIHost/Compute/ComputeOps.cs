@@ -521,10 +521,64 @@ public class ComputeOps : IDisposable
     }
 
     /// <summary>
+    /// Apply RoPE to a full Q or K projection tensor [seqLen, numHeads * headDim].
+    /// Each (seq, head) pair is rotated at position startPosition + seq.
+    /// </summary>
+    public void ApplyRoPEFull(Tensor tensor, uint startPosition, int numHeads, int headDim, float theta = 10000.0f)
+    {
+        int seqLen = tensor.Shape[0];
+        var paramsBuffer = _device.CreateBuffer(20, BufferType.Storage, DataType.I32);
+        var p = new byte[20];
+        BitConverter.GetBytes((uint)seqLen).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)numHeads).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)headDim).CopyTo(p, 8);
+        BitConverter.GetBytes(startPosition).CopyTo(p, 12);
+        BitConverter.GetBytes(theta).CopyTo(p, 16);
+        paramsBuffer.Write(p);
+
+        var kernel = GetOrCreateKernel("rope_full", ComputeShaders.RoPEFull);
+        kernel.SetArgument(0, tensor.Buffer);
+        kernel.SetArgument(1, paramsBuffer);
+
+        uint total = (uint)(seqLen * numHeads * headDim / 2);
+        _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        _queue.Flush();
+        paramsBuffer.Dispose();
+    }
+
+    /// <summary>
+    /// Apply causal mask in-place to attention scores [seqLen_q × seqLen_k].
+    /// Sets scores[i, j] = -inf where j > startPosition + i (future positions).
+    /// Only has effect when seqLen_q > 1 (prefill).
+    /// </summary>
+    public void ApplyCausalMask(Tensor scores, uint startPosition)
+    {
+        int seqLen_q = scores.Shape[0];
+        int seqLen_k = scores.Shape[1];
+        if (seqLen_q <= 1) return;
+
+        var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
+        var p = new byte[12];
+        BitConverter.GetBytes((uint)seqLen_q).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)seqLen_k).CopyTo(p, 4);
+        BitConverter.GetBytes(startPosition).CopyTo(p, 8);
+        paramsBuffer.Write(p);
+
+        var kernel = GetOrCreateKernel("causal_mask", ComputeShaders.CausalMask);
+        kernel.SetArgument(0, scores.Buffer);
+        kernel.SetArgument(1, paramsBuffer);
+
+        uint total = (uint)(seqLen_q * seqLen_k);
+        _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        _queue.Flush();
+        paramsBuffer.Dispose();
+    }
+
+    /// <summary>
     /// Multi-head attention: Attention(Q, K, V) = Softmax(Q @ K^T / sqrt(d_k)) @ V
     /// Q, K, V: [seq_len × d_model]
     /// </summary>
-    public Tensor MultiHeadAttention(Tensor Q, Tensor K, Tensor V, int numHeads, string? resultName = null)
+    public Tensor MultiHeadAttention(Tensor Q, Tensor K, Tensor V, int numHeads, uint startPosition = 0, string? resultName = null)
     {
 #if DEEP_DEBUG
         Console.WriteLine($"  [MHA Debug] Q shape: {Q.Shape}, K shape: {K.Shape}, V shape: {V.Shape}");
@@ -561,7 +615,10 @@ public class ComputeOps : IDisposable
             // Scale by 1/sqrt(d_k)
             float scale = 1.0f / MathF.Sqrt(headDimGQA);
             Scale(scores, scale);
-            
+
+            // Causal mask for prefill (seqLen_q > 1)
+            ApplyCausalMask(scores, startPosition);
+
             // Row-wise Softmax
             RowwiseSoftmax(scores);
             
@@ -587,6 +644,9 @@ public class ComputeOps : IDisposable
         // 2. Scale by 1/sqrt(d_k)
         float scale_std = 1.0f / MathF.Sqrt(headDim);
         Scale(scores_std, scale_std);
+
+        // Causal mask for prefill (seqLen_q > 1)
+        ApplyCausalMask(scores_std, startPosition);
 
         // 3. Row-wise Softmax
         RowwiseSoftmax(scores_std);
@@ -614,24 +674,23 @@ public class ComputeOps : IDisposable
 
         var result = Tensor.Create(_device, TensorShape.Matrix(rows, newCols), DataType.F32, resultName);
 
-        // Simple CPU implementation - copy each column repeatFactor times
-        float[] inputData = input.ReadData();
-        float[] outputData = new float[rows * newCols];
+        var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
+        var p = new byte[12];
+        BitConverter.GetBytes((uint)rows).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)cols).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)repeatFactor).CopyTo(p, 8);
+        paramsBuffer.Write(p);
 
-        for (int r = 0; r < rows; r++)
-        {
-            for (int c = 0; c < cols; c++)
-            {
-                float value = inputData[r * cols + c];
-                for (int rep = 0; rep < repeatFactor; rep++)
-                {
-                    int outCol = c * repeatFactor + rep;
-                    outputData[r * newCols + outCol] = value;
-                }
-            }
-        }
+        var kernel = GetOrCreateKernel("repeat_columns", ComputeShaders.RepeatColumns);
+        kernel.SetArgument(0, input.Buffer);
+        kernel.SetArgument(1, result.Buffer);
+        kernel.SetArgument(2, paramsBuffer);
 
-        result.Buffer.Write(outputData);
+        uint total = (uint)(rows * newCols);
+        _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        _queue.Flush();
+
+        paramsBuffer.Dispose();
         return result;
     }
 
@@ -692,20 +751,24 @@ public class ComputeOps : IDisposable
         int headDim = dModel / numHeads;
 
         // 1. Attention block
-        // 1.1 Pre-normalization
-        var xNorm = Tensor.Create(_device, x.Shape, DataType.F32, "attn_norm_input");
-        var xData = x.ReadData();
-        xNorm.Buffer.Write(xData);
+        // 1.1 Pre-normalization (GPU copy — no CPU roundtrip)
+        var xNorm = Clone(x, "attn_norm_input");
         LayerNorm(xNorm, attnNormWeight, eps);
 
         // 1.2 Q, K, V projections
         var Q = MatMul(xNorm, wQ, "Q");
         var K = MatMul(xNorm, wK, "K");
         var V = MatMul(xNorm, wV, "V");
-#if DEEP_DEBUG
-        Console.WriteLine($"  [TransLayer] Q={Q.Shape} K={K.Shape} V={V.Shape} wK={wK.Shape}");
-#endif
         xNorm.Dispose();
+
+        // 1.3 RoPE — apply rotary embeddings to Q and K before attention
+        int numKVHeads = K.Shape[1] / headDim;
+        ApplyRoPEFull(Q, position, numHeads, headDim);
+        ApplyRoPEFull(K, position, numKVHeads, headDim);
+
+#if DEEP_DEBUG
+        Console.WriteLine($"  [TransLayer] Q={Q.Shape} K={K.Shape} V={V.Shape}");
+#endif
 
         // 1.3 Multi-head attention with KV-cache
         Tensor attnOut;
@@ -726,14 +789,14 @@ public class ComputeOps : IDisposable
 #endif
             
             // Use cached K, V for attention
-            attnOut = MultiHeadAttention(Q, cachedK, cachedV, numHeads, "attn_out");
+            attnOut = MultiHeadAttention(Q, cachedK, cachedV, numHeads, position, "attn_out");
             Q.Dispose();
             // Don't dispose K, V - they're owned by cache
         }
         else
         {
             // Without cache: use K, V directly
-            attnOut = MultiHeadAttention(Q, K, V, numHeads, "attn_out");
+            attnOut = MultiHeadAttention(Q, K, V, numHeads, position, "attn_out");
             Q.Dispose();
             K.Dispose();
             V.Dispose();
@@ -748,10 +811,8 @@ public class ComputeOps : IDisposable
         attnProj.Dispose();
 
         // 2. FFN block
-        // 2.1 Pre-normalization
-        var x1Norm = Tensor.Create(_device, x1.Shape, DataType.F32, "ffn_norm_input");
-        var x1Data = x1.ReadData();
-        x1Norm.Buffer.Write(x1Data);
+        // 2.1 Pre-normalization (GPU copy — no CPU roundtrip)
+        var x1Norm = Clone(x1, "ffn_norm_input");
         LayerNorm(x1Norm, ffnNormWeight, eps);
 
         // 2.2 Feed-forward network
@@ -817,6 +878,34 @@ public class ComputeOps : IDisposable
         tokenBuf.Dispose();
         paramsBuffer.Dispose();
 
+        return result;
+    }
+
+    #endregion
+
+    #region Utility
+
+    /// <summary>
+    /// GPU-side tensor copy — avoids CPU roundtrip from ReadData/Write.
+    /// </summary>
+    public Tensor Clone(Tensor input, string? resultName = null)
+    {
+        var result = Tensor.Create(_device, input.Shape, DataType.F32, resultName);
+
+        uint[] paramsData = { (uint)input.Shape.TotalElements };
+        var paramsBuffer = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+        paramsBuffer.Write(paramsData);
+
+        var kernel = GetOrCreateKernel("copy", ComputeShaders.Copy);
+        kernel.SetArgument(0, input.Buffer);
+        kernel.SetArgument(1, result.Buffer);
+        kernel.SetArgument(2, paramsBuffer);
+
+        uint total = (uint)input.Shape.TotalElements;
+        _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        _queue.Flush();
+
+        paramsBuffer.Dispose();
         return result;
     }
 

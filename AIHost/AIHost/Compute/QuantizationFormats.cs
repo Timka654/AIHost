@@ -95,10 +95,10 @@ void main() {
     int qval = int(low2 | (high1 << 2u)) - 4;
 
     // Scale: scales at offset 96, int8 values
-    // CUDA-compatible scale index: is = 2*(loc/128) + ((loc%128)/16)/2, max = 5
-    uint ip   = loc / 128u;
-    uint ib16 = (loc % 128u) / 16u;
-    uint is_idx = 2u * ip + ib16 / 2u; // 0..5, always < 12
+    // One scale per 16-element sub-block (linear, is=0..15).
+    // Bytes 12-13 overlap d field (matches CPU behavior).
+    // Clamp to 13 to avoid reading past block boundary on GPU.
+    uint is_idx = min(loc / 16u, 13u);
     uint sc_raw = readU8(off + 96u + is_idx);
     int sc = sc_raw >= 128u ? int(sc_raw) - 256 : int(sc_raw);
 

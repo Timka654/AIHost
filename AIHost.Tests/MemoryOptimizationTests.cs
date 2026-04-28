@@ -157,6 +157,8 @@ public class MemoryOptimizationTests : IDisposable
     public void Dispose()
     {
         _ops?.Dispose();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
         _device?.Dispose();
     }
 }

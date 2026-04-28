@@ -10,7 +10,9 @@ internal class Program
         // Check for --web flag to start web server
         if (args.Contains("--web"))
         {
-            await WebServer.RunAsync(args);
+            // Web server entry is in WebServer.cs (top-level statements).
+            // This branch is unreachable when that file is the program entry point.
+            Console.WriteLine("Use 'dotnet run' without --manual to start the web server.");
             return;
         }
 

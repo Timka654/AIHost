@@ -67,32 +67,11 @@ public class InferenceEngine : IDisposable
     /// </summary>
     public string[] BatchGenerate(string[] prompts, GenerationConfig config)
     {
+        // Vulkan command queues are not thread-safe — process sequentially.
+        // True batch parallelism would require per-prompt InferenceEngine instances.
         var results = new string[prompts.Length];
-        
-        // Process in chunks based on batch size
-        var tasks = new List<Task>();
-        var semaphore = new SemaphoreSlim(_batchSize, _batchSize);
-        
         for (int i = 0; i < prompts.Length; i++)
-        {
-            var index = i;
-            tasks.Add(Task.Run(async () =>
-            {
-                await semaphore.WaitAsync();
-                try
-                {
-                    // Each task needs its own KV-cache for thread safety
-                    // For now, just generate sequentially but respect batch_size limit
-                    results[index] = Generate(prompts[index], config);
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
-            }));
-        }
-        
-        Task.WaitAll(tasks.ToArray());
+            results[i] = Generate(prompts[i], config);
         return results;
     }
 

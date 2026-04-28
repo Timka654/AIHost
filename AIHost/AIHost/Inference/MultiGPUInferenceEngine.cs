@@ -294,9 +294,18 @@ public class MultiGPUInferenceEngine : IDisposable
 
         for (int i = 0; i < _devices.Length; i++)
         {
+            _kvCaches[i]?.Dispose();
             _ops[i]?.Dispose();
-            _devices[i]?.Dispose();
+            _models[i]?.Dispose(); // releases weight cache GPU buffers
         }
+
+        // GC before device teardown — ensures finalizers of any lingering
+        // GPU objects run while the Vulkan device is still alive.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        for (int i = 0; i < _devices.Length; i++)
+            _devices[i]?.Dispose();
 
         _disposed = true;
     }

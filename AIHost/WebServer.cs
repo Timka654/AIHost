@@ -8,15 +8,22 @@ using AIHost.Middleware;
 using AIHost.Services;
 using System.Text.Json;
 
+// Manual test mode: bypass web server entirely
+if (args.Contains("--manual"))
+{
+    AIHost.ManualTests.TestRunner.RunInteractiveTests(args.Where(a => a != "--manual").ToArray());
+    return;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Load server configuration
+// Locate server.json — prefer data/config, fall back to config/ for backward compat.
 var configPath = Path.Combine(AppContext.BaseDirectory, "data", "config", "server.json");
 if (!File.Exists(configPath))
-{
-    // Fallback to old location for backward compatibility
     configPath = Path.Combine(AppContext.BaseDirectory, "config", "server.json");
-}
+
+// Load config for early startup decisions (port, device, etc.).
+// System.Text.Json is used so [JsonPropertyName] attributes on ServerConfig are respected.
 var serverConfig = new ServerConfig();
 
 if (File.Exists(configPath))
@@ -28,13 +35,15 @@ if (File.Exists(configPath))
 else
 {
     Console.WriteLine($"⚠ Server config not found, using defaults");
-    
-    // Create default config
     Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
     var defaultJson = JsonSerializer.Serialize(serverConfig, new JsonSerializerOptions { WriteIndented = true });
     await File.WriteAllTextAsync(configPath, defaultJson);
     Console.WriteLine($"✓ Created default config at {configPath}");
 }
+
+// Also wire server.json into the IConfiguration pipeline so that services can
+// access it via IConfiguration and it participates in the standard config chain.
+builder.Configuration.AddJsonFile(configPath, optional: true, reloadOnChange: false);
 
 // Ensure directory structure and template files exist
 EnsureDirectoryStructure(serverConfig);
@@ -107,6 +116,10 @@ var modelManager = new ModelManager(serverConfig.ModelsDirectory, computeDevice)
 builder.Services.AddSingleton(modelManager);
 builder.Services.AddSingleton(serverConfig);
 
+// Background services registered through DI — participate in graceful shutdown.
+builder.Services.AddHostedService<ModelAutoUnloadService>();
+builder.Services.AddHostedService<ModelConfigWatcherService>();
+
 var app = builder.Build();
 
 // Configure middleware
@@ -141,8 +154,7 @@ else
     Console.WriteLine("⚠ Token authentication disabled (no tokens file)");
 }
 
-// Start auto-unload service
-var autoUnloadService = new ModelAutoUnloadService(modelManager, serverConfig.AutoUnloadMinutes);
+// (Auto-unload is now managed by DI as ModelAutoUnloadService IHostedService)
 
 if (serverConfig.ManageToken != null)
 {

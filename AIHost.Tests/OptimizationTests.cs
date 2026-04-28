@@ -255,6 +255,8 @@ public class OptimizationTests : IDisposable
 
     public void Dispose()
     {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
         _device.Dispose();
     }
 }

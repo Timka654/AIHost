@@ -31,6 +31,10 @@ public static class ComputeShaders
     public static string RowwiseSoftmax => TryLoadOrInline("rowwise_softmax", _inlineRowwiseSoftmax);
     public static string Scale => TryLoadOrInline("scale", _inlineScale);
     public static string EmbeddingLookup => TryLoadOrInline("embedding_lookup", _inlineEmbeddingLookup);
+    public static string RoPEFull => TryLoadOrInline("rope_full", _inlineRoPEFull);
+    public static string CausalMask => TryLoadOrInline("causal_mask", _inlineCausalMask);
+    public static string Copy => TryLoadOrInline("copy", _inlineCopy);
+    public static string RepeatColumns => TryLoadOrInline("repeat_columns", _inlineRepeatColumns);
 
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {
@@ -387,6 +391,83 @@ void main() {
     int tokenId = tokenIds.ids[seq];
     if (tokenId < 0) return;
     output_buf.data[gid] = table.data[uint(tokenId) * params.dModel + dim];
+}
+";
+
+    private const string _inlineRoPEFull = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
+layout(set = 0, binding = 1) readonly buffer Params {
+    uint seqLen; uint numHeads; uint headDim; uint startPosition; float theta;
+} params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint halfHead = params.headDim / 2u;
+    uint pairsPerSeq = params.numHeads * halfHead;
+    if (gid >= params.seqLen * pairsPerSeq) return;
+    uint seq  = gid / pairsPerSeq;
+    uint rem  = gid % pairsPerSeq;
+    uint head = rem / halfHead;
+    uint pair = rem % halfHead;
+    uint pos = params.startPosition + seq;
+    float freq = 1.0 / pow(params.theta, float(pair * 2u) / float(params.headDim));
+    float angle = float(pos) * freq;
+    float c = cos(angle), s = sin(angle);
+    uint base = (seq * params.numHeads + head) * params.headDim + pair * 2u;
+    float x1 = buf.data[base];
+    float x2 = buf.data[base + 1u];
+    buf.data[base]     = x1 * c - x2 * s;
+    buf.data[base + 1u] = x1 * s + x2 * c;
+}
+";
+
+    private const string _inlineCausalMask = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
+layout(set = 0, binding = 1) readonly buffer Params {
+    uint seqLen_q; uint seqLen_k; uint startPosition;
+} params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.seqLen_q * params.seqLen_k) return;
+    uint i = gid / params.seqLen_k;
+    uint j = gid % params.seqLen_k;
+    if (j > params.startPosition + i) {
+        buf.data[gid] = -1e38;
+    }
+}
+";
+
+    private const string _inlineCopy = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
+layout(set = 0, binding = 2) readonly buffer Params { uint size; } params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.size) return;
+    dst.data[gid] = src.data[gid];
+}
+";
+
+    // Each output element (row, outCol) gathers from srcCol = outCol / repeatFactor.
+    private const string _inlineRepeatColumns = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
+layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint cols; uint repeatFactor; } params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint newCols = params.cols * params.repeatFactor;
+    if (gid >= params.rows * newCols) return;
+    uint row    = gid / newCols;
+    uint outCol = gid % newCols;
+    uint srcCol = outCol / params.repeatFactor;
+    dst.data[gid] = src.data[row * params.cols + srcCol];
 }
 ";
 }

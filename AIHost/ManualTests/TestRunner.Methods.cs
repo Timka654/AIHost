@@ -580,7 +580,7 @@ void main() {
 
         // Run multi-head attention
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var output = ops.MultiHeadAttention(Q, K, V, numHeads, "attention_output");
+        var output = ops.MultiHeadAttention(Q, K, V, numHeads, 0u, "attention_output");
         sw.Stop();
 
         var result = output.ReadData();
@@ -830,18 +830,15 @@ void main() {
         var model = new GGUF.GGUFModel(modelPath, provider);
         Console.WriteLine($"✓ Model loaded: {model.Tensors.Count} tensors\n");
 
-        // Create transformer
+        // Create transformer (owns its ComputeOps internally)
         var transformer = new Compute.Transformer(provider, model);
         transformer.LoadWeights();
 
         // Load real tokenizer from GGUF metadata
         var tokenizer = Tokenizer.BPETokenizer.FromGGUF(model.Reader);
 
-        // Create compute ops for KV-cache
-        using var ops = new Compute.ComputeOps(provider);
-
-        // Create inference engine
-        using var engine = new Inference.InferenceEngine(transformer, tokenizer, ops);
+        // Share Transformer's ComputeOps — no second command queue created
+        using var engine = new Inference.InferenceEngine(transformer, tokenizer, transformer.Ops);
 
         // Generation config
         var config = new Inference.GenerationConfig

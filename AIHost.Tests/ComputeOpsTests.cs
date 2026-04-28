@@ -18,6 +18,8 @@ public class ComputeOpsTests : IDisposable
     public void Dispose()
     {
         _ops.Dispose();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
         _device.Dispose();
     }
 

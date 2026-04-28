@@ -9,48 +9,69 @@ using Xunit;
 namespace AIHost.Tests;
 
 /// <summary>
-/// Tests for advanced inference features (batch, sampling)
+/// Shared fixture: loads the model once for all tests in InferenceAdvancedTests.
+/// Avoids 5× model load + double ComputeOps that caused the post-test crash.
 /// </summary>
-public class InferenceAdvancedTests : IDisposable
+public class InferenceFixture : IDisposable
 {
-    private readonly IComputeDevice _device;
-    private readonly Transformer _model;
-    private readonly BPETokenizer _tokenizer;
-    private readonly ComputeOps _ops;
+    public IComputeDevice Device { get; }
+    public Transformer Model { get; }
+    public BPETokenizer Tokenizer { get; }
+    public InferenceEngine Engine { get; }
+
+    // Must be stored and disposed — otherwise finalized after Device.Dispose() → Vulkan crash.
+    private readonly GGUFModel _ggufModel;
+
+    public InferenceFixture()
+    {
+        var modelPath = Environment.GetEnvironmentVariable("TEST_MODEL_PATH")
+            ?? @"D:\User\Downloads\tinyllama-1.1b-chat-v1.0.Q2_K.gguf";
+
+        Device = new VulkanComputeDevice();
+        _ggufModel = new GGUFModel(modelPath, Device);
+
+        Model = new Transformer(Device, _ggufModel);
+        Model.LoadWeights();
+
+        Tokenizer = BPETokenizer.FromGGUF(_ggufModel.Reader);
+        // Share Transformer's ComputeOps — no second command queue
+        Engine = new InferenceEngine(Model, Tokenizer, Model.Ops);
+    }
+
+    public void Dispose()
+    {
+        Engine.Dispose();
+        Model.Dispose();
+        _ggufModel.Dispose();
+        // Force GC to finalize any lingering Vulkan objects before the device is destroyed.
+        // Without this, finalizers may run after Device.Dispose() and crash the process.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        Device.Dispose();
+    }
+}
+
+/// <summary>
+/// Tests for advanced inference features (batch, sampling).
+/// Uses IClassFixture so the model loads once for all tests.
+/// </summary>
+public class InferenceAdvancedTests : IClassFixture<InferenceFixture>
+{
     private readonly InferenceEngine _engine;
 
-    public InferenceAdvancedTests()
+    public InferenceAdvancedTests(InferenceFixture fixture)
     {
-        var modelPath = Environment.GetEnvironmentVariable("TEST_MODEL_PATH") 
-            ?? @"D:\User\Downloads\tinyllama-1.1b-chat-v1.0.Q2_K.gguf";
-        
-        _device = new VulkanComputeDevice();
-        var ggufModel = new GGUFModel(modelPath, _device);
-        
-        _model = new Transformer(_device, ggufModel);
-        _model.LoadWeights();
-        
-        _tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
-        _ops = new ComputeOps(_device);
-        _engine = new InferenceEngine(_model, _tokenizer, _ops);
+        _engine = fixture.Engine;
     }
 
     [Fact]
     public void BatchGenerate_MultiplePrompts_ReturnsResults()
     {
-        // Arrange
         var prompts = new[] { "Hello", "Hi", "Hey" };
-        var config = new GenerationConfig
-        {
-            MaxNewTokens = 5,
-            Temperature = 0.7f,
-            UseKVCache = true
-        };
+        var config = new GenerationConfig { MaxNewTokens = 5, Temperature = 0.7f, UseKVCache = true };
 
-        // Act
         var results = _engine.BatchGenerate(prompts, config);
 
-        // Assert
         Assert.Equal(3, results.Length);
         foreach (var result in results)
         {
@@ -62,53 +83,31 @@ public class InferenceAdvancedTests : IDisposable
     [Fact]
     public void Generate_WithRepetitionPenalty_ReducesRepetition()
     {
-        // Arrange
         var prompt = "The the the";
-        var configWithPenalty = new GenerationConfig
+        var withPenalty = new GenerationConfig
         {
-            MaxNewTokens = 10,
-            Temperature = 1.0f,
-            RepetitionPenalty = 1.5f,
-            UseKVCache = true
+            MaxNewTokens = 10, Temperature = 1.0f, RepetitionPenalty = 1.5f, UseKVCache = true
         };
-        
-        var configWithoutPenalty = new GenerationConfig
+        var withoutPenalty = new GenerationConfig
         {
-            MaxNewTokens = 10,
-            Temperature = 1.0f,
-            RepetitionPenalty = 1.0f,
-            UseKVCache = true,
-            Seed = 42
+            MaxNewTokens = 10, Temperature = 1.0f, RepetitionPenalty = 1.0f, UseKVCache = true, Seed = 42
         };
 
-        // Act
-        var resultWithPenalty = _engine.Generate(prompt, configWithPenalty);
-        var resultWithoutPenalty = _engine.Generate(prompt, configWithoutPenalty);
+        var r1 = _engine.Generate(prompt, withPenalty);
+        var r2 = _engine.Generate(prompt, withoutPenalty);
 
-        // Assert
-        Assert.NotNull(resultWithPenalty);
-        Assert.NotNull(resultWithoutPenalty);
-        // Results should differ when penalty is applied
-        Assert.NotEqual(resultWithPenalty, resultWithoutPenalty);
+        Assert.NotNull(r1);
+        Assert.NotNull(r2);
+        Assert.NotEqual(r1, r2);
     }
 
     [Fact]
     public void Generate_WithTopK_LimitsVocabulary()
     {
-        // Arrange
-        var prompt = "Once";
-        var config = new GenerationConfig
-        {
-            MaxNewTokens = 5,
-            TopK = 5,
-            Temperature = 1.0f,
-            Seed = 42
-        };
+        var config = new GenerationConfig { MaxNewTokens = 5, TopK = 5, Temperature = 1.0f, Seed = 42 };
 
-        // Act
-        var result = _engine.Generate(prompt, config);
+        var result = _engine.Generate("Once", config);
 
-        // Assert
         Assert.NotNull(result);
         Assert.Contains("Once", result);
     }
@@ -116,21 +115,13 @@ public class InferenceAdvancedTests : IDisposable
     [Fact]
     public void Generate_WithTopP_NucleusSampling()
     {
-        // Arrange
-        var prompt = "Once upon";
         var config = new GenerationConfig
         {
-            MaxNewTokens = 5,
-            TopP = 0.9f,
-            TopK = 0, // Disable TopK
-            Temperature = 1.0f,
-            Seed = 42
+            MaxNewTokens = 5, TopP = 0.9f, TopK = 0, Temperature = 1.0f, Seed = 42
         };
 
-        // Act
-        var result = _engine.Generate(prompt, config);
+        var result = _engine.Generate("Once upon", config);
 
-        // Assert
         Assert.NotNull(result);
         Assert.Contains("Once upon", result);
     }
@@ -138,39 +129,15 @@ public class InferenceAdvancedTests : IDisposable
     [Fact]
     public void Generate_WithDifferentTemperatures_ProducesDifferentResults()
     {
-        // Arrange
-        var prompt = "Hello";
-        var lowTemp = new GenerationConfig
-        {
-            MaxNewTokens = 10,
-            Temperature = 0.1f,
-            Seed = 42
-        };
-        
-        var highTemp = new GenerationConfig
-        {
-            MaxNewTokens = 10,
-            Temperature = 2.0f,
-            Seed = 43
-        };
+        var lowTemp  = new GenerationConfig { MaxNewTokens = 10, Temperature = 0.1f, Seed = 42 };
+        var highTemp = new GenerationConfig { MaxNewTokens = 10, Temperature = 2.0f, Seed = 42 };
 
-        // Act
-        var resultLow = _engine.Generate(prompt, lowTemp);
-        var resultHigh = _engine.Generate(prompt, highTemp);
+        var resultLow  = _engine.Generate("Hello", lowTemp);
+        var resultHigh = _engine.Generate("Hello", highTemp);
 
-        // Assert
         Assert.NotNull(resultLow);
         Assert.NotNull(resultHigh);
-        // Low temperature should be more deterministic
         Assert.Contains("Hello", resultLow);
         Assert.Contains("Hello", resultHigh);
-    }
-
-    public void Dispose()
-    {
-        _engine?.Dispose();
-        _ops?.Dispose();
-        _model?.Dispose();
-        _device?.Dispose();
     }
 }

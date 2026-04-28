@@ -1,61 +1,59 @@
-using System.Collections.Concurrent;
-using System.Timers;
+using AIHost.Config;
+using Microsoft.Extensions.Hosting;
 
 namespace AIHost.Services;
 
 /// <summary>
-/// Auto-unload service for inactive models
+/// Auto-unloads models that have been idle longer than their keep-alive threshold.
+/// Runs as a hosted background service integrated with the ASP.NET Core lifetime.
 /// </summary>
-public class ModelAutoUnloadService : IDisposable
+public sealed class ModelAutoUnloadService : BackgroundService
 {
-    private readonly Config.ModelManager _modelManager;
-    private readonly System.Timers.Timer _timer;
-    private readonly int _inactiveMinutes;
-    private bool _disposed;
+    private readonly ModelManager _modelManager;
+    private readonly ServerConfig _serverConfig;
 
-    public ModelAutoUnloadService(Config.ModelManager modelManager, int inactiveMinutes)
+    public ModelAutoUnloadService(ModelManager modelManager, ServerConfig serverConfig)
     {
         _modelManager = modelManager;
-        _inactiveMinutes = inactiveMinutes;
+        _serverConfig = serverConfig;
+    }
 
-        if (_inactiveMinutes > 0)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (_serverConfig.AutoUnloadMinutes <= 0)
         {
-            _timer = new System.Timers.Timer(TimeSpan.FromMinutes(1).TotalMilliseconds);
-            _timer.Elapsed += CheckAndUnloadInactiveModels;
-            _timer.Start();
-            Console.WriteLine($"✓ Auto-unload enabled: {_inactiveMinutes} minutes of inactivity");
-        }
-        else
-        {
-            _timer = null!;
             Console.WriteLine("⚠ Auto-unload disabled");
+            return;
+        }
+
+        Console.WriteLine($"✓ Auto-unload enabled: {_serverConfig.AutoUnloadMinutes} minutes of inactivity");
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
+            CheckAndUnloadInactiveModels();
         }
     }
 
-    private void CheckAndUnloadInactiveModels(object? sender, ElapsedEventArgs e)
+    private void CheckAndUnloadInactiveModels()
     {
         try
         {
             var models = _modelManager.GetLoadedModels();
             var now = DateTime.UtcNow;
 
-            foreach (var kvp in models)
+            foreach (var (name, model) in models)
             {
-                var model = kvp.Value;
+                var keepAliveMinutes = model.Config.KeepAliveMinutes ?? _serverConfig.AutoUnloadMinutes;
+                if (keepAliveMinutes == 0) continue;
+
                 var lastActivity = model.LastRequestAt ?? model.LoadedAt;
-                var inactiveDuration = now - lastActivity;
+                var idleMinutes = (now - lastActivity).TotalMinutes;
 
-                // Use model-specific keep_alive if set, otherwise use global setting
-                var keepAliveMinutes = model.Config.KeepAliveMinutes ?? _inactiveMinutes;
-                
-                // If keep_alive is 0, never unload this model
-                if (keepAliveMinutes == 0)
-                    continue;
-
-                if (inactiveDuration.TotalMinutes >= keepAliveMinutes)
+                if (idleMinutes >= keepAliveMinutes)
                 {
-                    Console.WriteLine($"Auto-unloading inactive model: {kvp.Key} (inactive for {inactiveDuration.TotalMinutes:F1} minutes, keep_alive: {keepAliveMinutes}m)");
-                    _modelManager.UnloadModel(kvp.Key);
+                    Console.WriteLine($"Auto-unloading {name} (idle {idleMinutes:F1}m, threshold {keepAliveMinutes}m)");
+                    _modelManager.UnloadModel(name);
                 }
             }
         }
@@ -63,14 +61,5 @@ public class ModelAutoUnloadService : IDisposable
         {
             Console.WriteLine($"Error in auto-unload service: {ex.Message}");
         }
-    }
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-
-        _timer?.Stop();
-        _timer?.Dispose();
-        _disposed = true;
     }
 }
