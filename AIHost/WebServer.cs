@@ -115,6 +115,9 @@ Console.WriteLine($"✓ Request logger initialized (persistent: {serverConfig.Pe
 var modelManager = new ModelManager(serverConfig.ModelsDirectory, computeDevice);
 builder.Services.AddSingleton(modelManager);
 builder.Services.AddSingleton(serverConfig);
+// Register the global compute device so future services can receive it via DI.
+// Note: disposed manually at shutdown — DI doesn't own singleton instances registered this way.
+builder.Services.AddSingleton<IComputeDevice>(computeDevice);
 
 // Background services registered through DI — participate in graceful shutdown.
 builder.Services.AddHostedService<ModelAutoUnloadService>();

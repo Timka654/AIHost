@@ -63,12 +63,12 @@ public class InferenceEngine : IDisposable
     }
 
     /// <summary>
-    /// Generate text from multiple prompts in batch (parallel up to batch_size limit)
+    /// Generate text for multiple prompts sequentially.
+    /// True parallel batch inference would require one InferenceEngine per prompt
+    /// (Vulkan command queues are not thread-safe).
     /// </summary>
     public string[] BatchGenerate(string[] prompts, GenerationConfig config)
     {
-        // Vulkan command queues are not thread-safe — process sequentially.
-        // True batch parallelism would require per-prompt InferenceEngine instances.
         var results = new string[prompts.Length];
         for (int i = 0; i < prompts.Length; i++)
             results[i] = Generate(prompts[i], config);
