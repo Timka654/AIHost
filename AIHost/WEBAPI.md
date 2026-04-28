@@ -24,7 +24,7 @@
 
 ### 2. Конфигурация модели
 
-Создайте папку модели: `models/tinyllama-chat/model.json`
+Создайте папку модели: `data/models/tinyllama-chat/model.json`
 
 ```json
 {
@@ -32,6 +32,12 @@
   "model": "D:\\path\\to\\model.gguf",
   "format": "gguf",
   "auto_download": false,
+  
+  "compute_provider": "vulkan",
+  "device_index": 0,
+  "keep_alive": 30,
+  "enable_mmap": true,
+  
   "parameters": {
     "temperature": 0.7,
     "top_k": 40,

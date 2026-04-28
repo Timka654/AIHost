@@ -168,6 +168,9 @@ cat > ./data/models/my-model/model.json <<EOF
 {
   "name": "my-model",
   "model": "./data/models/my-model/model.gguf",
+  "format": "gguf",
+  "compute_provider": "vulkan",
+  "keep_alive": 30,
   "format": "gguf"
 }
 EOF
@@ -409,7 +412,11 @@ wget https://huggingface.co/.../llama2.gguf \
 cat > data/models/llama2-7b/model.json <<EOF
 {
   "name": "llama2-7b",
-  "model": "./data/models/llama2-7b/model.gguf"
+  "model": "./data/models/llama2-7b/model.gguf",
+  "format": "gguf",
+  "compute_provider": "vulkan",
+  "keep_alive": 30,
+  "enable_mmap": true
 }
 EOF
 

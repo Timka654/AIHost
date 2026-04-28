@@ -73,6 +73,35 @@ data/
 }
 ```
 
+### Model Configuration (`data/models/{model}/model.json`)
+
+Each model can override global settings:
+
+```json
+{
+  "name": "tinyllama-chat",
+  "model": "path/to/model.gguf",
+  
+  "compute_provider": "vulkan",
+  "device_index": 0,
+  "keep_alive": 30,
+  "enable_mmap": true,
+  
+  "parameters": {
+    "temperature": 0.7,
+    "context_size": 2048
+  }
+}
+```
+
+**Per-model settings:**
+- `compute_provider` - Override GPU backend (vulkan/cuda/rocm)
+- `device_index` - Select specific GPU device
+- `keep_alive` - Minutes before auto-unload (0 = never)
+- `enable_mmap` - Use memory mapping to reduce RAM
+
+See [MANAGEMENT.md](MANAGEMENT.md) for complete configuration reference.
+
 ## 🌐 API Examples
 
 ### Ollama API
