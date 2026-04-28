@@ -17,6 +17,7 @@ public class ModelManager : IDisposable
 {
     private readonly string _modelsDirectory;
     private readonly IComputeDevice _device;
+    private readonly ILogger<ModelManager> _logger;
 
     public string ModelsDirectory => _modelsDirectory;
     private readonly ConcurrentDictionary<string, ModelInstance> _loadedModels = new();
@@ -25,11 +26,12 @@ public class ModelManager : IDisposable
     private readonly SemaphoreSlim _loadLock = new(1, 1);
     private bool _disposed;
 
-    public ModelManager(string modelsDirectory, IComputeDevice device)
+    public ModelManager(string modelsDirectory, IComputeDevice device, ILogger<ModelManager> logger)
     {
         _modelsDirectory = modelsDirectory;
         _device = device;
-        
+        _logger = logger;
+
         // Load all model configs
         LoadModelConfigs();
     }
@@ -42,7 +44,7 @@ public class ModelManager : IDisposable
         if (!Directory.Exists(_modelsDirectory))
         {
             Directory.CreateDirectory(_modelsDirectory);
-            Console.WriteLine($"Created models directory: {_modelsDirectory}");
+            _logger.LogInformation("Created models directory: {Dir}", _modelsDirectory);
             return;
         }
 
@@ -56,20 +58,20 @@ public class ModelManager : IDisposable
             {
                 var json = File.ReadAllText(configPath);
                 var config = JsonSerializer.Deserialize<ModelConfig>(json);
-                
+
                 if (config != null && !string.IsNullOrEmpty(config.Name))
                 {
                     _modelConfigs[config.Name] = config;
-                    Console.WriteLine($"Loaded model config: {config.Name}");
+                    _logger.LogInformation("Loaded model config: {Name}", config.Name);
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Failed to load config from {configPath}: {ex.Message}");
+                _logger.LogError(ex, "Failed to load config from {Path}", configPath);
             }
         }
 
-        Console.WriteLine($"Loaded {_modelConfigs.Count} model configuration(s)");
+        _logger.LogInformation("Loaded {Count} model configuration(s)", _modelConfigs.Count);
     }
 
     /// <summary>
@@ -126,30 +128,25 @@ public class ModelManager : IDisposable
             var provider = config.ComputeProvider ?? "vulkan";
             var deviceIndex = config.DeviceIndex ?? 0;
             
-            Console.WriteLine($"Creating dedicated {provider} device (index {deviceIndex}) for model {modelName}");
+            _logger.LogInformation("Creating dedicated {Provider} device (index {Index}) for model {Model}", provider, deviceIndex, modelName);
             perModelDevice = CreateComputeDevice(provider, deviceIndex);
             device = perModelDevice;
         }
 
-        // Load model
-        Console.WriteLine($"Loading model: {modelName} from {modelPath}");
-        Console.WriteLine($"  Provider: {config.ComputeProvider ?? "(global)"}");
-        Console.WriteLine($"  Device Index: {config.DeviceIndex?.ToString() ?? "(global)"}");
-        Console.WriteLine($"  Keep Alive: {config.KeepAliveMinutes?.ToString() ?? "(global)"} minutes");
-        Console.WriteLine($"  GPU Layers: {config.NumGpuLayers?.ToString() ?? "all"}");
-        Console.WriteLine($"  Batch Size: {config.BatchSize?.ToString() ?? "8 (default)"}");
-        Console.WriteLine($"  Memory Mapping: {config.EnableMmap}");
-        Console.WriteLine($"  Memory Lock: {config.EnableMlock}");
-        
-        // Warnings for features not yet fully integrated
-        if (config.NumGpuLayers.HasValue && config.NumGpuLayers.Value >= 0)
-        {
-            Console.WriteLine($"  ⚠ Warning: num_gpu_layers is configured but requires Transformer changes for hybrid CPU/GPU");
-        }
+        _logger.LogInformation(
+            "Loading model {Model} | provider={Provider} device={Device} keep_alive={KeepAlive}m gpu_layers={Layers} batch={Batch} mmap={Mmap} mlock={Mlock}",
+            modelName,
+            config.ComputeProvider ?? "(global)",
+            config.DeviceIndex?.ToString() ?? "(global)",
+            config.KeepAliveMinutes?.ToString() ?? "(global)",
+            config.NumGpuLayers?.ToString() ?? "all",
+            config.BatchSize?.ToString() ?? "8",
+            config.EnableMmap, config.EnableMlock);
+
+        if (config.NumGpuLayers is >= 0)
+            _logger.LogWarning("num_gpu_layers requires Transformer changes for hybrid CPU/GPU — ignored");
         if (config.EnableMlock && !config.EnableMmap)
-        {
-            Console.WriteLine($"  ⚠ Warning: enable_mlock requires enable_mmap to be true");
-        }
+            _logger.LogWarning("enable_mlock requires enable_mmap to be true");
         
         // LazyGGUFModel owns its GGUFReader — reuse it for the tokenizer
         // to avoid opening and parsing the same file twice.
@@ -157,6 +154,7 @@ public class ModelManager : IDisposable
         var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
         // Transformer owns its ComputeOps; share it with InferenceEngine
         var transformer = new Transformer(device, ggufModel);
+        transformer.LoadWeights();
 
         // Use configured batch size or default to 8
         int batchSize = config.BatchSize ?? 8;
@@ -177,7 +175,7 @@ public class ModelManager : IDisposable
 
         _loadedModels[modelName] = loaded;
 
-        Console.WriteLine($"✓ Model '{modelName}' loaded successfully");
+        _logger.LogInformation("Model '{Model}' loaded successfully", modelName);
 
         return loaded;
     }
@@ -207,17 +205,15 @@ public class ModelManager : IDisposable
     /// <summary>
     /// Check if string is a URL
     /// </summary>
-    private bool IsUrl(string path)
-    {
-        return path.StartsWith("http://") || path.StartsWith("https://");
-    }
+    private static bool IsUrl(string path)
+        => path.StartsWith("http://") || path.StartsWith("https://");
 
     /// <summary>
     /// Download model from URL
     /// </summary>
     private async Task DownloadModelAsync(string url, string destinationPath)
     {
-        Console.WriteLine($"Downloading model from {url}...");
+        _logger.LogInformation("Downloading model from {Url}", url);
         
         var directory = Path.GetDirectoryName(destinationPath);
         if (!string.IsNullOrEmpty(directory))
@@ -246,11 +242,11 @@ public class ModelManager : IDisposable
             if (totalBytes > 0 && downloadedBytes % (10 * 1024 * 1024) == 0) // Log every 10MB
             {
                 var progress = (double)downloadedBytes / totalBytes * 100;
-                Console.WriteLine($"Download progress: {progress:F1}% ({downloadedBytes / (1024 * 1024)}MB / {totalBytes / (1024 * 1024)}MB)");
+                _logger.LogInformation("Download progress: {Pct:F1}% ({MB}MB / {TotalMB}MB)", progress, downloadedBytes / (1024 * 1024), totalBytes / (1024 * 1024));
             }
         }
 
-        Console.WriteLine($"✓ Model downloaded: {destinationPath}");
+        _logger.LogInformation("Model downloaded: {Path}", destinationPath);
     }
 
     /// <summary>
@@ -274,7 +270,7 @@ public class ModelManager : IDisposable
             }
             else
             {
-                Console.WriteLine($"Warning: System message file not found: {resolvedPath}");
+                _logger.LogWarning("System message file not found: {Path}", resolvedPath);
             }
         }
 
@@ -306,7 +302,7 @@ public class ModelManager : IDisposable
         if (_loadedModels.TryRemove(modelName, out var instance))
         {
             instance.Dispose();
-            Console.WriteLine($"Unloaded model: {modelName}");
+            _logger.LogInformation("Unloaded model: {Model}", modelName);
         }
     }
 
@@ -355,14 +351,15 @@ public class ModelManager : IDisposable
 
         if (isUpdate && _loadedModels.ContainsKey(config.Name))
         {
-            Console.WriteLine($"Model config changed, unloading for hot-reload: {config.Name}");
+            _logger.LogInformation("Model config changed, unloading for hot-reload: {Model}", config.Name);
             UnloadModel(config.Name);
         }
         else
         {
-            Console.WriteLine(isUpdate
-                ? $"Model config updated (not loaded): {config.Name}"
-                : $"New model available: {config.Name}");
+            if (isUpdate)
+                _logger.LogInformation("Model config updated (not loaded): {Model}", config.Name);
+            else
+                _logger.LogInformation("New model available: {Model}", config.Name);
         }
     }
 
@@ -375,19 +372,19 @@ public class ModelManager : IDisposable
         _modelConfigs.TryRemove(modelName, out _);
         if (_loadedModels.ContainsKey(modelName))
         {
-            Console.WriteLine($"Model config removed, unloading: {modelName}");
+            _logger.LogInformation("Model config removed, unloading: {Model}", modelName);
             UnloadModel(modelName);
         }
         else
         {
-            Console.WriteLine($"Model config removed: {modelName}");
+            _logger.LogInformation("Model config removed: {Model}", modelName);
         }
     }
 
     /// <summary>
     /// Create compute device by provider name
     /// </summary>
-    private IComputeDevice CreateComputeDevice(string provider, int deviceIndex)
+    private static IComputeDevice CreateComputeDevice(string provider, int deviceIndex)
     {
         return provider.ToLower() switch
         {
@@ -408,6 +405,7 @@ public class ModelManager : IDisposable
         _loadedModels.Clear();
         _loadLock.Dispose();
         _disposed = true;
+        GC.SuppressFinalize(this);
     }
 }
 

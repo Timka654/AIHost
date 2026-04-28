@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using AIHost.Config;
 
 namespace AIHost.Middleware;
@@ -9,6 +10,7 @@ namespace AIHost.Middleware;
 public class TokenAuthMiddleware : IDisposable
 {
     private readonly RequestDelegate _next;
+    private readonly ILogger<TokenAuthMiddleware> _logger;
     private readonly HashSet<string> _validTokens = new();
     private readonly string? _manageToken;
     private readonly string? _tokensFilePath;
@@ -16,8 +18,9 @@ public class TokenAuthMiddleware : IDisposable
     private readonly FileSystemWatcher? _fileWatcher;
     private bool _disposed;
 
-    public TokenAuthMiddleware(RequestDelegate next, ServerConfig serverConfig)
+    public TokenAuthMiddleware(RequestDelegate next, ServerConfig serverConfig, ILogger<TokenAuthMiddleware> logger)
     {
+        _logger = logger;
         _next = next;
         _manageToken = serverConfig.ManageToken;
         
@@ -51,11 +54,11 @@ public class TokenAuthMiddleware : IDisposable
                     _fileWatcher.Created += OnTokensFileChanged;
                     _fileWatcher.Deleted += OnTokensFileDeleted;
                     
-                    Console.WriteLine($"✓ Token file watcher enabled: {fileName}");
+                    _logger.LogInformation("Token file watcher enabled: {File}", fileName);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"⚠ Failed to setup file watcher: {ex.Message}");
+                    _logger.LogWarning(ex, "Failed to setup token file watcher");
                 }
             }
         }
@@ -73,11 +76,13 @@ public class TokenAuthMiddleware : IDisposable
             try
             {
                 LoadTokens(path);
-                Console.WriteLine($"🔄 Tokens reloaded: {_validTokens.Count} token(s)");
+                int count;
+                lock (_lockObj) { count = _validTokens.Count; }
+                _logger.LogInformation("Tokens reloaded: {Count} token(s)", count);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"⚠ Failed to reload tokens: {ex.Message}");
+                _logger.LogError(ex, "Failed to reload tokens");
             }
         });
     }
@@ -88,7 +93,7 @@ public class TokenAuthMiddleware : IDisposable
         {
             _validTokens.Clear();
         }
-        Console.WriteLine($"⚠ Tokens file deleted - authentication disabled");
+        _logger.LogWarning("Tokens file deleted — authentication disabled");
     }
 
     private void LoadTokens(string filePath)
@@ -101,7 +106,7 @@ public class TokenAuthMiddleware : IDisposable
                 {
                     _validTokens.Clear();
                 }
-                Console.WriteLine($"⚠ Tokens file not found: {filePath}");
+                _logger.LogWarning("Tokens file not found: {Path}", filePath);
                 return;
             }
             
@@ -126,14 +131,11 @@ public class TokenAuthMiddleware : IDisposable
                 }
             }
             
-            if (newTokens.Count == 0)
-            {
-                Console.WriteLine($"⚠ No valid tokens found - authentication disabled");
-            }
+            var tokenCount = newTokens.Count;
+            if (tokenCount == 0)
+                _logger.LogWarning("No valid tokens found — authentication disabled");
             else
-            {
-                Console.WriteLine($"✓ Loaded {_validTokens.Count} valid token(s)");
-            }
+                _logger.LogInformation("Loaded {Count} valid token(s)", tokenCount);
         }
         catch (Exception ex)
         {

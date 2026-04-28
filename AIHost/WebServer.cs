@@ -111,9 +111,12 @@ var requestLogger = new RequestLogger(
 builder.Services.AddSingleton(requestLogger);
 Console.WriteLine($"✓ Request logger initialized (persistent: {serverConfig.PersistentLogs})");
 
-// Initialize model manager
-var modelManager = new ModelManager(serverConfig.ModelsDirectory, computeDevice);
-builder.Services.AddSingleton(modelManager);
+// Initialize model manager via factory so ILogger<ModelManager> is injected from DI.
+builder.Services.AddSingleton(sp =>
+    new ModelManager(
+        serverConfig.ModelsDirectory,
+        computeDevice,
+        sp.GetRequiredService<ILogger<ModelManager>>()));
 builder.Services.AddSingleton(serverConfig);
 // Register the global compute device so future services can receive it via DI.
 // Note: disposed manually at shutdown — DI doesn't own singleton instances registered this way.
@@ -124,6 +127,7 @@ builder.Services.AddHostedService<ModelAutoUnloadService>();
 builder.Services.AddHostedService<ModelConfigWatcherService>();
 
 var app = builder.Build();
+var modelManager = app.Services.GetRequiredService<ModelManager>();
 
 // Configure middleware
 if (app.Environment.IsDevelopment())

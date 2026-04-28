@@ -40,7 +40,7 @@ public sealed class ModelConfigWatcherService : BackgroundService
 
         if (!Directory.Exists(modelsDir))
         {
-            Console.WriteLine($"⚠ Models directory not found, config watcher inactive: {modelsDir}");
+            _logger.LogWarning("Models directory not found, config watcher inactive: {Dir}", modelsDir);
             return Task.CompletedTask;
         }
 
@@ -56,7 +56,7 @@ public sealed class ModelConfigWatcherService : BackgroundService
         _watcher.Created += OnConfigFileChanged;
         _watcher.Deleted += OnConfigFileDeleted;
 
-        Console.WriteLine($"✓ Model config watcher started: {Path.GetFullPath(modelsDir)}");
+        _logger.LogInformation("Model config watcher started: {Dir}", Path.GetFullPath(modelsDir));
 
         // Block until the host signals cancellation.
         return Task.Delay(Timeout.Infinite, stoppingToken)
@@ -86,7 +86,7 @@ public sealed class ModelConfigWatcherService : BackgroundService
 
                 if (config == null || string.IsNullOrWhiteSpace(config.Name))
                 {
-                    Console.WriteLine($"⚠ Skipping invalid model config: {fullPath}");
+                    _logger.LogWarning("Skipping invalid model config: {Path}", fullPath);
                     return;
                 }
 
@@ -94,7 +94,7 @@ public sealed class ModelConfigWatcherService : BackgroundService
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"⚠ Error processing model config {name}: {ex.Message}");
+                _logger.LogError(ex, "Error processing model config {Name}", name);
             }
         });
     }
