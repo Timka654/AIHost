@@ -32,49 +32,84 @@ public class OllamaController : ControllerBase
     public async Task<IActionResult> Generate([FromBody] OllamaGenerateRequest request)
     {
         var sw = Stopwatch.StartNew();
-        long loadDuration = 0;
 
         try
         {
-            // Load model
             var loadSw = Stopwatch.StartNew();
             var model = await _modelManager.GetModelAsync(request.Model);
-            loadDuration = loadSw.ElapsedMilliseconds * 1_000_000; // Convert to nanoseconds
+            var loadDuration = loadSw.ElapsedMilliseconds * 1_000_000L;
 
-            // Build prompt with system message
             var prompt = BuildPrompt(model, request.System, request.Prompt, request.Raw);
-
-            // Get generation parameters
             var config = BuildGenerationConfig(model.Config, request.Options);
-
-            // Generate
-            var evalSw = Stopwatch.StartNew();
-            var response = model.Engine.Generate(prompt, config);
-            var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000;
-
-            // Count tokens (approximate)
             var tokenizer = model.Engine.Tokenizer;
             var promptTokens = tokenizer.Encode(prompt).Length;
-            var responseTokens = tokenizer.Encode(response).Length;
 
-            var result = new OllamaGenerateResponse
+            if (request.Stream)
+                return await StreamGenerate(model, prompt, config, request.Model, loadDuration, promptTokens, sw);
+
+            var evalSw = Stopwatch.StartNew();
+            var fullOutput = model.Engine.Generate(prompt, config);
+            var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000L;
+
+            // Return only the generated part, not the full prompt+output
+            var generated = StripPrompt(fullOutput, prompt);
+            var evalCount = tokenizer.Encode(generated).Length;
+
+            _modelManager.UpdateModelStats(request.Model, request.Prompt, evalCount / (evalDuration / 1e9));
+
+            return Ok(new OllamaGenerateResponse
             {
                 Model = request.Model,
-                Response = response,
+                Response = generated,
                 Done = true,
-                TotalDuration = sw.ElapsedMilliseconds * 1_000_000,
+                TotalDuration = sw.ElapsedMilliseconds * 1_000_000L,
                 LoadDuration = loadDuration,
                 PromptEvalCount = promptTokens,
-                EvalCount = responseTokens,
+                EvalCount = evalCount,
                 EvalDuration = evalDuration
-            };
-
-            return Ok(result);
+            });
         }
         catch (Exception ex)
         {
             return BadRequest(new { error = ex.Message });
         }
+    }
+
+    private async Task<IActionResult> StreamGenerate(
+        Config.ModelInstance model, string prompt, GenerationConfig config,
+        string modelName, long loadDuration, int promptTokens, Stopwatch sw)
+    {
+        Response.ContentType = "application/x-ndjson";
+        var evalSw = Stopwatch.StartNew();
+        var evalCount = 0;
+
+        model.Engine.GenerateStreaming(prompt, config, token =>
+        {
+            evalCount++;
+            var chunk = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                model = modelName,
+                response = token,
+                done = false
+            });
+            Response.WriteAsync(chunk + "\n").GetAwaiter().GetResult();
+            Response.Body.FlushAsync().GetAwaiter().GetResult();
+        });
+
+        var finalChunk = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            model = modelName,
+            response = "",
+            done = true,
+            total_duration = sw.ElapsedMilliseconds * 1_000_000L,
+            load_duration = loadDuration,
+            prompt_eval_count = promptTokens,
+            eval_count = evalCount,
+            eval_duration = evalSw.ElapsedMilliseconds * 1_000_000L
+        });
+        await Response.WriteAsync(finalChunk + "\n");
+
+        return new EmptyResult();
     }
 
     /// <summary>
@@ -84,49 +119,38 @@ public class OllamaController : ControllerBase
     public async Task<IActionResult> Chat([FromBody] OllamaChatRequest request)
     {
         var sw = Stopwatch.StartNew();
-        long loadDuration = 0;
 
         try
         {
-            // Load model
             var loadSw = Stopwatch.StartNew();
             var model = await _modelManager.GetModelAsync(request.Model);
+            var loadDuration = loadSw.ElapsedMilliseconds * 1_000_000L;
 
-            loadDuration = loadSw.ElapsedMilliseconds * 1_000_000;
-
-            // Build prompt from messages
             var prompt = BuildChatPrompt(model, request.Messages);
-
-            // Get generation parameters
             var config = BuildGenerationConfig(model.Config, request.Options);
-
-            // Generate
-            var evalSw = Stopwatch.StartNew();
-            var response = model.Engine.Generate(prompt, config);
-            var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000;
-
-            // Count tokens
             var tokenizer = model.Engine.Tokenizer;
             var promptTokens = tokenizer.Encode(prompt).Length;
-            var responseTokens = tokenizer.Encode(response).Length;
 
-            var result = new OllamaChatResponse
+            var evalSw = Stopwatch.StartNew();
+            var fullOutput = model.Engine.Generate(prompt, config);
+            var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000L;
+
+            var generated = StripPrompt(fullOutput, prompt);
+            var evalCount = tokenizer.Encode(generated).Length;
+
+            _modelManager.UpdateModelStats(request.Model, prompt, evalCount / (evalDuration / 1e9));
+
+            return Ok(new OllamaChatResponse
             {
                 Model = request.Model,
-                Message = new OllamaMessage
-                {
-                    Role = "assistant",
-                    Content = response
-                },
+                Message = new OllamaMessage { Role = "assistant", Content = generated },
                 Done = true,
-                TotalDuration = sw.ElapsedMilliseconds * 1_000_000,
+                TotalDuration = sw.ElapsedMilliseconds * 1_000_000L,
                 LoadDuration = loadDuration,
                 PromptEvalCount = promptTokens,
-                EvalCount = responseTokens,
+                EvalCount = evalCount,
                 EvalDuration = evalDuration
-            };
-
-            return Ok(result);
+            });
         }
         catch (Exception ex)
         {
@@ -188,6 +212,23 @@ public class OllamaController : ControllerBase
     }
 
     // === Helper Methods ===
+
+    /// <summary>
+    /// Strips the prompt prefix from the full decoded output so only generated text is returned.
+    /// </summary>
+    private static string StripPrompt(string fullOutput, string prompt)
+    {
+        if (fullOutput.StartsWith(prompt, StringComparison.Ordinal))
+            return fullOutput[prompt.Length..].TrimStart('\n', '\r', ' ');
+
+        // Tokenization round-trip may alter whitespace — fall back to finding "Assistant:" marker
+        var marker = "Assistant:";
+        var idx = fullOutput.LastIndexOf(marker, StringComparison.Ordinal);
+        if (idx >= 0)
+            return fullOutput[(idx + marker.Length)..].TrimStart('\n', '\r', ' ');
+
+        return fullOutput;
+    }
 
     private string BuildPrompt(ModelInstance model, string? system, string prompt, bool raw)
     {
@@ -310,10 +351,10 @@ public class OllamaController : ControllerBase
         foreach (var sysMsg in config.SystemMessages)
             lines.Add($"SYSTEM {sysMsg}");
 
-        lines.Add($"PARAMETER temperature {config.Parameters.Temperature}");
+        lines.Add(FormattableString.Invariant($"PARAMETER temperature {config.Parameters.Temperature}"));
         lines.Add($"PARAMETER top_k {config.Parameters.TopK}");
-        lines.Add($"PARAMETER top_p {config.Parameters.TopP}");
-        lines.Add($"PARAMETER repeat_penalty {config.Parameters.RepetitionPenalty}");
+        lines.Add(FormattableString.Invariant($"PARAMETER top_p {config.Parameters.TopP}"));
+        lines.Add(FormattableString.Invariant($"PARAMETER repeat_penalty {config.Parameters.RepetitionPenalty}"));
 
         return string.Join("\n", lines);
     }
