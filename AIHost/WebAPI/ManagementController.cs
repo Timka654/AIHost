@@ -182,9 +182,7 @@ public class ManagementController : ControllerBase
         try
         {
             // Create model config
-            var modelDir = Path.Combine(_modelManager.GetType().GetField("_modelsDirectory", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                ?.GetValue(_modelManager) as string ?? "./models", request.Name);
+            var modelDir = Path.Combine(_modelManager.ModelsDirectory, request.Name);
 
             Directory.CreateDirectory(modelDir);
 
@@ -196,7 +194,7 @@ public class ManagementController : ControllerBase
             using var client = new HttpClient();
             client.Timeout = TimeSpan.FromHours(2);
 
-            var response = await client.GetAsync(request.Url, HttpCompletionOption.ResponseHeadersRead);
+            using var response = await client.GetAsync(request.Url, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
             using var fileStream = System.IO.File.Create(modelPath);

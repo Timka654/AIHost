@@ -1,5 +1,6 @@
 using AIHost.Config;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace AIHost.Services;
 
@@ -11,22 +12,27 @@ public sealed class ModelAutoUnloadService : BackgroundService
 {
     private readonly ModelManager _modelManager;
     private readonly ServerConfig _serverConfig;
+    private readonly ILogger<ModelAutoUnloadService> _logger;
 
-    public ModelAutoUnloadService(ModelManager modelManager, ServerConfig serverConfig)
+    public ModelAutoUnloadService(
+        ModelManager modelManager,
+        ServerConfig serverConfig,
+        ILogger<ModelAutoUnloadService> logger)
     {
         _modelManager = modelManager;
         _serverConfig = serverConfig;
+        _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (_serverConfig.AutoUnloadMinutes <= 0)
         {
-            Console.WriteLine("⚠ Auto-unload disabled");
+            _logger.LogWarning("Auto-unload disabled");
             return;
         }
 
-        Console.WriteLine($"✓ Auto-unload enabled: {_serverConfig.AutoUnloadMinutes} minutes of inactivity");
+        _logger.LogInformation("Auto-unload enabled: {Minutes} minutes of inactivity", _serverConfig.AutoUnloadMinutes);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -52,14 +58,16 @@ public sealed class ModelAutoUnloadService : BackgroundService
 
                 if (idleMinutes >= keepAliveMinutes)
                 {
-                    Console.WriteLine($"Auto-unloading {name} (idle {idleMinutes:F1}m, threshold {keepAliveMinutes}m)");
+                    _logger.LogInformation(
+                        "Auto-unloading {Model} (idle {Idle:F1}m, threshold {Threshold}m)",
+                        name, idleMinutes, keepAliveMinutes);
                     _modelManager.UnloadModel(name);
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error in auto-unload service: {ex.Message}");
+            _logger.LogError(ex, "Error in auto-unload service");
         }
     }
 }

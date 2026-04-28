@@ -4,7 +4,8 @@ using System.Collections.Concurrent;
 namespace AIHost.Compute;
 
 /// <summary>
-/// Async wrapper for compute command queues to enable parallel execution
+/// Async wrapper for compute command queues — serialises GPU operations
+/// without blocking threadpool threads on the semaphore.
 /// </summary>
 public class AsyncComputeQueue : IDisposable
 {
@@ -18,103 +19,74 @@ public class AsyncComputeQueue : IDisposable
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
     }
 
-    /// <summary>
-    /// Enqueue a buffer write command
-    /// </summary>
-    public Task WriteBufferAsync(IComputeBuffer buffer, ulong offset, byte[] data)
+    public async Task WriteBufferAsync(IComputeBuffer buffer, ulong offset, byte[] data)
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(AsyncComputeQueue));
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        return Task.Run(() =>
+        await _semaphore.WaitAsync();
+        try
         {
-            _semaphore.Wait();
-            try
-            {
-                _queue.WriteBuffer(buffer, offset, data);
-            }
-            finally
-            {
-                _semaphore.Release();
-            }
-        });
+            await Task.Run(() => _queue.WriteBuffer(buffer, offset, data));
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
-    /// <summary>
-    /// Enqueue a buffer read command
-    /// </summary>
-    public Task<byte[]> ReadBufferAsync(IComputeBuffer buffer, ulong offset, int size)
+    public async Task<byte[]> ReadBufferAsync(IComputeBuffer buffer, ulong offset, int size)
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(AsyncComputeQueue));
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        return Task.Run(() =>
+        await _semaphore.WaitAsync();
+        try
         {
-            _semaphore.Wait();
-            try
+            return await Task.Run(() =>
             {
                 byte[] data = new byte[size];
                 _queue.ReadBuffer(buffer, offset, data);
                 return data;
-            }
-            finally
-            {
-                _semaphore.Release();
-            }
-        });
-    }
-
-    /// <summary>
-    /// Enqueue a kernel dispatch command
-    /// </summary>
-    public Task DispatchAsync(IComputeKernel kernel, uint[] globalWorkSize, uint[]? localWorkSize = null)
-    {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(AsyncComputeQueue));
-
-        return Task.Run(() =>
+            });
+        }
+        finally
         {
-            _semaphore.Wait();
-            try
-            {
-                _queue.Dispatch(kernel, globalWorkSize, localWorkSize);
-            }
-            finally
-            {
-                _semaphore.Release();
-            }
-        });
+            _semaphore.Release();
+        }
     }
 
-    /// <summary>
-    /// Execute all queued commands and wait for completion
-    /// </summary>
+    public async Task DispatchAsync(IComputeKernel kernel, uint[] globalWorkSize, uint[]? localWorkSize = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        await _semaphore.WaitAsync();
+        try
+        {
+            await Task.Run(() => _queue.Dispatch(kernel, globalWorkSize, localWorkSize));
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
     public async Task FlushAsync()
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(AsyncComputeQueue));
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        await Task.Run(() =>
+        await _semaphore.WaitAsync();
+        try
         {
-            _semaphore.Wait();
-            try
-            {
-                _queue.Flush();
-            }
-            finally
-            {
-                _semaphore.Release();
-            }
-        });
+            await Task.Run(() => _queue.Flush());
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
-    /// <summary>
-    /// Synchronize and wait for all operations to complete (flush + wait)
-    /// </summary>
     public async Task SynchronizeAsync()
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(AsyncComputeQueue));
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         await _semaphore.WaitAsync();
         try
@@ -130,6 +102,7 @@ public class AsyncComputeQueue : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+        _disposed = true;
 
         _semaphore.Wait();
         try
@@ -141,8 +114,6 @@ public class AsyncComputeQueue : IDisposable
             _semaphore.Release();
             _semaphore.Dispose();
         }
-
-        _disposed = true;
     }
 }
 
@@ -161,9 +132,7 @@ internal class WriteBufferCommand : ComputeCommand
     public byte[] Data { get; set; } = null!;
 
     public override void Execute(IComputeCommandQueue queue)
-    {
-        queue.WriteBuffer(Buffer, Offset, Data);
-    }
+        => queue.WriteBuffer(Buffer, Offset, Data);
 }
 
 internal class DispatchCommand : ComputeCommand
@@ -173,7 +142,5 @@ internal class DispatchCommand : ComputeCommand
     public uint[]? LocalWorkSize { get; set; }
 
     public override void Execute(IComputeCommandQueue queue)
-    {
-        queue.Dispatch(Kernel, GlobalWorkSize, LocalWorkSize);
-    }
+        => queue.Dispatch(Kernel, GlobalWorkSize, LocalWorkSize);
 }

@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(dotnet build *)",
-      "Bash(dotnet run *)"
+      "Bash(dotnet run *)",
+      "Bash(taskkill /PID 8688 /F)",
+      "PowerShell(Set-Location \"e:\\\\my_dev\\\\AIHost\\\\AIHost\"; dotnet run --no-build -- --manual 12 \"D:\\\\User\\\\Downloads\\\\tinyllama-1.1b-chat-v1.0.Q2_K.gguf\" 2>&1 | Select-String -Pattern \"Generated text|Streaming completed|failed|GLSL\" | Select-Object -First 6)",
+      "PowerShell(Set-Location \"e:\\\\my_dev\\\\AIHost\\\\AIHost\"; dotnet run --no-build -- --manual 12 \"D:\\\\User\\\\Downloads\\\\tinyllama-1.1b-chat-v1.0.Q2_K.gguf\" 2>&1 | Select-String -Pattern \"Streaming completed|Output:|failed\" | Select-Object -First 3)",
+      "PowerShell(Set-Location \"e:\\\\my_dev\\\\AIHost\\\\AIHost\"; dotnet run --no-build -- --manual 12 \"D:\\\\User\\\\Downloads\\\\tinyllama-1.1b-chat-v1.0.Q2_K.gguf\" 2>&1 | Select-String \"Generated text|Streaming completed|failed\" | Select-Object -First 3)",
+      "PowerShell(Set-Location \"e:\\\\my_dev\\\\AIHost\\\\AIHost\"; dotnet run --no-build -- --manual 12 \"D:\\\\User\\\\Downloads\\\\tinyllama-1.1b-chat-v1.0.Q2_K.gguf\" 2>&1 | Select-String \"Generated text|failed\" | Select-Object -First 2)",
+      "PowerShell(Set-Location \"e:\\\\my_dev\\\\AIHost\\\\AIHost\"; dotnet run -- --web 2>&1 | Select-Object -First 20)",
+      "PowerShell(Set-Location \"e:\\\\my_dev\\\\AIHost\"; dotnet build 2>&1 | Where-Object { $_ -match \"error\" } | Select-Object -First 10)"
     ]
   }
 }

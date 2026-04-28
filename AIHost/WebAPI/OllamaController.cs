@@ -16,6 +16,15 @@ public class OllamaController : ControllerBase
         _modelManager = modelManager;
     }
 
+    [HttpGet("version")]
+    public async Task<IActionResult> Version()
+    {
+        return Ok(new
+        {
+            version = "0.21.1"
+        });
+    }
+
     /// <summary>
     /// Ollama /api/generate - Generate text from a prompt
     /// </summary>
@@ -82,6 +91,8 @@ public class OllamaController : ControllerBase
             // Load model
             var loadSw = Stopwatch.StartNew();
             var model = await _modelManager.GetModelAsync(request.Model);
+
+            //model.Engine.model
             loadDuration = loadSw.ElapsedMilliseconds * 1_000_000;
 
             // Build prompt from messages

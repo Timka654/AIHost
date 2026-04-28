@@ -1,6 +1,7 @@
 using System.Text.Json;
 using AIHost.Config;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace AIHost.Services;
 
@@ -15,16 +16,22 @@ public sealed class ModelConfigWatcherService : BackgroundService
 {
     private readonly ModelManager _modelManager;
     private readonly ServerConfig _serverConfig;
+    private readonly ILogger<ModelConfigWatcherService> _logger;
+    private FileSystemWatcher? _watcher;
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
-    public ModelConfigWatcherService(ModelManager modelManager, ServerConfig serverConfig)
+    public ModelConfigWatcherService(
+        ModelManager modelManager,
+        ServerConfig serverConfig,
+        ILogger<ModelConfigWatcherService> logger)
     {
         _modelManager = modelManager;
         _serverConfig = serverConfig;
+        _logger = logger;
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
@@ -37,7 +44,7 @@ public sealed class ModelConfigWatcherService : BackgroundService
             return Task.CompletedTask;
         }
 
-        var watcher = new FileSystemWatcher(modelsDir)
+        _watcher = new FileSystemWatcher(modelsDir)
         {
             Filter = "model.json",
             IncludeSubdirectories = true,
@@ -45,25 +52,32 @@ public sealed class ModelConfigWatcherService : BackgroundService
             EnableRaisingEvents = true
         };
 
-        watcher.Changed += OnConfigFileChanged;
-        watcher.Created += OnConfigFileChanged;
-        watcher.Deleted += OnConfigFileDeleted;
+        _watcher.Changed += OnConfigFileChanged;
+        _watcher.Created += OnConfigFileChanged;
+        _watcher.Deleted += OnConfigFileDeleted;
 
         Console.WriteLine($"✓ Model config watcher started: {Path.GetFullPath(modelsDir)}");
 
-        // Hold the watcher alive until the host stops, then clean up.
+        // Block until the host signals cancellation.
         return Task.Delay(Timeout.Infinite, stoppingToken)
-            .ContinueWith(_ => watcher.Dispose(), TaskScheduler.Default);
+            .ContinueWith(_ => { }, TaskScheduler.Default); // disposal handled in StopAsync
+    }
+
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        // Dispose watcher before base stops the background task.
+        _watcher?.Dispose();
+        _watcher = null;
+        return base.StopAsync(cancellationToken);
     }
 
     private void OnConfigFileChanged(object _, FileSystemEventArgs e)
     {
-        // Debounce without blocking the threadpool: fire-and-forget async task.
-        // The OS may deliver the event before the file write is complete.
         var fullPath = e.FullPath;
         var name = e.Name;
         Task.Run(async () =>
         {
+            // Small debounce — OS may fire before file write completes.
             await Task.Delay(200);
             try
             {
@@ -87,7 +101,6 @@ public sealed class ModelConfigWatcherService : BackgroundService
 
     private void OnConfigFileDeleted(object _, FileSystemEventArgs e)
     {
-        // Derive model name from the parent directory name (models/<name>/model.json).
         var modelName = Path.GetFileName(Path.GetDirectoryName(e.FullPath));
         if (string.IsNullOrWhiteSpace(modelName)) return;
 

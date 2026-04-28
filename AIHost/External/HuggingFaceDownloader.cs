@@ -39,16 +39,24 @@ public class HFFileInfo
 /// <summary>
 /// HuggingFace model downloader
 /// </summary>
-public class HuggingFaceDownloader
+public class HuggingFaceDownloader : IDisposable
 {
     private const string HF_API = "https://huggingface.co/api";
     private readonly HttpClient _client;
+    private bool _disposed;
 
     public HuggingFaceDownloader()
     {
         _client = new HttpClient();
         _client.Timeout = TimeSpan.FromHours(2);
         _client.DefaultRequestHeaders.Add("User-Agent", "AIHost/1.0");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _client.Dispose();
+        _disposed = true;
     }
 
     /// <summary>
@@ -111,7 +119,7 @@ public class HuggingFaceDownloader
 
         Console.WriteLine($"Downloading {modelId}/{fileName}...");
 
-        var response = await _client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        using var response = await _client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
 
         var totalBytes = response.Content.Headers.ContentLength ?? 0;

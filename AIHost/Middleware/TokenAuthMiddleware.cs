@@ -63,13 +63,21 @@ public class TokenAuthMiddleware : IDisposable
     
     private void OnTokensFileChanged(object sender, FileSystemEventArgs e)
     {
-        // Debounce: wait a bit for file to be fully written
-        Task.Delay(100).ContinueWith(_ =>
+        if (string.IsNullOrEmpty(_tokensFilePath)) return;
+
+        var path = _tokensFilePath;
+        Task.Run(async () =>
         {
-            if (!string.IsNullOrEmpty(_tokensFilePath))
+            // Small debounce — OS may fire before file write completes.
+            await Task.Delay(100);
+            try
             {
-                LoadTokens(_tokensFilePath);
+                LoadTokens(path);
                 Console.WriteLine($"🔄 Tokens reloaded: {_validTokens.Count} token(s)");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠ Failed to reload tokens: {ex.Message}");
             }
         });
     }
