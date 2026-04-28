@@ -1,59 +1,149 @@
 using Microsoft.AspNetCore.Http;
-using System.Collections.Concurrent;
+using AIHost.Config;
 
 namespace AIHost.Middleware;
 
 /// <summary>
-/// Middleware for token-based authentication
+/// Middleware for token-based authentication with dynamic token reloading
 /// </summary>
-public class TokenAuthMiddleware
+public class TokenAuthMiddleware : IDisposable
 {
     private readonly RequestDelegate _next;
     private readonly HashSet<string> _validTokens = new();
     private readonly string? _manageToken;
-    private readonly bool _requireAuth;
+    private readonly string? _tokensFilePath;
     private readonly object _lockObj = new();
+    private readonly FileSystemWatcher? _fileWatcher;
+    private bool _disposed;
 
-    public TokenAuthMiddleware(RequestDelegate next, string? tokensFile, string? manageToken)
+    public TokenAuthMiddleware(RequestDelegate next, ServerConfig serverConfig)
     {
         _next = next;
-        _manageToken = manageToken;
+        _manageToken = serverConfig.ManageToken;
         
-        // Load tokens from file if provided
-        if (!string.IsNullOrEmpty(tokensFile) && File.Exists(tokensFile))
+        var tokensFile = serverConfig.TokensFile;
+        
+        // Setup file path and load initial tokens
+        if (!string.IsNullOrEmpty(tokensFile))
         {
-            LoadTokens(tokensFile);
-            _requireAuth = true;
+            _tokensFilePath = Path.IsPathRooted(tokensFile) 
+                ? tokensFile 
+                : Path.Combine(AppContext.BaseDirectory, tokensFile);
+            
+            // Load initial tokens
+            LoadTokens(_tokensFilePath);
+            
+            // Setup file watcher if directory exists
+            var directory = Path.GetDirectoryName(_tokensFilePath);
+            var fileName = Path.GetFileName(_tokensFilePath);
+            
+            if (!string.IsNullOrEmpty(directory) && Directory.Exists(directory))
+            {
+                try
+                {
+                    _fileWatcher = new FileSystemWatcher(directory, fileName)
+                    {
+                        NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime,
+                        EnableRaisingEvents = true
+                    };
+                    
+                    _fileWatcher.Changed += OnTokensFileChanged;
+                    _fileWatcher.Created += OnTokensFileChanged;
+                    _fileWatcher.Deleted += OnTokensFileDeleted;
+                    
+                    Console.WriteLine($"✓ Token file watcher enabled: {fileName}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠ Failed to setup file watcher: {ex.Message}");
+                }
+            }
         }
-        else
+    }
+    
+    private void OnTokensFileChanged(object sender, FileSystemEventArgs e)
+    {
+        // Debounce: wait a bit for file to be fully written
+        Task.Delay(100).ContinueWith(_ =>
         {
-            _requireAuth = false;
-            Console.WriteLine("No tokens file found - authentication disabled");
+            if (!string.IsNullOrEmpty(_tokensFilePath))
+            {
+                LoadTokens(_tokensFilePath);
+                Console.WriteLine($"🔄 Tokens reloaded: {_validTokens.Count} token(s)");
+            }
+        });
+    }
+    
+    private void OnTokensFileDeleted(object sender, FileSystemEventArgs e)
+    {
+        lock (_lockObj)
+        {
+            _validTokens.Clear();
         }
+        Console.WriteLine($"⚠ Tokens file deleted - authentication disabled");
     }
 
     private void LoadTokens(string filePath)
     {
         try
         {
+            if (!File.Exists(filePath))
+            {
+                lock (_lockObj)
+                {
+                    _validTokens.Clear();
+                }
+                Console.WriteLine($"⚠ Tokens file not found: {filePath}");
+                return;
+            }
+            
             var lines = File.ReadAllLines(filePath);
+            var newTokens = new HashSet<string>();
+            
+            foreach (var line in lines)
+            {
+                var token = line.Trim();
+                if (!string.IsNullOrEmpty(token) && !token.StartsWith("#"))
+                {
+                    newTokens.Add(token);
+                }
+            }
+            
             lock (_lockObj)
             {
                 _validTokens.Clear();
-                foreach (var line in lines)
+                foreach (var token in newTokens)
                 {
-                    var token = line.Trim();
-                    if (!string.IsNullOrEmpty(token) && !token.StartsWith("#"))
-                    {
-                        _validTokens.Add(token);
-                    }
+                    _validTokens.Add(token);
                 }
             }
-            Console.WriteLine($"Loaded {_validTokens.Count} valid tokens from {filePath}");
+            
+            if (newTokens.Count == 0)
+            {
+                Console.WriteLine($"⚠ No valid tokens found - authentication disabled");
+            }
+            else
+            {
+                Console.WriteLine($"✓ Loaded {_validTokens.Count} valid token(s)");
+            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Failed to load tokens: {ex.Message}");
+            Console.WriteLine($"❌ Failed to load tokens: {ex.Message}");
+        }
+    }
+    
+    /// <summary>
+    /// Check if authentication is required (based on whether we have valid tokens)
+    /// </summary>
+    private bool RequireAuth
+    {
+        get
+        {
+            lock (_lockObj)
+            {
+                return _validTokens.Count > 0;
+            }
         }
     }
 
@@ -87,8 +177,8 @@ public class TokenAuthMiddleware
             return;
         }
 
-        // Regular API endpoints - check tokens if auth is enabled
-        if (_requireAuth)
+        // Regular API endpoints - check tokens if we have any configured
+        if (RequireAuth)
         {
             var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
             var providedToken = authHeader?.Replace("Bearer ", "").Trim();
@@ -112,12 +202,27 @@ public class TokenAuthMiddleware
 
         await _next(context);
     }
+    
+    public void Dispose()
+    {
+        if (_disposed) return;
+        
+        if (_fileWatcher != null)
+        {
+            _fileWatcher.Changed -= OnTokensFileChanged;
+            _fileWatcher.Created -= OnTokensFileChanged;
+            _fileWatcher.Deleted -= OnTokensFileDeleted;
+            _fileWatcher.Dispose();
+        }
+        
+        _disposed = true;
+    }
 }
 
 public static class TokenAuthMiddlewareExtensions
 {
-    public static IApplicationBuilder UseTokenAuth(this IApplicationBuilder builder, string? tokensFile, string? manageToken)
+    public static IApplicationBuilder UseTokenAuth(this IApplicationBuilder builder)
     {
-        return builder.UseMiddleware<TokenAuthMiddleware>(tokensFile, manageToken);
+        return builder.UseMiddleware<TokenAuthMiddleware>();
     }
 }

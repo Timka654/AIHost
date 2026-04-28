@@ -11,7 +11,7 @@ public class Transformer : IDisposable
 {
     private readonly IComputeDevice _device;
     private readonly ComputeOps _ops;
-    private readonly GGUFModel _model;
+    private readonly IGGUFModel _model;
     private readonly int _numLayers;
     private readonly int _dModel;
     private readonly int _numHeads;
@@ -27,7 +27,7 @@ public class Transformer : IDisposable
 
     public int LayerCount => _numLayers;
 
-    public Transformer(IComputeDevice device, GGUFModel model)
+    public Transformer(IComputeDevice device, IGGUFModel model)
     {
         _device = device;
         _ops = new ComputeOps(device);

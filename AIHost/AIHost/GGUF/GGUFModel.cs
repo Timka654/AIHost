@@ -5,7 +5,7 @@ namespace AIHost.GGUF;
 /// <summary>
 /// GGUF модель с удобными методами загрузки тензоров
 /// </summary>
-public class GGUFModel : IDisposable
+public class GGUFModel : IGGUFModel
 {
     private readonly GGUFReader _reader;
     private readonly IComputeDevice _device;

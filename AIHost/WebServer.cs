@@ -36,6 +36,9 @@ else
     Console.WriteLine($"✓ Created default config at {configPath}");
 }
 
+// Ensure directory structure and template files exist
+EnsureDirectoryStructure(serverConfig);
+
 // Configure Kestrel
 builder.WebHost.ConfigureKestrel(options =>
 {
@@ -126,9 +129,9 @@ if (serverConfig.RateLimitRequestsPerMinute > 0)
 }
 
 // Token authentication middleware
-var tokensFile = serverConfig.TokensFile != null ? Path.Combine(AppContext.BaseDirectory, serverConfig.TokensFile) : null;
-app.UseTokenAuth(tokensFile, serverConfig.ManageToken);
+app.UseTokenAuth();
 
+var tokensFile = serverConfig.TokensFile != null ? Path.Combine(AppContext.BaseDirectory, serverConfig.TokensFile) : null;
 if (tokensFile != null && File.Exists(tokensFile))
 {
     Console.WriteLine($"✓ Token authentication enabled: {tokensFile}");
@@ -196,3 +199,97 @@ await app.RunAsync();
 // Cleanup
 modelManager.Dispose();
 computeDevice.Dispose();
+
+/// <summary>
+/// Ensure all required directories and template files exist
+/// </summary>
+static void EnsureDirectoryStructure(ServerConfig config)
+{
+    // Ensure all directories exist
+    var directories = new[]
+    {
+        config.ModelsDirectory,
+        config.LogsDirectory,
+        config.CacheDirectory,
+        Path.GetDirectoryName(config.TokensFile) ?? "data/config"
+    };
+
+    foreach (var dir in directories.Where(d => !string.IsNullOrEmpty(d)))
+    {
+        if (!Directory.Exists(dir))
+        {
+            Directory.CreateDirectory(dir);
+            Console.WriteLine($"✓ Created directory: {dir}");
+        }
+    }
+
+    // Create template tokens.txt if it doesn't exist
+    if (!string.IsNullOrEmpty(config.TokensFile))
+    {
+        var tokensPath = Path.IsPathRooted(config.TokensFile)
+            ? config.TokensFile
+            : Path.Combine(AppContext.BaseDirectory, config.TokensFile);
+
+        if (!File.Exists(tokensPath))
+    {
+        var tokensTemplate = @"# API Authentication Tokens
+# Add one token per line. Lines starting with # are comments.
+# Example tokens (replace with your own!):
+# your-secret-token-here
+# another-token-12345
+
+# Uncomment the line below to enable authentication:
+# my-secret-api-token
+";
+        File.WriteAllText(tokensPath, tokensTemplate);
+        Console.WriteLine($"✓ Created template tokens file: {tokensPath}");
+        Console.WriteLine($"  ⚠ Edit {Path.GetFileName(tokensPath)} to add your API tokens");
+    }
+    }
+
+    // Check if any models exist
+    var modelDirs = Directory.Exists(config.ModelsDirectory)
+        ? Directory.GetDirectories(config.ModelsDirectory)
+        : Array.Empty<string>();
+
+    if (modelDirs.Length == 0)
+    {
+        // Create example model directory with template
+        var exampleModelDir = Path.Combine(config.ModelsDirectory, "example-model");
+        Directory.CreateDirectory(exampleModelDir);
+
+        var exampleConfig = new
+        {
+            name = "example-model",
+            model = "C:\\path\\to\\your\\model.gguf",
+            format = "gguf",
+            description = "Example model configuration - edit this file to configure your model",
+            tags = new[] { "example", "template" },
+            compute_provider = "vulkan",
+            device_index = 0,
+            keep_alive = 30,
+            enable_mmap = true,
+            enable_mlock = false,
+            num_gpu_layers = -1,
+            parameters = new
+            {
+                temperature = 0.7,
+                top_k = 40,
+                top_p = 0.9,
+                repetition_penalty = 1.1,
+                context_size = 2048,
+                max_tokens = 512
+            }
+        };
+
+        var exampleJson = JsonSerializer.Serialize(exampleConfig, new JsonSerializerOptions { WriteIndented = true });
+        var exampleConfigPath = Path.Combine(exampleModelDir, "model.json");
+        File.WriteAllText(exampleConfigPath, exampleJson);
+
+        Console.WriteLine($"✓ Created example model config: {exampleConfigPath}");
+        Console.WriteLine($"  ⚠ Edit model.json to configure your model:");
+        Console.WriteLine($"     1. Set 'model' path to your .gguf file");
+        Console.WriteLine($"     2. Update 'name' to match your model");
+        Console.WriteLine($"     3. Adjust parameters as needed");
+    }
+}

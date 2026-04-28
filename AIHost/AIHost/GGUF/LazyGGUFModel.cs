@@ -1,4 +1,5 @@
 using AIHost.ICompute;
+using AIHost.Utils;
 using System.IO.MemoryMappedFiles;
 
 namespace AIHost.GGUF;
@@ -7,16 +8,19 @@ namespace AIHost.GGUF;
 /// Lazy-loading GGUF model with memory mapping support
 /// Loads tensors on-demand and supports split GGUF files
 /// </summary>
-public class LazyGGUFModel : IDisposable
+public class LazyGGUFModel : IGGUFModel
 {
     private readonly GGUFReader _reader;
     private readonly IComputeDevice _device;
     private readonly Dictionary<string, IComputeBuffer> _tensorBuffers = new();
     private readonly MemoryMappedFile? _memoryMappedFile;
+    private MemoryMappedViewAccessor? _memoryMappedView;
     private readonly string _filePath;
     private readonly List<string> _splitFiles = new();
     private bool _disposed;
     private bool _useMemoryMapping;
+    private bool _useMemoryLock;
+    private readonly Dictionary<IntPtr, ulong> _lockedRegions = new();
 
     public GGUFHeader Header => _reader.Header;
     public GGUFMetadata Metadata => _reader.Metadata;
@@ -26,11 +30,12 @@ public class LazyGGUFModel : IDisposable
     public int LoadedTensorCount => _tensorBuffers.Count;
     public int TotalTensorCount => Tensors.Count;
 
-    public LazyGGUFModel(string filePath, IComputeDevice device, bool useMemoryMapping = true)
+    public LazyGGUFModel(string filePath, IComputeDevice device, bool useMemoryMapping = true, bool useMemoryLock = false)
     {
         _filePath = filePath;
         _device = device;
         _useMemoryMapping = useMemoryMapping;
+        _useMemoryLock = useMemoryLock;
 
         // Check for split files
         _splitFiles = DiscoverSplitFiles(filePath);
@@ -42,6 +47,7 @@ public class LazyGGUFModel : IDisposable
             // TODO: Implement proper multi-file support
             filePath = _splitFiles[0];
             _useMemoryMapping = false; // Disable mmap for split files for now
+            _useMemoryLock = false; // Can't lock split files yet
         }
 
         // Initialize reader
@@ -61,6 +67,12 @@ public class LazyGGUFModel : IDisposable
                     MemoryMappedFileAccess.Read);
                 
                 Console.WriteLine($"Memory-mapped file created for {Path.GetFileName(filePath)}");
+                
+                // Try to lock memory if requested
+                if (_useMemoryLock)
+                {
+                    TryLockMemoryMappedFile();
+                }
             }
             catch (Exception ex)
             {
@@ -68,7 +80,55 @@ public class LazyGGUFModel : IDisposable
                 Console.WriteLine("Falling back to standard file I/O");
                 _memoryMappedFile = null;
                 _useMemoryMapping = false;
+                _useMemoryLock = false;
             }
+        }
+        else if (_useMemoryLock)
+        {
+            Console.WriteLine($"⚠ Warning: Memory locking requires memory mapping to be enabled");
+            _useMemoryLock = false;
+        }
+    }
+
+    private unsafe void TryLockMemoryMappedFile()
+    {
+        if (!MemoryLock.IsSupported())
+        {
+            Console.WriteLine($"⚠ Memory locking not supported on this platform");
+            _useMemoryLock = false;
+            return;
+        }
+
+        try
+        {
+            // Create accessor to get pointer
+            _memoryMappedView = _memoryMappedFile?.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            if (_memoryMappedView == null) return;
+
+            byte* ptr = null;
+            _memoryMappedView.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+            
+            if (ptr != null)
+            {
+                var capacity = (ulong)_memoryMappedView.Capacity;
+                var address = new IntPtr(ptr);
+                
+                if (MemoryLock.Lock(address, capacity))
+                {
+                    _lockedRegions[address] = capacity;
+                    Console.WriteLine($"✓ Locked {capacity / (1024 * 1024)}MB of model memory");
+                }
+                else
+                {
+                    Console.WriteLine($"⚠ Failed to lock memory - {MemoryLock.GetRecommendations()}");
+                    _useMemoryLock = false;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Failed to lock memory: {ex.Message}");
+            _useMemoryLock = false;
         }
     }
 
@@ -235,6 +295,16 @@ public class LazyGGUFModel : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+
+        // Unlock memory regions
+        foreach (var (address, size) in _lockedRegions)
+        {
+            MemoryLock.Unlock(address, size);
+        }
+        _lockedRegions.Clear();
+
+        // Release view accessor
+        _memoryMappedView?.Dispose();
 
         UnloadAllTensors();
         _memoryMappedFile?.Dispose();
