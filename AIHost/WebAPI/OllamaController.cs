@@ -92,7 +92,6 @@ public class OllamaController : ControllerBase
             var loadSw = Stopwatch.StartNew();
             var model = await _modelManager.GetModelAsync(request.Model);
 
-            //model.Engine.model
             loadDuration = loadSw.ElapsedMilliseconds * 1_000_000;
 
             // Build prompt from messages
