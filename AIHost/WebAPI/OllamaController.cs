@@ -221,11 +221,13 @@ public class OllamaController : ControllerBase
         if (fullOutput.StartsWith(prompt, StringComparison.Ordinal))
             return fullOutput[prompt.Length..].TrimStart('\n', '\r', ' ');
 
-        // Tokenization round-trip may alter whitespace — fall back to finding "Assistant:" marker
-        var marker = "Assistant:";
-        var idx = fullOutput.LastIndexOf(marker, StringComparison.Ordinal);
-        if (idx >= 0)
-            return fullOutput[(idx + marker.Length)..].TrimStart('\n', '\r', ' ');
+        // Look for the last assistant tag (TinyLlama template or classic format)
+        foreach (var marker in new[] { "<|assistant|>", "Assistant:" })
+        {
+            var idx = fullOutput.LastIndexOf(marker, StringComparison.Ordinal);
+            if (idx >= 0)
+                return fullOutput[(idx + marker.Length)..].TrimStart('\n', '\r', ' ', '\0');
+        }
 
         return fullOutput;
     }
@@ -253,29 +255,31 @@ public class OllamaController : ControllerBase
 
     private string BuildChatPrompt(ModelInstance model, List<OllamaMessage> messages)
     {
-        var parts = new List<string>();
+        // TinyLlama / LLaMA chat template used by most instruct models:
+        // <|system|>\n{system}\n</s>\n<|user|>\n{user}\n</s>\n<|assistant|>\n
+        var sb = new System.Text.StringBuilder();
 
-        // Add model system messages first
-        foreach (var sysMsg in model.SystemMessages)
-            parts.Add($"System: {sysMsg}");
-
-        // Add conversation messages
+        // Collect system text: model-level messages + any system role in conversation
+        var systemParts = new List<string>(model.SystemMessages);
         foreach (var msg in messages)
+            if (msg.Role == "system") systemParts.Add(msg.Content);
+
+        if (systemParts.Count > 0)
         {
-            var role = msg.Role switch
-            {
-                "system" => "System",
-                "user" => "User",
-                "assistant" => "Assistant",
-                _ => msg.Role
-            };
-            parts.Add($"{role}: {msg.Content}");
+            sb.Append("<|system|>\n");
+            sb.Append(string.Join("\n", systemParts));
+            sb.Append("\n</s>\n");
         }
 
-        // Add assistant prefix
-        parts.Add("Assistant:");
+        foreach (var msg in messages)
+        {
+            if (msg.Role == "system") continue; // already handled above
+            var tag = msg.Role == "assistant" ? "<|assistant|>" : "<|user|>";
+            sb.Append($"{tag}\n{msg.Content}\n</s>\n");
+        }
 
-        return string.Join("\n\n", parts);
+        sb.Append("<|assistant|>\n");
+        return sb.ToString();
     }
 
     private GenerationConfig BuildGenerationConfig(ModelConfig modelConfig, OllamaOptions? options,

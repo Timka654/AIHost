@@ -135,15 +135,6 @@ public class InferenceEngine : IDisposable
                 Console.WriteLine($"[Inference] Token {generatedCount}: {iterSw.ElapsedMilliseconds}ms | avg {tps:F1} tok/s | kvLen={startPos}");
             }
 
-            // Diagnostic: show first few token predictions
-            if (generatedCount < 3)
-            {
-                float maxL = lastLogits.Max();
-                int maxIdx = Array.IndexOf(lastLogits, maxL);
-                bool anyNaN = lastLogits.Any(float.IsNaN);
-                Console.WriteLine($"[Logits] gen#{generatedCount}: maxLogit={maxL:F3} @{maxIdx} anyNaN={anyNaN}");
-            }
-
             int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
             generatedCount++;

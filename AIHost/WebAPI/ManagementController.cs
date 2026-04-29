@@ -49,6 +49,45 @@ public class DownloadModelRequest
 }
 
 /// <summary>
+/// Chat request
+/// </summary>
+public class ChatRequest
+{
+    [JsonPropertyName("model_name")]
+    public string ModelName { get; set; } = "";
+
+    [JsonPropertyName("message")]
+    public string Message { get; set; } = "";
+
+    [JsonPropertyName("system_message")]
+    public string? SystemMessage { get; set; }
+
+    [JsonPropertyName("temperature")]
+    public float? Temperature { get; set; }
+
+    [JsonPropertyName("top_k")]
+    public int? TopK { get; set; }
+
+    [JsonPropertyName("top_p")]
+    public float? TopP { get; set; }
+
+    [JsonPropertyName("max_tokens")]
+    public int? MaxTokens { get; set; }
+}
+
+/// <summary>
+/// Chat message
+/// </summary>
+public class ChatMessage
+{
+    [JsonPropertyName("role")]
+    public string Role { get; set; } = "";
+
+    [JsonPropertyName("content")]
+    public string Content { get; set; } = "";
+}
+
+/// <summary>
 /// Management API controller for admin operations
 /// </summary>
 [ApiController]
@@ -169,6 +208,161 @@ public class ManagementController : ControllerBase
     }
 
     /// <summary>
+    /// List all available model configs
+    /// </summary>
+    [HttpGet("configs")]
+    public IActionResult GetAllConfigs()
+    {
+        var configs = _modelManager.GetAllConfigs();
+        return Ok(configs);
+    }
+
+    /// <summary>
+    /// Create or update a model config
+    /// </summary>
+    [HttpPost("configs")]
+    public async Task<IActionResult> CreateOrUpdateConfig([FromBody] ModelConfig config)
+    {
+        if (string.IsNullOrEmpty(config.Name))
+            return BadRequest(new { error = "Model name is required" });
+
+        try
+        {
+            var modelDir = Path.Combine(_modelManager.ModelsDirectory, config.Name);
+            Directory.CreateDirectory(modelDir);
+
+            var configPath = Path.Combine(modelDir, "model.json");
+            var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            await System.IO.File.WriteAllTextAsync(configPath, json);
+
+            _modelManager.RegisterOrUpdateConfig(config);
+
+            return Ok(new { message = $"Model config '{config.Name}' saved successfully" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to save config: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Delete a model config
+    /// </summary>
+    [HttpDelete("configs/{name}")]
+    public IActionResult DeleteConfig(string name)
+    {
+        try
+        {
+            _modelManager.RemoveConfig(name);
+            return Ok(new { message = $"Model config '{name}' deleted" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to delete config: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Clear model cache directory
+    /// </summary>
+    [HttpDelete("cache")]
+    public IActionResult ClearCache()
+    {
+        try
+        {
+            if (!Directory.Exists(_modelManager.ModelsDirectory))
+                return Ok(new { message = "Cache directory does not exist" });
+
+            var cacheDir = _modelManager.ModelsDirectory;
+            var files = Directory.GetFiles(cacheDir, "*", SearchOption.AllDirectories);
+            var dirs = Directory.GetDirectories(cacheDir, "*", SearchOption.AllDirectories);
+
+            foreach (var file in files)
+                System.IO.File.Delete(file);
+            foreach (var dir in dirs)
+                System.IO.Directory.Delete(dir, recursive: true);
+
+            return Ok(new { message = $"Cache cleared ({files.Length} files, {dirs.Length} directories)" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to clear cache: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get cache directory info
+    /// </summary>
+    [HttpGet("cache")]
+    public IActionResult GetCacheInfo()
+    {
+        try
+        {
+            if (!Directory.Exists(_modelManager.ModelsDirectory))
+                return Ok(new { path = _modelManager.ModelsDirectory, file_count = 0, total_size = 0, dir_count = 0 });
+
+            var files = Directory.GetFiles(_modelManager.ModelsDirectory, "*", SearchOption.AllDirectories);
+            var dirs = Directory.GetDirectories(_modelManager.ModelsDirectory, "*", SearchOption.AllDirectories);
+            var totalSize = files.Sum(f => new FileInfo(f).Length);
+
+            return Ok(new
+            {
+                path = _modelManager.ModelsDirectory,
+                file_count = files.Length,
+                total_size = totalSize,
+                dir_count = dirs.Length
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get cache info: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Direct chat endpoint
+    /// </summary>
+    [HttpPost("chat")]
+    public async Task<IActionResult> DirectChat([FromBody] ChatRequest request)
+    {
+        if (string.IsNullOrEmpty(request.ModelName))
+            return BadRequest(new { error = "Model name is required" });
+
+        if (string.IsNullOrEmpty(request.Message))
+            return BadRequest(new { error = "Message is required" });
+
+        try
+        {
+            var model = await _modelManager.GetModelAsync(request.ModelName);
+
+            var config = new AIHost.Inference.GenerationConfig
+            {
+                MaxNewTokens = request.MaxTokens ?? 512,
+                Temperature = request.Temperature ?? 0.7f,
+                TopK = request.TopK ?? 40,
+                TopP = request.TopP ?? 0.9f,
+                RepetitionPenalty = 1.1f,
+                Seed = -1,
+                UseKVCache = true
+            };
+
+            var response = model.Engine.Generate(request.Message, config);
+
+            return Ok(new
+            {
+                model = request.ModelName,
+                response = response,
+                tokens = response.Length,
+                finish_reason = "stop"
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Chat failed: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
     /// Download model from URL
     /// </summary>
     [HttpPost("download")]
@@ -224,15 +418,5 @@ public class ManagementController : ControllerBase
         {
             return StatusCode(500, new { error = $"Download failed: {ex.Message}" });
         }
-    }
-
-    /// <summary>
-    /// List all available model configs
-    /// </summary>
-    [HttpGet("configs")]
-    public IActionResult GetAllConfigs()
-    {
-        var configs = _modelManager.GetAllConfigs();
-        return Ok(configs);
     }
 }

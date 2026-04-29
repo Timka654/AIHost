@@ -40,6 +40,7 @@
             display: flex;
             gap: 10px;
             margin-top: 15px;
+            flex-wrap: wrap;
         }
 
         .nav button {
@@ -67,6 +68,279 @@
             padding: 30px;
             border-radius: 10px;
             box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .section-header h2 {
+            margin: 0;
+            color: #333;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.3s;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.3s;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .btn-success {
+            background: #28a745;
+            color: white;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.3s;
+        }
+
+        .btn-success:hover {
+            background: #218838;
+        }
+
+        .config-list {
+            list-style: none;
+            padding: 0;
+            margin-top: 20px;
+        }
+
+        .config-item {
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            transition: all 0.3s;
+        }
+
+        .config-item:hover {
+            border-color: #667eea;
+        }
+
+        .config-item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .config-item-name {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .config-item-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .config-item-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .config-stat {
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #dee2e6;
+        }
+
+        .config-stat-label {
+            font-size: 12px;
+            color: #6c757d;
+        }
+
+        .config-stat-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+            margin-top: 5px;
+        }
+
+        .cache-info {
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        .cache-info h3 {
+            margin-top: 0;
+            color: #333;
+        }
+
+        .cache-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .cache-stat-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            border: 2px solid #e9ecef;
+        }
+
+        .cache-stat-box .value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .cache-stat-box .label {
+            font-size: 14px;
+            color: #6c757d;
+            margin-top: 5px;
+        }
+
+        .chat-container {
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        .chat-container h3 {
+            margin-top: 0;
+            color: #333;
+        }
+
+        .chat-form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .chat-form .form-group {
+            margin-bottom: 0;
+        }
+
+        .chat-messages {
+            margin-top: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            background: white;
+        }
+
+        .chat-message {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .chat-message.system {
+            background: #e7f3ff;
+            border-left: 3px solid #667eea;
+        }
+
+        .chat-message.user {
+            background: #f0f0f0;
+            border-left: 3px solid #6c757d;
+        }
+
+        .chat-message.assistant {
+            background: #e7f3ff;
+            border-left: 3px solid #28a745;
+        }
+
+        .chat-message .role {
+            font-weight: bold;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+
+        .chat-message .content {
+            font-size: 14px;
+            color: #333;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #6c757d;
+        }
+
+        .empty-state svg {
+            width: 100px;
+            height: 100px;
+            margin-bottom: 20px;
+            opacity: 0.3;
+        }
+
+        .refresh-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: 60px;
+            height: 60px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            font-size: 24px;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            transition: all 0.3s;
+        }
+
+        .refresh-btn:hover {
+            background: #764ba2;
+            transform: rotate(180deg) scale(1.1);
+        }
+
+        .token-info {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+
+        .token-info strong {
+            color: #856404;
         }
 
         .section {
@@ -215,7 +489,9 @@
             font-weight: 600;
         }
 
-        .form-group input {
+        .form-group input,
+        .form-group textarea,
+        .form-group select {
             width: 100%;
             padding: 10px;
             border: 2px solid #e9ecef;
@@ -223,7 +499,9 @@
             font-size: 14px;
         }
 
-        .form-group input:focus {
+        .form-group input:focus,
+        .form-group textarea:focus,
+        .form-group select:focus {
             outline: none;
             border-color: #667eea;
         }
@@ -244,50 +522,52 @@
             transform: translateY(-2px);
         }
 
-        .empty-state {
-            text-align: center;
-            padding: 60px 20px;
-            color: #6c757d;
+        .chat-form .form-group {
+            margin-bottom: 0;
         }
 
-        .empty-state svg {
-            width: 100px;
-            height: 100px;
-            margin-bottom: 20px;
-            opacity: 0.3;
-        }
-
-        .refresh-btn {
-            position: fixed;
-            bottom: 30px;
-            right: 30px;
-            width: 60px;
-            height: 60px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 50%;
-            font-size: 24px;
-            cursor: pointer;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            transition: all 0.3s;
-        }
-
-        .refresh-btn:hover {
-            background: #764ba2;
-            transform: rotate(180deg) scale(1.1);
-        }
-
-        .token-info {
-            background: #fff3cd;
-            border: 2px solid #ffc107;
-            border-radius: 8px;
+        .chat-messages {
+            margin-top: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
             padding: 15px;
-            margin-bottom: 20px;
+            background: white;
         }
 
-        .token-info strong {
-            color: #856404;
+        .chat-message {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .chat-message.system {
+            background: #e7f3ff;
+            border-left: 3px solid #667eea;
+        }
+
+        .chat-message.user {
+            background: #f0f0f0;
+            border-left: 3px solid #6c757d;
+        }
+
+        .chat-message.assistant {
+            background: #e7f3ff;
+            border-left: 3px solid #28a745;
+        }
+
+        .chat-message .role {
+            font-weight: bold;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+
+        .chat-message .content {
+            font-size: 14px;
+            color: #333;
+            white-space: pre-wrap;
+            word-wrap: break-word;
         }
     </style>
 </head>
@@ -299,6 +579,9 @@
                 <button onclick="showSection('models')" class="active" id="btn-models">Models</button>
                 <button onclick="showSection('logs')" id="btn-logs">Request Logs</button>
                 <button onclick="showSection('download')" id="btn-download">Download Model</button>
+                <button onclick="showSection('configs')" id="btn-configs">Model Configs</button>
+                <button onclick="showSection('cache')" id="btn-cache">Cache</button>
+                <button onclick="showSection('chat')" id="btn-chat">Chat</button>
             </div>
         </header>
 
@@ -364,6 +647,92 @@
                     </div>
                     <button type="submit" class="btn-submit">Download Model</button>
                 </form>
+            </div>
+
+            <!-- Configs Section -->
+            <div id="section-configs" class="section">
+                <div class="section-header">
+                    <h2>Model Configs</h2>
+                    <button class="btn btn-secondary" onclick="showCreateConfig()">+ Create New</button>
+                </div>
+                <div id="configs-container"></div>
+                <div id="create-config-form" class="config-item" style="display: none;">
+                    <h3>Create Model Config</h3>
+                    <form onsubmit="createConfig(event)">
+                        <div class="form-group">
+                            <label>Model Name:</label>
+                            <input type="text" id="config-name" placeholder="my-model" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Model Path:</label>
+                            <input type="text" id="config-model-path" placeholder="./data/models/my-model/model.gguf" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Format:</label>
+                            <input type="text" id="config-format" value="gguf" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Description:</label>
+                            <input type="text" id="config-description" placeholder="My model description">
+                        </div>
+                        <div class="form-group">
+                            <label>Temperature (0.0-2.0):</label>
+                            <input type="number" id="config-temperature" value="0.7" step="0.1" min="0" max="2">
+                        </div>
+                        <div class="form-group">
+                            <label>Top K:</label>
+                            <input type="number" id="config-top-k" value="40" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>Top P:</label>
+                            <input type="number" id="config-top-p" value="0.9" step="0.1" min="0" max="1">
+                        </div>
+                        <div class="form-group">
+                            <label>Max Tokens:</label>
+                            <input type="number" id="config-max-tokens" value="512" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>Management Token (optional):</label>
+                            <input type="password" id="manage-token" placeholder="Enter token if required">
+                        </div>
+                        <button type="submit" class="btn btn-success">Create Config</button>
+                        <button type="button" class="btn btn-secondary" onclick="showConfigs()">Cancel</button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Cache Section -->
+            <div id="section-cache" class="section">
+                <h2>Cache Directory</h2>
+                <div id="cache-container"></div>
+            </div>
+
+            <!-- Chat Section -->
+            <div id="section-chat" class="section">
+                <h2>Direct Chat</h2>
+                <div class="chat-container">
+                    <h3>Start a conversation</h3>
+                    <div id="chat-models-container"></div>
+                    <div id="chat-form" class="chat-form" style="display: none;">
+                        <div class="form-group">
+                            <label>System Message (optional):</label>
+                            <textarea id="chat-system-message" rows="3" placeholder="You are a helpful assistant..." style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>Message:</label>
+                            <textarea id="chat-message" rows="4" placeholder="Type your message here..." style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>Temperature (0.0-2.0):</label>
+                            <input type="number" id="chat-temperature" value="0.7" step="0.1" min="0" max="2" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
+                        </div>
+                        <div class="form-group">
+                            <label>Max Tokens:</label>
+                            <input type="number" id="chat-max-tokens" value="512" step="64" min="1" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
+                        </div>
+                        <button class="btn btn-success" onclick="sendChatMessage()">💬 Send Message</button>
+                    </div>
+                </div>
             </div>
         </div>
     </div>

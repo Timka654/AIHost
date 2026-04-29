@@ -17,6 +17,10 @@ public static class ComputeShaders
 
     // Core operations - lazy loaded from files with inline fallbacks
     public static string MatMulF32 => TryLoadOrInline("matmul", _inlineMatMul);
+
+    // Weight matrices from GGUF are stored column-major (ne[0] is innermost/fastest dim).
+    // This variant reads B as column-major: B[bRow, bCol] = data[bRow + bCol * K].
+    public static string MatMulWeightsF32 => TryLoadOrInline("matmul_weights", _inlineMatMulWeights);
     public static string Softmax => TryLoadOrInline("softmax", _inlineSoftmax);
     public static string SiLU => TryLoadOrInline("silu", _inlineSiLU);
     public static string ElementWiseAdd => TryLoadOrInline("add", _inlineAdd);
@@ -36,6 +40,11 @@ public static class ComputeShaders
     public static string Copy => TryLoadOrInline("copy", _inlineCopy);
     public static string RepeatColumns => TryLoadOrInline("repeat_columns", _inlineRepeatColumns);
 
+    // Correct GQA K/V expansion: repeats groups of head_dim columns (not individual columns).
+    // K[seq, numKvHeads*headDim] → K_expanded[seq, numQHeads*headDim]
+    // Each KV head's headDim-block is repeated repeat_factor times.
+    public static string RepeatKVHeads => TryLoadOrInline("repeat_kv_heads", _inlineRepeatKVHeads);
+
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {
         try
@@ -49,6 +58,49 @@ public static class ComputeShaders
     }
 
     // Inline fallbacks for backward compatibility
+
+    // Weight matrices from GGUF use column-major layout: B[k, n] = data[k + n * K].
+    // This variant replaces the row-major read B[k,n]=data[k*N+n] with the column-major
+    // read B[k,n]=data[k + n*K], fixing out-of-bounds access and wrong computation
+    // for non-square weight matrices (wK, wV, wGate, wUp, wDown, etc.).
+    private const string _inlineMatMulWeights = @"
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) readonly buffer MatrixA  { float data[]; } A;
+layout(set = 0, binding = 1) readonly buffer MatrixB  { float data[]; } B;
+layout(set = 0, binding = 2) buffer MatrixC           { float data[]; } C;
+layout(set = 0, binding = 3) readonly buffer Params   { uint M; uint K; uint N; } params;
+shared float tileA[16][16];
+shared float tileB[16][16];
+void main() {
+    uint row     = gl_GlobalInvocationID.y;
+    uint col     = gl_GlobalInvocationID.x;
+    uint tileRow = gl_LocalInvocationID.y;
+    uint tileCol = gl_LocalInvocationID.x;
+    float sum    = 0.0;
+    uint numTiles = (params.K + 15u) / 16u;
+    for (uint t = 0u; t < numTiles; t++) {
+        uint aRow = row;
+        uint aCol = t * 16u + tileCol;
+        uint bRow = t * 16u + tileRow;   // K index
+        uint bCol = col;                  // N index
+        tileA[tileRow][tileCol] = (aRow < params.M && aCol < params.K)
+            ? A.data[aRow * params.K + aCol] : 0.0;
+        // B is GGUF column-major: B[bRow, bCol] = data[bRow + bCol * K]
+        tileB[tileRow][tileCol] = (bRow < params.K && bCol < params.N)
+            ? B.data[bRow + bCol * params.K] : 0.0;
+        barrier();
+        for (uint k = 0u; k < 16u; k++) {
+            sum += tileA[tileRow][k] * tileB[k][tileCol];
+        }
+        barrier();
+    }
+    if (row < params.M && col < params.N) {
+        C.data[row * params.N + col] = sum;
+    }
+}
+";
+
     private const string _inlineMatMul = @"
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -450,6 +502,31 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= params.size) return;
     dst.data[gid] = src.data[gid];
+}
+";
+
+    // GQA K/V expansion: repeat each head_dim block repeatFactor times.
+    // output[row, j] = src[row, (j / (repeatFactor * headDim)) * headDim + j % headDim]
+    // Params: rows, srcCols (=numKvHeads*headDim), headDim, repeatFactor
+    private const string _inlineRepeatKVHeads = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
+layout(set = 0, binding = 2) readonly buffer Params {
+    uint rows; uint srcCols; uint headDim; uint repeatFactor;
+} params;
+void main() {
+    uint dstCols = params.srcCols * params.repeatFactor;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.rows * dstCols) return;
+    uint row = gid / dstCols;
+    uint j   = gid % dstCols;
+    uint groupStride = params.repeatFactor * params.headDim;  // cols per kv-head in dst
+    uint kvHead      = j / groupStride;
+    uint dimInHead   = j % params.headDim;
+    uint srcCol      = kvHead * params.headDim + dimInHead;
+    dst.data[gid] = src.data[row * params.srcCols + srcCol];
 }
 ";
 

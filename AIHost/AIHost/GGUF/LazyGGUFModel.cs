@@ -228,9 +228,11 @@ public class LazyGGUFModel : IGGUFModel
         if (_memoryMappedFile == null)
             throw new InvalidOperationException("Memory-mapped file not available");
 
+        // tensor.Offset is RELATIVE to the data section start; add DataOffset to get the
+        // absolute file position. (ReadTensorData() in GGUFReader does this correctly.)
         using var accessor = _memoryMappedFile.CreateViewAccessor(
-            (long)tensor.Offset, 
-            (long)tensor.SizeInBytes, 
+            (long)(_reader.DataOffset + tensor.Offset),
+            (long)tensor.SizeInBytes,
             MemoryMappedFileAccess.Read);
 
         byte[] data = new byte[tensor.SizeInBytes];

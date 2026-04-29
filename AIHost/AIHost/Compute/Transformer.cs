@@ -35,6 +35,7 @@ public class Transformer : IDisposable
     public int LayerCount => _numLayers;
     public ComputeOps Ops => _ops;
 
+
     public Transformer(IComputeDevice device, IGGUFModel model)
     {
         _ops = new ComputeOps(device);
@@ -133,13 +134,7 @@ public class Transformer : IDisposable
 
         // 2. All transformer layers (each layer dequantizes its own weights transiently)
         for (int i = 0; i < _numLayers; i++)
-        {
-#if DEEP_DEBUG
-            if (i % 5 == 0 || i == _numLayers - 1)
-                Console.WriteLine($"  Layer {i}/{_numLayers}...");
-#endif
             x = ApplyLayer(x, i, startPosition, kvCache);
-        }
 
         // 3. Final layer norm
         {
@@ -148,7 +143,7 @@ public class Transformer : IDisposable
             if (!normScratch) normF32.Dispose();
         }
 
-        // 4. Vocab projection
+        // 4. Vocab projection (GGUF column-major weight)
         Tensor logits;
         {
             var (outF32, outScratch) = TempF32("output.weight");
@@ -308,3 +303,4 @@ public class Transformer : IDisposable
         GC.SuppressFinalize(this);
     }
 }
+
