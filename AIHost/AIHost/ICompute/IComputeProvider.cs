@@ -52,5 +52,6 @@ public abstract class ComputeCommandQueueBase : IComputeCommandQueue
     public abstract void ReadBuffer(IComputeBuffer buffer, ulong offset, byte[] data);
     public abstract void Dispatch(IComputeKernel kernel, uint[] globalWorkSize, uint[]? localWorkSize = null);
     public abstract void Flush();
+    public virtual void InsertMemoryBarrier() { } // no-op for non-Vulkan backends
     public abstract void Dispose();
 }

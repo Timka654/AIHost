@@ -102,6 +102,7 @@ internal class MockComputeCommandQueue : IComputeCommandQueue
     public void ReadBuffer(IComputeBuffer buffer, ulong offset, byte[] data) { }
     public void Dispatch(IComputeKernel kernel, uint[] globalWorkSize, uint[]? localWorkSize = null) { }
     public void Flush() { }
+    public void InsertMemoryBarrier() { }
     public void Dispose() { }
 }
 

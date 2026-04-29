@@ -114,32 +114,35 @@ public class Transformer : IDisposable
     {
         string p = $"blk.{layerIdx}";
 
-        // Collect transient F32 views so we can dispose them all after the layer.
-        var temps = new List<Tensor>(9);
-        Tensor W(string name) { var t = TempF32(name); temps.Add(t); return t; }
+        // All ops within a layer are batched into one GPU submission.
+        // Temp F32 tensors and the incoming x are deferred — they stay alive until
+        // after the single fence wait, then ComputeOps.Flush() disposes them.
+        _ops.BeginBatch();
 
-        try
+        Tensor W(string name)
         {
-            var output = _ops.TransformerLayer(
-                x,
-                W($"{p}.attn_norm.weight"),
-                W($"{p}.attn_q.weight"),
-                W($"{p}.attn_k.weight"),
-                W($"{p}.attn_v.weight"),
-                W($"{p}.attn_output.weight"),
-                W($"{p}.ffn_norm.weight"),
-                W($"{p}.ffn_gate.weight"),
-                W($"{p}.ffn_up.weight"),
-                W($"{p}.ffn_down.weight"),
-                _numHeads, position, kvCache, layerIdx);
+            var t = TempF32(name);
+            _ops.DeferExternal(t);  // freed after layer flush
+            return t;
+        }
 
-            x.Dispose();
-            return output;
-        }
-        finally
-        {
-            foreach (var t in temps) t.Dispose();
-        }
+        var output = _ops.TransformerLayer(
+            x,
+            W($"{p}.attn_norm.weight"),
+            W($"{p}.attn_q.weight"),
+            W($"{p}.attn_k.weight"),
+            W($"{p}.attn_v.weight"),
+            W($"{p}.attn_output.weight"),
+            W($"{p}.ffn_norm.weight"),
+            W($"{p}.ffn_gate.weight"),
+            W($"{p}.ffn_up.weight"),
+            W($"{p}.ffn_down.weight"),
+            _numHeads, position, kvCache, layerIdx);
+
+        _ops.DeferExternal(x);  // x no longer needed after this layer
+        _ops.Flush();           // 1 fence wait for the entire layer
+
+        return output;
     }
 
     /// <summary>

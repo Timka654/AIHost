@@ -24,4 +24,10 @@ public interface IComputeCommandQueue : IDisposable
     /// Выполнить все команды в очереди
     /// </summary>
     void Flush();
+
+    /// <summary>
+    /// Insert a compute-to-compute memory barrier so the next dispatch sees writes
+    /// from all previous dispatches. Does NOT submit or wait — use inside a batch.
+    /// </summary>
+    void InsertMemoryBarrier();
 }

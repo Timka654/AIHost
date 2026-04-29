@@ -1,4 +1,4 @@
 <Solution>
   <Project Path="AIHost.Tests/AIHost.Tests.csproj" />
-  <Project Path="AIHost/AIHost.csproj" />
+  <Project Path="AIHost/AIHost.csproj" Id="3e1a2168-3950-49d0-a070-46b34087f72b" />
 </Solution>

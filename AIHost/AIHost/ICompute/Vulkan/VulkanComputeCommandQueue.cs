@@ -161,6 +161,32 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         _vk.CmdDispatch(_commandBuffer, groupCountX, groupCountY, groupCountZ);
     }
 
+    public override void InsertMemoryBarrier()
+    {
+        BeginRecording();
+
+        // Compute → Compute barrier: all shader writes become visible to subsequent shaders.
+        // Required when batching multiple dispatches without intermediate Flush().
+        var barrier = new MemoryBarrier
+        {
+            SType = StructureType.MemoryBarrier,
+            SrcAccessMask = AccessFlags.ShaderWriteBit,
+            DstAccessMask = AccessFlags.ShaderReadBit
+        };
+
+        unsafe
+        {
+            _vk.CmdPipelineBarrier(
+                _commandBuffer,
+                PipelineStageFlags.ComputeShaderBit,
+                PipelineStageFlags.ComputeShaderBit,
+                DependencyFlags.None,
+                1, &barrier,
+                0, null,
+                0, null);
+        }
+    }
+
     public override void Flush()
     {
         if (!_isRecording) return;

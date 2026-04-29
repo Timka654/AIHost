@@ -1,27 +1,26 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <!-- CA1848: Use LoggerMessage delegates — too verbose for this project's scale;
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<UserSecretsId>411dbc4f-31b2-4595-bc61-9c917efdc45e</UserSecretsId>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
+		<!-- CA1848: Use LoggerMessage delegates — too verbose for this project's scale;
          structured logging with args is acceptable. -->
-    <NoWarn>$(NoWarn);CA1848</NoWarn>
-  </PropertyGroup>
+		<NoWarn>$(NoWarn);CA1848</NoWarn>
+	</PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Silk.NET.Vulkan" Version="2.21.0" />
-    <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.21.0" />
-    <PackageReference Include="Silk.NET.Shaderc" Version="2.21.0" />
-    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
-    <PackageReference Include="xunit" Version="2.9.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
-  </ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Silk.NET.Vulkan" Version="2.21.0" />
+		<PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.21.0" />
+		<PackageReference Include="Silk.NET.Shaderc" Version="2.21.0" />
+		<PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.23.0" />
+	</ItemGroup>
 
 </Project>

@@ -65,6 +65,8 @@ public unsafe class CudaComputeCommandQueue : IComputeCommandQueue
         Synchronize();
     }
 
+    public void InsertMemoryBarrier() { } // CUDA streams are ordered; no explicit barrier needed
+
     public void Dispose()
     {
         if (_disposed) return;

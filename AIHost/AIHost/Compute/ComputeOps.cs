@@ -15,6 +15,12 @@ public class ComputeOps : IDisposable
     private readonly Dictionary<string, IComputeKernel> _kernelCache = new();
     private bool _disposed;
 
+    // Batch mode: all dispatches are recorded into one command buffer; no fence wait
+    // between ops. A single Flush() at the end submits everything and waits once.
+    // Deferred disposals accumulate here and are released after the flush.
+    private bool _batchMode;
+    private readonly List<IDisposable> _deferred = [];
+
     public IComputeDevice Device => _device;
 
     public ComputeOps(IComputeDevice device)
@@ -22,6 +28,49 @@ public class ComputeOps : IDisposable
         _device = device;
         _queue = device.CreateCommandQueue();
     }
+
+    // ── Batch infrastructure ─────────────────────────────────────────────────
+
+    /// <summary>Enters batch mode: GPU ops accumulate in one command buffer.</summary>
+    public void BeginBatch() => _batchMode = true;
+
+    /// <summary>
+    /// Submits all accumulated GPU work in a single fence wait, then releases
+    /// all deferred buffers and tensors. Exits batch mode.
+    /// Reduces ~500 fence waits/token to 1 per layer.
+    /// </summary>
+    public void Flush()
+    {
+        _queue.Flush();
+        foreach (var d in _deferred) d.Dispose();
+        _deferred.Clear();
+        _batchMode = false;
+    }
+
+    /// <summary>In batch mode: insert a compute barrier (no submit). Otherwise flush.</summary>
+    private void MaybeFlush()
+    {
+        if (_batchMode)
+            _queue.InsertMemoryBarrier();
+        else
+            _queue.Flush();
+    }
+
+    /// <summary>In batch mode: defer disposal until Flush(). Otherwise dispose now.</summary>
+    private void Defer(IDisposable d)
+    {
+        if (_batchMode)
+            _deferred.Add(d);
+        else
+            d.Dispose();
+    }
+
+    /// <summary>
+    /// Publicly defer a tensor for disposal after the current batch flush.
+    /// Use this from Transformer when tensors are passed into TransformerLayer
+    /// and must stay alive until the layer's GPU work completes.
+    /// </summary>
+    public void DeferExternal(IDisposable d) => Defer(d);
 
     #region Matrix Operations
 
@@ -60,9 +109,9 @@ public class ComputeOps : IDisposable
         };
         
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
 
         return result;
     }
@@ -93,9 +142,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((a.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
 
         return result;
     }
@@ -122,9 +171,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((a.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
 
         return result;
     }
@@ -163,9 +212,9 @@ public class ComputeOps : IDisposable
 
             uint[] globalWorkSize = { (uint)((result.Shape.TotalElements + 255) / 256) };
             _queue.Dispatch(kernel, globalWorkSize, null);
-            _queue.Flush();
+            MaybeFlush();
 
-            paramsBuffer.Dispose();
+            Defer(paramsBuffer);
             return result;
         }
         else if (axis == 1)
@@ -193,9 +242,9 @@ public class ComputeOps : IDisposable
 
             uint[] globalWorkSize = { (uint)((result.Shape.TotalElements + 255) / 256) };
             _queue.Dispatch(kernel, globalWorkSize, null);
-            _queue.Flush();
+            MaybeFlush();
 
-            paramsBuffer.Dispose();
+            Defer(paramsBuffer);
             return result;
         }
         else
@@ -219,9 +268,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((tensor.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
     }
 
     #endregion
@@ -253,9 +302,9 @@ public class ComputeOps : IDisposable
 
         // One workgroup per row — each workgroup of 256 threads handles one token's vector
         _queue.Dispatch(kernel, new[] { (uint)rows }, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
     }
 
     /// <summary>
@@ -273,9 +322,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((tensor.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
     }
 
     #endregion
@@ -306,9 +355,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((headDim / 2 + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
     }
 
     #endregion
@@ -331,7 +380,7 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
         return result;
     }
@@ -352,7 +401,7 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
         return result;
     }
@@ -373,7 +422,7 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
         return result;
     }
@@ -394,7 +443,7 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
         return result;
     }
@@ -415,7 +464,7 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
         return result;
     }
@@ -465,9 +514,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((cols + 15) / 16), (uint)((rows + 15) / 16) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
         return result;
     }
 
@@ -492,9 +541,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)rows };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
     }
 
     /// <summary>
@@ -515,9 +564,9 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((tensor.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
     }
 
     /// <summary>
@@ -542,8 +591,8 @@ public class ComputeOps : IDisposable
 
         uint total = (uint)(seqLen * numHeads * headDim / 2);
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
-        _queue.Flush();
-        paramsBuffer.Dispose();
+        MaybeFlush();
+        Defer(paramsBuffer);
     }
 
     /// <summary>
@@ -570,8 +619,8 @@ public class ComputeOps : IDisposable
 
         uint total = (uint)(seqLen_q * seqLen_k);
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
-        _queue.Flush();
-        paramsBuffer.Dispose();
+        MaybeFlush();
+        Defer(paramsBuffer);
     }
 
     /// <summary>
@@ -609,8 +658,8 @@ public class ComputeOps : IDisposable
             // Now run standard attention with expanded K, V
             var KT = Transpose(K_expanded, "KT");
             var scores = MatMul(Q, KT, "attention_scores");
-            KT.Dispose();
-            K_expanded.Dispose();
+            Defer(KT);
+            Defer(K_expanded);
             
             // Scale by 1/sqrt(d_k)
             float scale = 1.0f / MathF.Sqrt(headDimGQA);
@@ -624,8 +673,8 @@ public class ComputeOps : IDisposable
             
             // Attention_weights @ V
             var output = MatMul(scores, V_expanded, resultName ?? "attention_output");
-            scores.Dispose();
-            V_expanded.Dispose();
+            Defer(scores);
+            Defer(V_expanded);
             
             return output;
         }
@@ -639,7 +688,7 @@ public class ComputeOps : IDisposable
         // 1. Q @ K^T
         var KT_std = Transpose(K, "KT");
         var scores_std = MatMul(Q, KT_std, "attention_scores");
-        KT_std.Dispose();
+        Defer(KT_std);
 
         // 2. Scale by 1/sqrt(d_k)
         float scale_std = 1.0f / MathF.Sqrt(headDim);
@@ -653,7 +702,7 @@ public class ComputeOps : IDisposable
 
         // 4. Attention_weights @ V
         var output_std = MatMul(scores_std, V, resultName ?? "attention_output");
-        scores_std.Dispose();
+        Defer(scores_std);
 
         return output_std;
     }
@@ -688,9 +737,9 @@ public class ComputeOps : IDisposable
 
         uint total = (uint)(rows * newCols);
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
         return result;
     }
 
@@ -716,12 +765,12 @@ public class ComputeOps : IDisposable
 
         // 4. Element-wise multiply: gate_up = gate ⊙ up
         var gateUp = Multiply(gate, up, "ffn_gate_up");
-        gate.Dispose();
-        up.Dispose();
+        Defer(gate);
+        Defer(up);
 
         // 5. Down projection: output = gate_up @ W_down
         var output = MatMul(gateUp, wDown, resultName ?? "ffn_output");
-        gateUp.Dispose();
+        Defer(gateUp);
 
         return output;
     }
@@ -759,7 +808,7 @@ public class ComputeOps : IDisposable
         var Q = MatMul(xNorm, wQ, "Q");
         var K = MatMul(xNorm, wK, "K");
         var V = MatMul(xNorm, wV, "V");
-        xNorm.Dispose();
+        Defer(xNorm);
 
         // 1.3 RoPE — apply rotary embeddings to Q and K before attention
         int numKVHeads = K.Shape[1] / headDim;
@@ -777,52 +826,45 @@ public class ComputeOps : IDisposable
 #if DEEP_DEBUG
             Console.WriteLine($"  [KVCache] layer={layerIdx} K={K.Shape} V={V.Shape}");
 #endif
-            // Add current K, V to cache (will concatenate internally)
             kvCache.Add(layerIdx, K, V);
 
-            // Get full cached K, V for attention
             var (cachedK, cachedV) = kvCache.Get(layerIdx);
             if (cachedK == null || cachedV == null)
                 throw new InvalidOperationException($"Failed to retrieve cached K,V for layer {layerIdx}");
 #if DEEP_DEBUG
             Console.WriteLine($"  [KVCache] cached K={cachedK.Shape} V={cachedV.Shape} Q={Q.Shape}");
 #endif
-            
-            // Use cached K, V for attention
             attnOut = MultiHeadAttention(Q, cachedK, cachedV, numHeads, position, "attn_out");
-            Q.Dispose();
+            Defer(Q);
             // Don't dispose K, V - they're owned by cache
         }
         else
         {
-            // Without cache: use K, V directly
             attnOut = MultiHeadAttention(Q, K, V, numHeads, position, "attn_out");
-            Q.Dispose();
-            K.Dispose();
-            V.Dispose();
+            Defer(Q);
+            Defer(K);
+            Defer(V);
         }
 
         // 1.4 Output projection
         var attnProj = MatMul(attnOut, wAttnOut, "attn_proj");
-        attnOut.Dispose();
+        Defer(attnOut);
 
         // 1.5 Residual connection
         var x1 = Add(x, attnProj, "x_after_attn");
-        attnProj.Dispose();
+        Defer(attnProj);
 
         // 2. FFN block
-        // 2.1 Pre-normalization (GPU copy — no CPU roundtrip)
         var x1Norm = Clone(x1, "ffn_norm_input");
         LayerNorm(x1Norm, ffnNormWeight, eps);
 
-        // 2.2 Feed-forward network
         var ffnOut = FeedForward(x1Norm, wGate, wUp, wDown, "ffn_out");
-        x1Norm.Dispose();
+        Defer(x1Norm);
 
         // 2.3 Residual connection
         var output = Add(x1, ffnOut, resultName ?? "layer_output");
-        x1.Dispose();
-        ffnOut.Dispose();
+        Defer(x1);
+        Defer(ffnOut);
 
         return output;
     }
@@ -873,10 +915,10 @@ public class ComputeOps : IDisposable
 
         uint total = (uint)(seqLen * dModel);
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
-        _queue.Flush();
+        MaybeFlush();
 
         tokenBuf.Dispose();
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
 
         return result;
     }
@@ -903,9 +945,9 @@ public class ComputeOps : IDisposable
 
         uint total = (uint)input.Shape.TotalElements;
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
-        _queue.Flush();
+        MaybeFlush();
 
-        paramsBuffer.Dispose();
+        Defer(paramsBuffer);
         return result;
     }
 
