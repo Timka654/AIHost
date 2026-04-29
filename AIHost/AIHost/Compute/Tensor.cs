@@ -49,8 +49,23 @@ public class Tensor : IDisposable
     {
         if (DataType != DataType.F32)
             throw new InvalidOperationException("ReadData supports only F32 tensors");
-        
+
         return Buffer.Read<float>();
+    }
+
+    /// <summary>
+    /// Read a single row from a 2-D F32 tensor without transferring the full buffer.
+    /// </summary>
+    public float[] ReadRow(int rowIndex)
+    {
+        if (DataType != DataType.F32)
+            throw new InvalidOperationException("ReadRow supports only F32 tensors");
+        if (Shape.Rank != 2)
+            throw new InvalidOperationException("ReadRow requires a 2-D tensor");
+
+        int cols = Shape.Dimensions[1];
+        ulong byteOffset = (ulong)(rowIndex * cols * sizeof(float));
+        return Buffer.ReadRange<float>(byteOffset, cols);
     }
 
     public void Dispose()

@@ -27,6 +27,15 @@ public abstract class ComputeBufferBase : IComputeBuffer
     public abstract IntPtr GetPointer();
     public abstract void Write<T>(T[] data) where T : unmanaged;
     public abstract T[] Read<T>() where T : unmanaged;
+
+    public virtual T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
+    {
+        // Default: full read + slice (providers can override with a partial transfer)
+        var all = Read<T>();
+        int start = (int)(byteOffset / (ulong)System.Runtime.InteropServices.Marshal.SizeOf<T>());
+        return all.Skip(start).Take(elementCount).ToArray();
+    }
+
     public abstract void Dispose();
 }
 

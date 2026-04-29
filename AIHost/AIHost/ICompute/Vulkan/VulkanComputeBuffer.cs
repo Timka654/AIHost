@@ -154,12 +154,101 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
         }
         else
         {
-            // DEVICE_LOCAL only: readback via staging buffer
             fixed (T* dst = result)
                 DownloadStaging((byte*)dst, _size);
         }
 
         return result;
+    }
+
+    public override T[] ReadRange<T>(ulong byteOffset, int elementCount)
+    {
+        int elementSize = Marshal.SizeOf<T>();
+        ulong byteCount = (ulong)(elementSize * elementCount);
+        T[] result = new T[elementCount];
+
+        if (_mappedPointer != IntPtr.Zero)
+        {
+            // HOST_VISIBLE: direct CPU read at offset
+            fixed (T* dst = result)
+                System.Buffer.MemoryCopy(
+                    ((byte*)_mappedPointer.ToPointer()) + byteOffset,
+                    dst, (long)byteCount, (long)byteCount);
+        }
+        else
+        {
+            // DEVICE_LOCAL: partial staging copy
+            fixed (T* dst = result)
+                DownloadStagingRange((byte*)dst, byteOffset, byteCount);
+        }
+
+        return result;
+    }
+
+    private void DownloadStagingRange(byte* dst, ulong srcByteOffset, ulong byteCount)
+    {
+        var (stagingBuf, stagingMem, stagingPtr) = CreateStagingBuffer(byteCount, upload: false);
+        try
+        {
+            CopyBufferRange(_buffer, stagingBuf, srcByteOffset, 0, byteCount);
+            System.Buffer.MemoryCopy(stagingPtr.ToPointer(), dst, (long)byteCount, (long)byteCount);
+        }
+        finally
+        {
+            _vk.UnmapMemory(_device, stagingMem);
+            _vk.FreeMemory(_device, stagingMem, null);
+            _vk.DestroyBuffer(_device, stagingBuf, null);
+        }
+    }
+
+    private void CopyBufferRange(VkBuffer src, VkBuffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        var poolInfo = new CommandPoolCreateInfo
+        {
+            SType = StructureType.CommandPoolCreateInfo,
+            Flags = CommandPoolCreateFlags.TransientBit,
+            QueueFamilyIndex = _queueFamilyIndex
+        };
+        _vk.CreateCommandPool(_device, &poolInfo, null, out var cmdPool);
+
+        var allocInfo = new CommandBufferAllocateInfo
+        {
+            SType = StructureType.CommandBufferAllocateInfo,
+            CommandPool = cmdPool,
+            Level = CommandBufferLevel.Primary,
+            CommandBufferCount = 1
+        };
+        CommandBuffer cmdBuf;
+        _vk.AllocateCommandBuffers(_device, &allocInfo, &cmdBuf);
+
+        var beginInfo = new CommandBufferBeginInfo
+        {
+            SType = StructureType.CommandBufferBeginInfo,
+            Flags = CommandBufferUsageFlags.OneTimeSubmitBit
+        };
+        _vk.BeginCommandBuffer(cmdBuf, &beginInfo);
+
+        var region = new BufferCopy { SrcOffset = srcOffset, DstOffset = dstOffset, Size = size };
+        _vk.CmdCopyBuffer(cmdBuf, src, dst, 1, &region);
+
+        _vk.EndCommandBuffer(cmdBuf);
+
+        var fenceInfo = new FenceCreateInfo { SType = StructureType.FenceCreateInfo };
+        _vk.CreateFence(_device, &fenceInfo, null, out var fence);
+
+        var submitInfo = new SubmitInfo
+        {
+            SType = StructureType.SubmitInfo,
+            CommandBufferCount = 1,
+            PCommandBuffers = &cmdBuf
+        };
+        _vk.QueueSubmit(_queue, 1, &submitInfo, fence);
+
+        var fenceLocal = fence;
+        _vk.WaitForFences(_device, 1, &fenceLocal, true, ulong.MaxValue);
+        _vk.DestroyFence(_device, fence, null);
+        _vk.FreeCommandBuffers(_device, cmdPool, 1, &cmdBuf);
+        _vk.DestroyCommandPool(_device, cmdPool, null);
     }
 
     // ── Staging helpers ─────────────────────────────────────────────────────────

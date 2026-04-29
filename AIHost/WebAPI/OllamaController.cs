@@ -40,7 +40,7 @@ public class OllamaController : ControllerBase
             var loadDuration = loadSw.ElapsedMilliseconds * 1_000_000L;
 
             var prompt = BuildPrompt(model, request.System, request.Prompt, request.Raw);
-            var config = BuildGenerationConfig(model.Config, request.Options);
+            var config = BuildGenerationConfig(model.Config, request.Options, model.Engine.ContextLength);
             var tokenizer = model.Engine.Tokenizer;
             var promptTokens = tokenizer.Encode(prompt).Length;
 
@@ -127,7 +127,7 @@ public class OllamaController : ControllerBase
             var loadDuration = loadSw.ElapsedMilliseconds * 1_000_000L;
 
             var prompt = BuildChatPrompt(model, request.Messages);
-            var config = BuildGenerationConfig(model.Config, request.Options);
+            var config = BuildGenerationConfig(model.Config, request.Options, model.Engine.ContextLength);
             var tokenizer = model.Engine.Tokenizer;
             var promptTokens = tokenizer.Encode(prompt).Length;
 
@@ -278,7 +278,8 @@ public class OllamaController : ControllerBase
         return string.Join("\n\n", parts);
     }
 
-    private GenerationConfig BuildGenerationConfig(ModelConfig modelConfig, OllamaOptions? options)
+    private GenerationConfig BuildGenerationConfig(ModelConfig modelConfig, OllamaOptions? options,
+        int modelContextLength = 0)
     {
         var config = new GenerationConfig
         {
@@ -289,7 +290,9 @@ public class OllamaController : ControllerBase
             MaxNewTokens = modelConfig.Parameters.MaxTokens,
             Seed = modelConfig.Parameters.Seed,
             UseKVCache = modelConfig.Parameters.UseKVCache,
-            KVCacheQuantization = ParseKVCacheQuantization(modelConfig.Parameters.KVCacheQuantization)
+            KVCacheQuantization = ParseKVCacheQuantization(modelConfig.Parameters.KVCacheQuantization),
+            MaxPromptTokens = ComputeMaxPromptTokens(
+                modelContextLength, modelConfig.Parameters.ContextSize, modelConfig.Parameters.MaxTokens)
         };
 
         // Override with request options
@@ -304,6 +307,13 @@ public class OllamaController : ControllerBase
         }
 
         return config;
+    }
+
+    private static int ComputeMaxPromptTokens(int modelCtx, int configCtx, int maxNewTokens)
+    {
+        int ctx = modelCtx > 0 ? modelCtx : configCtx;
+        int limit = ctx - maxNewTokens;
+        return limit > 0 ? limit : 0;
     }
 
     private KVCacheQuantization ParseKVCacheQuantization(string value)

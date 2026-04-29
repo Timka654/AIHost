@@ -34,6 +34,11 @@ public interface IComputeBuffer : IDisposable
     /// Прочитать данные из буфера
     /// </summary>
     T[] Read<T>() where T : unmanaged;
+
+    /// <summary>
+    /// Read a contiguous slice without transferring the full buffer.
+    /// </summary>
+    T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged;
 }
 
 public enum BufferType

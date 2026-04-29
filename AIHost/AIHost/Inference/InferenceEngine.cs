@@ -17,6 +17,8 @@ public class GenerationConfig
     public int Seed { get; set; } = -1;
     public bool UseKVCache { get; set; } = true;
     public KVCacheQuantization KVCacheQuantization { get; set; } = KVCacheQuantization.None;
+    /// <summary>Max prompt tokens before truncation (0 = no limit).</summary>
+    public int MaxPromptTokens { get; set; } = 0;
 }
 
 /// <summary>
@@ -34,6 +36,7 @@ public class InferenceEngine : IDisposable
 
     public BPETokenizer Tokenizer => _tokenizer;
     public int BatchSize => _batchSize;
+    public int ContextLength => _model.ContextLength;
 
     public InferenceEngine(Transformer model, BPETokenizer tokenizer, ComputeOps ops, int batchSize = 8)
     {
@@ -81,7 +84,16 @@ public class InferenceEngine : IDisposable
             _random = new Random(config.Seed);
 
         var tokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
-        Console.WriteLine($"Prompt tokens: [{string.Join(", ", tokens)}]");
+
+        if (config.MaxPromptTokens > 0 && tokens.Count > config.MaxPromptTokens)
+        {
+            int removed = tokens.Count - config.MaxPromptTokens;
+            // Keep BOS + tail of prompt (preserve most-recent context)
+            tokens = [.. tokens.Take(1), .. tokens.Skip(removed + 1)];
+            Console.WriteLine($"[Inference] Prompt truncated: {tokens.Count + removed} → {tokens.Count} tokens");
+        }
+
+        Console.WriteLine($"[Inference] Prompt tokens: {tokens.Count}");
 
         if (config.UseKVCache)
         {
@@ -96,6 +108,9 @@ public class InferenceEngine : IDisposable
         }
 
         int eosToken = _tokenizer.EosToken;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        bool prefillDone = false;
+        int generatedCount = 0;
 
         for (int i = 0; i < config.MaxNewTokens; i++)
         {
@@ -104,33 +119,55 @@ public class InferenceEngine : IDisposable
                 ? new[] { tokens[^1] }
                 : tokens.ToArray();
 
+            var iterSw = System.Diagnostics.Stopwatch.StartNew();
             var logits = _model.Forward(inputTokens, startPos, _kvCache);
             var lastLogits = ExtractLastToken(logits);
             logits.Dispose();
 
+            if (!prefillDone)
+            {
+                Console.WriteLine($"[Inference] Prefill {inputTokens.Length} tokens: {iterSw.ElapsedMilliseconds}ms");
+                prefillDone = true;
+            }
+            else if (generatedCount % 10 == 0)
+            {
+                double tps = generatedCount / sw.Elapsed.TotalSeconds;
+                Console.WriteLine($"[Inference] Token {generatedCount}: {iterSw.ElapsedMilliseconds}ms | avg {tps:F1} tok/s | kvLen={startPos}");
+            }
+
+            // Diagnostic: show first few token predictions
+            if (generatedCount < 3)
+            {
+                float maxL = lastLogits.Max();
+                int maxIdx = Array.IndexOf(lastLogits, maxL);
+                bool anyNaN = lastLogits.Any(float.IsNaN);
+                Console.WriteLine($"[Logits] gen#{generatedCount}: maxLogit={maxL:F3} @{maxIdx} anyNaN={anyNaN}");
+            }
+
             int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
+            generatedCount++;
             onToken?.Invoke(nextToken);
 
             if (nextToken == eosToken)
+            {
+                Console.WriteLine($"[Inference] EOS at token {generatedCount}, total {sw.ElapsedMilliseconds}ms");
                 break;
+            }
         }
+
+        if (generatedCount == config.MaxNewTokens)
+            Console.WriteLine($"[Inference] Hit MaxNewTokens={config.MaxNewTokens} limit, total {sw.ElapsedMilliseconds}ms");
 
         return tokens;
     }
 
     private float[] ExtractLastToken(Tensor logits)
     {
-        // logits shape: [seqLen, vocabSize]
-        var data = logits.ReadData();
-        int seqLen = logits.Shape.Dimensions[0];
-        int vocabSize = logits.Shape.Dimensions[1];
-
-        float[] lastLogits = new float[vocabSize];
-        int offset = (seqLen - 1) * vocabSize;
-        Array.Copy(data, offset, lastLogits, 0, vocabSize);
-
-        return lastLogits;
+        // logits shape: [seqLen, vocabSize] — only the last row is needed.
+        // ReadRow avoids a full-buffer GPU→CPU transfer (e.g. 284 MB for 2214-token prefill).
+        int lastRow = logits.Shape.Dimensions[0] - 1;
+        return logits.ReadRow(lastRow);
     }
 
     private int Sample(float[] logits, List<int> generatedTokens, GenerationConfig config)
@@ -332,12 +369,16 @@ public class KVCache : IDisposable
             
             var newKey = _ops.Concat(oldKey, key, axis: 0, $"kv_cache_k_layer{layer}");
             var newValue = _ops.Concat(oldValue, value, axis: 0, $"kv_cache_v_layer{layer}");
-            
-            oldKey.Dispose();
-            oldValue.Dispose();
-            key.Dispose(); // Dispose incoming tensors after concat
-            value.Dispose();
-            
+
+            // ALL FOUR tensors must be deferred: the Concat dispatches in the current batch
+            // reference oldKey, oldValue, key, and value through descriptor ring slots.
+            // Calling Dispose() before Flush() would destroy the Vulkan buffers while they
+            // are still referenced in the recorded command buffer → VK_ERROR_DEVICE_LOST.
+            _ops.DeferExternal(oldKey);
+            _ops.DeferExternal(oldValue);
+            _ops.DeferExternal(key);
+            _ops.DeferExternal(value);
+
             _cache[layer] = (newKey, newValue);
             SequenceLength = newKey.Shape.Dimensions[0]; // seq_len is first dimension
         }

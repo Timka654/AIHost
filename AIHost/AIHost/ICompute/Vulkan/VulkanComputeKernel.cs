@@ -17,7 +17,11 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
     private PipelineLayout _pipelineLayout;
     private DescriptorSetLayout _descriptorSetLayout;
     private DescriptorPool _descriptorPool;
-    private DescriptorSet _descriptorSet;
+    // Ring of descriptor sets — one per dispatch within a batch.
+    // Each Dispatch() uses the next slot; ResetDispatchRing() rewinds after Flush().
+    private const int DescriptorPoolSize = 64;
+    private DescriptorSet[] _descriptorSets = [];
+    private int _dispatchIndex;
     private readonly List<IComputeBuffer> _bufferArguments = new();
     private bool _compiled;
     private bool _disposed;
@@ -129,17 +133,20 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
                 throw new InvalidOperationException("Failed to create compute pipeline");
         }
 
-        // Создание descriptor pool
+        // Descriptor pool with DescriptorPoolSize slots so each dispatch in a batch
+        // gets its own descriptor set — avoids the "last write wins" problem where
+        // all dispatches in a command buffer share one descriptor and see only
+        // the last-updated bindings at GPU execution time.
         var poolSize = new DescriptorPoolSize
         {
             Type = DescriptorType.StorageBuffer,
-            DescriptorCount = (uint)bindingCount
+            DescriptorCount = (uint)(bindingCount * DescriptorPoolSize)
         };
 
         var poolInfo = new DescriptorPoolCreateInfo
         {
             SType = StructureType.DescriptorPoolCreateInfo,
-            MaxSets = 1,
+            MaxSets = DescriptorPoolSize,
             PoolSizeCount = 1,
             PPoolSizes = &poolSize
         };
@@ -147,18 +154,25 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         if (_vk.CreateDescriptorPool(_device, &poolInfo, null, out _descriptorPool) != Result.Success)
             throw new InvalidOperationException("Failed to create descriptor pool");
 
-        // Выделение descriptor set
-        var descriptorSetLayoutForAlloc = _descriptorSetLayout;
+        // Allocate all DescriptorPoolSize sets at once
+        _descriptorSets = new DescriptorSet[DescriptorPoolSize];
+        var layouts = stackalloc DescriptorSetLayout[DescriptorPoolSize];
+        for (int i = 0; i < DescriptorPoolSize; i++)
+            layouts[i] = _descriptorSetLayout;
+
         var allocInfo = new DescriptorSetAllocateInfo
         {
             SType = StructureType.DescriptorSetAllocateInfo,
             DescriptorPool = _descriptorPool,
-            DescriptorSetCount = 1,
-            PSetLayouts = &descriptorSetLayoutForAlloc
+            DescriptorSetCount = DescriptorPoolSize,
+            PSetLayouts = layouts
         };
 
-        if (_vk.AllocateDescriptorSets(_device, &allocInfo, out _descriptorSet) != Result.Success)
-            throw new InvalidOperationException("Failed to allocate descriptor set");
+        fixed (DescriptorSet* setsPtr = _descriptorSets)
+        {
+            if (_vk.AllocateDescriptorSets(_device, &allocInfo, setsPtr) != Result.Success)
+                throw new InvalidOperationException("Failed to allocate descriptor sets");
+        }
 
         _compiled = true;
     }
@@ -217,10 +231,18 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         return spirvBytes;
     }
 
-    public void UpdateDescriptorSets()
+    /// <summary>
+    /// Write current buffer arguments into the next ring slot and advance the index.
+    /// Returns the descriptor set to bind for this dispatch.
+    /// </summary>
+    public DescriptorSet UpdateDescriptorSets()
     {
         if (!_compiled)
             throw new InvalidOperationException("Kernel must be compiled before updating descriptor sets");
+
+        int slot = _dispatchIndex % DescriptorPoolSize;
+        var currentSet = _descriptorSets[slot];
+        _dispatchIndex++;
 
         var writeDescriptorSets = stackalloc WriteDescriptorSet[_bufferArguments.Count];
         var bufferInfos = stackalloc DescriptorBufferInfo[_bufferArguments.Count];
@@ -240,7 +262,7 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
             writeDescriptorSets[i] = new WriteDescriptorSet
             {
                 SType = StructureType.WriteDescriptorSet,
-                DstSet = _descriptorSet,
+                DstSet = currentSet,
                 DstBinding = (uint)i,
                 DstArrayElement = 0,
                 DescriptorCount = 1,
@@ -250,7 +272,11 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         }
 
         _vk.UpdateDescriptorSets(_device, (uint)_bufferArguments.Count, writeDescriptorSets, 0, null);
+        return currentSet;
     }
+
+    /// <summary>Reset the dispatch ring after Flush() — reuse slots for the next batch.</summary>
+    public void ResetDispatchRing() => _dispatchIndex = 0;
 
     public override void Dispatch(uint[] globalWorkSize, uint[]? localWorkSize = null)
     {
@@ -322,5 +348,5 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
 
     internal Pipeline Pipeline => _pipeline;
     internal PipelineLayout PipelineLayout => _pipelineLayout;
-    internal DescriptorSet DescriptorSet => _descriptorSet;
+    //internal DescriptorSet DescriptorSet => _descriptorSet;
 }

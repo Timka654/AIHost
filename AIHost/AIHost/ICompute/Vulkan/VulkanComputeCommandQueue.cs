@@ -122,14 +122,15 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 
         BeginRecording();
 
-        // Обновить descriptor sets с текущими буферами
-        vkKernel.UpdateDescriptorSets();
+        // Allocate a fresh ring-slot descriptor set and update it with current buffer bindings.
+        // Each dispatch in a batch gets its own slot so the GPU sees the correct buffers
+        // when it executes (not the last-written state of a shared set).
+        var descriptorSet = vkKernel.UpdateDescriptorSets();
 
         // Bind pipeline
         _vk.CmdBindPipeline(_commandBuffer, PipelineBindPoint.Compute, vkKernel.Pipeline);
 
-        // Bind descriptor sets
-        var descriptorSet = vkKernel.DescriptorSet;
+        // Bind the per-dispatch descriptor set
         _vk.CmdBindDescriptorSets(
             _commandBuffer,
             PipelineBindPoint.Compute,
@@ -192,8 +193,9 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (!_isRecording) return;
 
         // Завершение записи команд
-        if (_vk.EndCommandBuffer(_commandBuffer) != Result.Success)
-            throw new InvalidOperationException("Failed to end command buffer");
+        var endResult = _vk.EndCommandBuffer(_commandBuffer);
+        if (endResult != Result.Success)
+            throw new InvalidOperationException($"vkEndCommandBuffer failed: {endResult}");
 
         _isRecording = false;
 
@@ -211,8 +213,9 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
             PCommandBuffers = &cmdBufferLocal
         };
 
-        if (_vk.QueueSubmit(_queue, 1, &submitInfo, _fence) != Result.Success)
-            throw new InvalidOperationException("Failed to submit command buffer");
+        var submitResult = _vk.QueueSubmit(_queue, 1, &submitInfo, _fence);
+        if (submitResult != Result.Success)
+            throw new InvalidOperationException($"vkQueueSubmit failed: {submitResult}");
 
         // Ожидание завершения
         _vk.WaitForFences(_device, 1, &fenceLocal, true, ulong.MaxValue);

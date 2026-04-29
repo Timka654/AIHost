@@ -1,5 +1,6 @@
 using AIHost.GGUF;
 using AIHost.ICompute;
+using AIHost.ICompute.Vulkan;
 using AIHost.Inference;
 using System.Runtime.InteropServices;
 
@@ -45,6 +46,10 @@ public class ComputeOps : IDisposable
         foreach (var d in _deferred) d.Dispose();
         _deferred.Clear();
         _batchMode = false;
+        // Rewind each kernel's descriptor ring so next batch starts from slot 0.
+        foreach (var kernel in _kernelCache.Values)
+            if (kernel is VulkanComputeKernel vk)
+                vk.ResetDispatchRing();
     }
 
     /// <summary>In batch mode: insert a compute barrier (no submit). Otherwise flush.</summary>
@@ -481,9 +486,57 @@ public class ComputeOps : IDisposable
             DataType.Q4_K => DequantizeQ4K(quantized, resultName),
             DataType.Q5_K => DequantizeQ5K(quantized, resultName),
             DataType.Q6_K => DequantizeQ6K(quantized, resultName),
-            DataType.F32 => quantized, // Уже F32
+            DataType.F32 => quantized,
             _ => throw new NotSupportedException($"Dequantization for {quantized.DataType} not implemented")
         };
+    }
+
+    /// <summary>
+    /// Dequantize into a pre-allocated F32 tensor (avoids vkAllocateMemory per call).
+    /// </summary>
+    public void DequantizeInto(Tensor quantized, Tensor target)
+    {
+        if (target.DataType != DataType.F32)
+            throw new ArgumentException("Target must be F32");
+
+        string kernelName = quantized.DataType switch
+        {
+            DataType.Q2_K => "dequant_q2k",
+            DataType.Q3_K => "dequant_q3k",
+            DataType.Q4_K => "dequant_q4k",
+            DataType.Q5_K => "dequant_q5k",
+            DataType.Q6_K => "dequant_q6k",
+            _ => throw new NotSupportedException($"DequantizeInto not supported for {quantized.DataType}")
+        };
+
+        string shaderSource = quantized.DataType switch
+        {
+            DataType.Q2_K => ComputeShaders.DequantizeQ2K,
+            DataType.Q3_K => ComputeShaders.DequantizeQ3K,
+            DataType.Q4_K => ComputeShaders.DequantizeQ4K,
+            DataType.Q5_K => ComputeShaders.DequantizeQ5K,
+            DataType.Q6_K => ComputeShaders.DequantizeQ6K,
+            _ => throw new NotSupportedException()
+        };
+
+        var kernel = GetOrCreateKernel(kernelName, shaderSource);
+        kernel.SetArgument(0, quantized.Buffer);
+        kernel.SetArgument(1, target.Buffer);
+
+        uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
+        _queue.Dispatch(kernel, globalWorkSize, null);
+        // No barrier here — independent weight dequants can run in parallel on GPU.
+        // Caller must insert a barrier after ALL weight dequants are dispatched.
+        if (!_batchMode) _queue.Flush();
+    }
+
+    /// <summary>
+    /// Insert a pipeline barrier in the current batch (no-op in non-batch mode).
+    /// Use after a group of independent dispatches that are all needed by subsequent ops.
+    /// </summary>
+    public void InsertBarrier()
+    {
+        if (_batchMode) _queue.InsertMemoryBarrier();
     }
 
     #endregion

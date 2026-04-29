@@ -64,6 +64,13 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
         }
     }
 
+    public T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
+    {
+        int elementSize = Marshal.SizeOf<T>();
+        int start = (int)(byteOffset / (ulong)elementSize);
+        return Read<T>().Skip(start).Take(elementCount).ToArray();
+    }
+
     public T[] Read<T>() where T : unmanaged
     {
         if (_disposed)
@@ -72,12 +79,12 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
         int elementSize = Marshal.SizeOf<T>();
         int count = (int)(_size / (ulong)elementSize);
         T[] result = new T[count];
-        
+
         fixed (T* ptr = result)
         {
             CopyToHost((IntPtr)ptr, _size);
         }
-        
+
         return result;
     }
 

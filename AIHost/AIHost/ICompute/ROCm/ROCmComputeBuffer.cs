@@ -40,6 +40,12 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
         }
     }
 
+    public T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
+    {
+        int start = (int)(byteOffset / (ulong)sizeof(T));
+        return Read<T>().Skip(start).Take(elementCount).ToArray();
+    }
+
     public T[] Read<T>() where T : unmanaged
     {
         if (_disposed)
