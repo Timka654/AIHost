@@ -5,11 +5,15 @@ using AIHost.Inference;
 namespace AIHost.Compute;
 
 /// <summary>
-/// LLM Transformer model for inference
+/// LLM Transformer model for inference.
+///
+/// Memory strategy: weights are stored QUANTIZED in the cache (~600 MB for Q4_K_M).
+/// Each forward pass dequantizes only the weights needed for the current operation into
+/// temporary F32 tensors that are freed immediately after use.
+/// Peak GPU memory per layer ≈ 160 MB F32 (vs 4.4 GB if all pre-dequantized).
 /// </summary>
 public class Transformer : IDisposable
 {
-    private readonly IComputeDevice _device;
     private readonly ComputeOps _ops;
     private readonly IGGUFModel _model;
     private readonly int _numLayers;
@@ -17,20 +21,14 @@ public class Transformer : IDisposable
     private readonly int _numHeads;
     private bool _disposed;
 
-    // Model weights
-    private Tensor? _tokenEmbedding;
-    private Tensor? _outputNormWeight;
-    private Tensor? _outputWeight;
-    
-    // Weight cache to avoid repeated dequantization
-    private readonly Dictionary<string, Tensor> _weightCache = new();
+    // Stores QUANTIZED tensors (or F32 for weights already stored as F32 in GGUF).
+    private readonly Dictionary<string, Tensor> _weightCache = [];
 
     public int LayerCount => _numLayers;
     public ComputeOps Ops => _ops;
 
     public Transformer(IComputeDevice device, IGGUFModel model)
     {
-        _device = device;
         _ops = new ComputeOps(device);
         _model = model;
 
@@ -43,181 +41,168 @@ public class Transformer : IDisposable
     }
 
     /// <summary>
-    /// Load model weights from GGUF
+    /// Upload all model weights to GPU (quantized). Fast: no dequantization here.
     /// </summary>
     public void LoadWeights()
     {
         Console.WriteLine("Loading model weights...");
 
-        // Token embedding
-        _tokenEmbedding = LoadWeight("token_embd.weight");
-#if DEEP_DEBUG
-        Console.WriteLine($"  token_embd.weight: {_tokenEmbedding.Shape}");
-#endif
+        CacheWeight("token_embd.weight");
+        CacheWeight("output_norm.weight");
+        CacheWeight("output.weight");
 
-        // Output layers
-        _outputNormWeight = LoadWeight("output_norm.weight");
-        _outputWeight = LoadWeight("output.weight");
-#if DEEP_DEBUG
-        Console.WriteLine($"  output_norm.weight: {_outputNormWeight.Shape}");
-        Console.WriteLine($"  output.weight: {_outputWeight.Shape}");
-#endif
+        for (int i = 0; i < _numLayers; i++)
+        {
+            string p = $"blk.{i}";
+            CacheWeight($"{p}.attn_norm.weight");
+            CacheWeight($"{p}.attn_q.weight");
+            CacheWeight($"{p}.attn_k.weight");
+            CacheWeight($"{p}.attn_v.weight");
+            CacheWeight($"{p}.attn_output.weight");
+            CacheWeight($"{p}.ffn_norm.weight");
+            CacheWeight($"{p}.ffn_gate.weight");
+            CacheWeight($"{p}.ffn_up.weight");
+            CacheWeight($"{p}.ffn_down.weight");
 
-        Console.WriteLine($"✓ Weights loaded\n");
+            if ((i + 1) % 5 == 0 || i == _numLayers - 1)
+                Console.WriteLine($"  Uploaded layer {i + 1}/{_numLayers}");
+        }
+
+        Console.WriteLine($"✓ Weights loaded ({_weightCache.Count} tensors, quantized in VRAM)\n");
     }
 
     /// <summary>
-    /// Forward pass through transformer
+    /// Forward pass through transformer.
     /// </summary>
     public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null)
     {
-        if (_tokenEmbedding == null)
+        if (!_weightCache.ContainsKey("token_embd.weight"))
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
-
-        int seqLen = tokenIds.Length;
 #if DEEP_DEBUG
-        Console.WriteLine($"Forward pass: {seqLen} tokens starting at position {startPosition}");
+        Console.WriteLine($"Forward pass: {tokenIds.Length} tokens at position {startPosition}");
 #endif
 
-        // 1. Token embedding lookup
-        var x = EmbeddingLookup(_tokenEmbedding, tokenIds);
-#if DEEP_DEBUG
-        Console.WriteLine($"  Embedding: {x.Shape}");
-#endif
+        // 1. Token embedding: dequantize table → lookup → free table
+        Tensor x;
+        using (var embF32 = TempF32("token_embd.weight"))
+            x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
 
-        // 2. Apply all transformer layers
+        // 2. All transformer layers (each layer dequantizes its own weights transiently)
         for (int i = 0; i < _numLayers; i++)
         {
 #if DEEP_DEBUG
             if (i % 5 == 0 || i == _numLayers - 1)
-                Console.WriteLine($"  Applying layer {i}/{_numLayers}...");
+                Console.WriteLine($"  Layer {i}/{_numLayers}...");
 #endif
             x = ApplyLayer(x, i, startPosition, kvCache);
-            _device.Synchronize();
         }
 
         // 3. Final layer norm
-        _ops.LayerNorm(x, _outputNormWeight!);
-#if DEEP_DEBUG
-        Console.WriteLine($"  Final norm: {x.Shape}");
-#endif
+        using (var normF32 = TempF32("output_norm.weight"))
+            _ops.LayerNorm(x, normF32);
 
-        // 4. Project to vocab
-        var logits = _ops.MatMul(x, _outputWeight!, "logits");
+        // 4. Vocab projection
+        Tensor logits;
+        using (var outF32 = TempF32("output.weight"))
+            logits = _ops.MatMul(x, outF32, "logits");
+
         x.Dispose();
-#if DEEP_DEBUG
-        Console.WriteLine($"  Logits: {logits.Shape}");
-#endif
-
         return logits;
     }
 
     private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null)
     {
-        // Load layer weights
-        string prefix = $"blk.{layerIdx}";
-        var attnNorm = LoadWeight($"{prefix}.attn_norm.weight");
-        var wQ = LoadWeight($"{prefix}.attn_q.weight");
-        var wK = LoadWeight($"{prefix}.attn_k.weight");
-        var wV = LoadWeight($"{prefix}.attn_v.weight");
-        var wAttnOut = LoadWeight($"{prefix}.attn_output.weight");
-        var ffnNorm = LoadWeight($"{prefix}.ffn_norm.weight");
-        var wGate = LoadWeight($"{prefix}.ffn_gate.weight");
-        var wUp = LoadWeight($"{prefix}.ffn_up.weight");
-        var wDown = LoadWeight($"{prefix}.ffn_down.weight");
+        string p = $"blk.{layerIdx}";
 
-        // Apply layer
-        var output = _ops.TransformerLayer(
-            x, attnNorm, wQ, wK, wV, wAttnOut,
-            ffnNorm, wGate, wUp, wDown,
-            _numHeads, position, kvCache, layerIdx);
+        // Collect transient F32 views so we can dispose them all after the layer.
+        var temps = new List<Tensor>(9);
+        Tensor W(string name) { var t = TempF32(name); temps.Add(t); return t; }
 
-        // Don't dispose weights - they're cached!
-        x.Dispose();
-
-        return output;
-    }
-
-    private Tensor LoadWeight(string name)
-    {
-        // Check cache first
-        if (_weightCache.TryGetValue(name, out var cached))
-            return cached;
-        
-        // Find tensor info
-        var tensorInfo = _model.Tensors.FirstOrDefault(t => t.Name == name);
-        if (tensorInfo == null)
-            throw new ArgumentException($"Tensor '{name}' not found");
-
-        // Load buffer
-        var buffer = _model.LoadTensor(name);
-        
-        // Get data type and shape
-        var dataType = MapTensorTypeToDataType(tensorInfo.Type);
-        
-        // Use GGUF dimensions as-is - they are already in correct layout for MatMul
-        // GGUF stores weight matrices as [in_features, out_features] (transposed PyTorch format)
-        var dims = tensorInfo.Shape.Select(s => (int)s).ToArray();
-        var shape = new TensorShape(dims);
-        
-        // Create tensor wrapper
-        var tensor = new Tensor(buffer, shape, dataType, name);
-        
-        // Dequantize if needed
-        if (dataType != DataType.F32)
+        try
         {
-            var dequantized = _ops.Dequantize(tensor, $"{name}_f32");
-            tensor.Dispose();
-            tensor = dequantized;
+            var output = _ops.TransformerLayer(
+                x,
+                W($"{p}.attn_norm.weight"),
+                W($"{p}.attn_q.weight"),
+                W($"{p}.attn_k.weight"),
+                W($"{p}.attn_v.weight"),
+                W($"{p}.attn_output.weight"),
+                W($"{p}.ffn_norm.weight"),
+                W($"{p}.ffn_gate.weight"),
+                W($"{p}.ffn_up.weight"),
+                W($"{p}.ffn_down.weight"),
+                _numHeads, position, kvCache, layerIdx);
+
+            x.Dispose();
+            return output;
         }
-
-        // Cache the dequantized weight
-        _weightCache[name] = tensor;
-        
-        return tensor;
-    }
-
-    private DataType MapTensorTypeToDataType(GGUFTensorType type)
-    {
-        return type switch
+        finally
         {
-            GGUFTensorType.F32 => DataType.F32,
-            GGUFTensorType.F16 => DataType.F16,
-            GGUFTensorType.Q4_0 => DataType.Q4_0,
-            GGUFTensorType.Q4_1 => DataType.Q4_1,
-            GGUFTensorType.Q5_0 => DataType.Q5_0,
-            GGUFTensorType.Q5_1 => DataType.Q5_1,
-            GGUFTensorType.Q8_0 => DataType.Q8_0,
-            GGUFTensorType.Q8_1 => DataType.Q8_1,
-            GGUFTensorType.Q2_K => DataType.Q2_K,
-            GGUFTensorType.Q3_K => DataType.Q3_K,
-            GGUFTensorType.Q4_K => DataType.Q4_K,
-            GGUFTensorType.Q5_K => DataType.Q5_K,
-            GGUFTensorType.Q6_K => DataType.Q6_K,
-            GGUFTensorType.Q8_K => DataType.Q8_K,
-            _ => throw new NotSupportedException($"Unsupported tensor type: {type}")
-        };
+            foreach (var t in temps) t.Dispose();
+        }
     }
 
-    private Tensor EmbeddingLookup(Tensor embeddingTable, int[] tokenIds)
+    /// <summary>
+    /// Returns a new F32 tensor from the named cached weight.
+    /// The caller MUST dispose the returned tensor.
+    /// </summary>
+    private Tensor TempF32(string name)
     {
-        return _ops.EmbeddingLookup(tokenIds, embeddingTable, "embeddings");
+        var cached = _weightCache[name];
+        // F32 weights (e.g., norm weights): Clone so caller can safely dispose without
+        // touching the cached original. Quantized weights: Dequantize creates a new buffer.
+        return cached.DataType == DataType.F32
+            ? _ops.Clone(cached)
+            : _ops.Dequantize(cached);
     }
+
+    /// <summary>
+    /// Uploads a single weight to GPU (quantized, no dequantization).
+    /// </summary>
+    private void CacheWeight(string name)
+    {
+        if (_weightCache.ContainsKey(name)) return;
+
+        var info = _model.Tensors.FirstOrDefault(t => t.Name == name)
+            ?? throw new ArgumentException($"Tensor '{name}' not found in GGUF");
+
+        var buffer = _model.LoadTensor(name);
+        var dtype = MapType(info.Type);
+        var dims = info.Shape.Select(s => (int)s).ToArray();
+
+        _weightCache[name] = new Tensor(buffer, new TensorShape(dims), dtype, name);
+    }
+
+    private static DataType MapType(GGUFTensorType t) => t switch
+    {
+        GGUFTensorType.F32  => DataType.F32,
+        GGUFTensorType.F16  => DataType.F16,
+        GGUFTensorType.Q4_0 => DataType.Q4_0,
+        GGUFTensorType.Q4_1 => DataType.Q4_1,
+        GGUFTensorType.Q5_0 => DataType.Q5_0,
+        GGUFTensorType.Q5_1 => DataType.Q5_1,
+        GGUFTensorType.Q8_0 => DataType.Q8_0,
+        GGUFTensorType.Q8_1 => DataType.Q8_1,
+        GGUFTensorType.Q2_K => DataType.Q2_K,
+        GGUFTensorType.Q3_K => DataType.Q3_K,
+        GGUFTensorType.Q4_K => DataType.Q4_K,
+        GGUFTensorType.Q5_K => DataType.Q5_K,
+        GGUFTensorType.Q6_K => DataType.Q6_K,
+        GGUFTensorType.Q8_K => DataType.Q8_K,
+        _ => throw new NotSupportedException($"Unsupported tensor type: {t}")
+    };
 
     public void Dispose()
     {
         if (_disposed) return;
 
-        _tokenEmbedding?.Dispose();
-        _outputNormWeight?.Dispose();
-        _outputWeight?.Dispose();
-
-        foreach (var tensor in _weightCache.Values)
-            tensor.Dispose();
+        foreach (var t in _weightCache.Values)
+            t.Dispose();
         _weightCache.Clear();
 
         _ops.Dispose();
 
         _disposed = true;
+        GC.SuppressFinalize(this);
     }
 }

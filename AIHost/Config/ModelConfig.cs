@@ -106,6 +106,15 @@ public class ModelConfig
     /// </summary>
     [JsonPropertyName("enable_mlock")]
     public bool EnableMlock { get; set; } = false;
+
+    /// <summary>
+    /// Allow the model to fall back to shared GPU memory (system RAM) when dedicated VRAM
+    /// is insufficient. Default false — loading fails fast with a clear error rather than
+    /// silently running at PCIe speeds (10–20x slower than VRAM).
+    /// Set to true only if you intentionally want CPU-side inference.
+    /// </summary>
+    [JsonPropertyName("allow_shared_memory")]
+    public bool AllowSharedMemory { get; set; } = false;
 }
 
 /// <summary>

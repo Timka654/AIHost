@@ -66,7 +66,7 @@ internal class MockComputeDevice : IComputeDevice
     public string ProviderName => "Mock";
     public string ApiVersion => "1.0.0";
     
-    public IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32)
+    public IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)
         => new MockComputeBuffer(size);
     
     public IComputeKernel CreateKernel(string source, string entryPoint)

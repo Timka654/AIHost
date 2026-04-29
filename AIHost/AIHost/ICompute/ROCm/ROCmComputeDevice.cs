@@ -42,8 +42,9 @@ public class ROCmComputeDevice : ComputeProviderBase
         Console.WriteLine($"Global Memory: {props.totalGlobalMem / (1024 * 1024)} MB\n");
     }
 
-    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32)
+    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)
     {
+        // ROCm always allocates in device memory — requireDeviceLocal is always satisfied.
         return new ROCmComputeBuffer(size, type, elementType);
     }
 

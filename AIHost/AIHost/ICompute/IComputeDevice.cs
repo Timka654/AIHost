@@ -18,7 +18,11 @@ public interface IComputeDevice : IDisposable
     /// <summary>
     /// Создать буфер памяти
     /// </summary>
-    IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32);
+    /// <param name="requireDeviceLocal">
+    /// When true, throws <see cref="InsufficientVramException"/> if the buffer cannot be placed
+    /// in dedicated device memory (VRAM). Use false for buffers that are acceptable in shared/system RAM.
+    /// </param>
+    IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false);
 
     /// <summary>
     /// Создать ядро из исходного кода

@@ -20,6 +20,7 @@ public class LazyGGUFModel : IGGUFModel
     private bool _disposed;
     private bool _useMemoryMapping;
     private bool _useMemoryLock;
+    private readonly bool _requireDeviceLocal;
     private readonly Dictionary<IntPtr, ulong> _lockedRegions = new();
 
     public GGUFHeader Header => _reader.Header;
@@ -30,12 +31,13 @@ public class LazyGGUFModel : IGGUFModel
     public int LoadedTensorCount => _tensorBuffers.Count;
     public int TotalTensorCount => Tensors.Count;
 
-    public LazyGGUFModel(string filePath, IComputeDevice device, bool useMemoryMapping = true, bool useMemoryLock = false)
+    public LazyGGUFModel(string filePath, IComputeDevice device, bool useMemoryMapping = true, bool useMemoryLock = false, bool requireDeviceLocal = false)
     {
         _filePath = filePath;
         _device = device;
         _useMemoryMapping = useMemoryMapping;
         _useMemoryLock = useMemoryLock;
+        _requireDeviceLocal = requireDeviceLocal;
 
         // Check for split files
         _splitFiles = DiscoverSplitFiles(filePath);
@@ -158,9 +160,9 @@ public class LazyGGUFModel : IGGUFModel
             data = _reader.ReadTensorData(tensor);
         }
 
-        // Create buffer
+        // Create buffer — weight tensors require device-local memory when configured.
         var dataType = MapTensorTypeToDataType(tensor.Type);
-        var buffer = _device.CreateBuffer(tensor.SizeInBytes, BufferType.Storage, dataType);
+        var buffer = _device.CreateBuffer(tensor.SizeInBytes, BufferType.Storage, dataType, _requireDeviceLocal);
 
         // Upload data
         fixed (byte* src = data)

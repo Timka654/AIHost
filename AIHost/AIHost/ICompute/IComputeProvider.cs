@@ -8,7 +8,7 @@ public abstract class ComputeProviderBase : IComputeDevice
     public abstract string ProviderName { get; }
     public abstract string ApiVersion { get; }
 
-    public abstract IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32);
+    public abstract IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false);
     public abstract IComputeKernel CreateKernel(string source, string entryPoint);
     public abstract IComputeKernel CreateKernelFromFile(string filePath, string entryPoint);
     public abstract IComputeCommandQueue CreateCommandQueue();

@@ -74,8 +74,9 @@ public unsafe class CudaComputeDevice : ComputeProviderBase
         Console.WriteLine($"Multiprocessors: {prop.multiProcessorCount}");
     }
 
-    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32)
+    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)
     {
+        // CUDA always allocates in device memory — requireDeviceLocal is always satisfied.
         return new CudaComputeBuffer(size, type, elementType);
     }
 

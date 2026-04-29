@@ -150,7 +150,7 @@ public class ModelManager : IDisposable
         
         // LazyGGUFModel owns its GGUFReader — reuse it for the tokenizer
         // to avoid opening and parsing the same file twice.
-        IGGUFModel ggufModel = new AIHost.GGUF.LazyGGUFModel(modelPath, device, config.EnableMmap, config.EnableMlock);
+        IGGUFModel ggufModel = new AIHost.GGUF.LazyGGUFModel(modelPath, device, config.EnableMmap, config.EnableMlock, requireDeviceLocal: !config.AllowSharedMemory);
         var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
         // Transformer owns its ComputeOps; share it with InferenceEngine
         var transformer = new Transformer(device, ggufModel);
@@ -446,5 +446,6 @@ public class ModelInstance : IDisposable
     {
         Engine?.Dispose();
         Device?.Dispose();
+        GC.SuppressFinalize(this);
     }
 }

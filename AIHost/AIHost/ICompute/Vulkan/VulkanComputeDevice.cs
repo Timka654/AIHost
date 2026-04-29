@@ -205,9 +205,9 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
         _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
     }
 
-    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32)
+    public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)
     {
-        return new VulkanComputeBuffer(_vk, _device, _physicalDevice, size, type, elementType);
+        return new VulkanComputeBuffer(_vk, _device, _physicalDevice, _queue, _queueFamilyIndex, size, type, elementType, requireDeviceLocal);
     }
 
     public override IComputeKernel CreateKernel(string source, string entryPoint)
