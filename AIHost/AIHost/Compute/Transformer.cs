@@ -34,6 +34,7 @@ public class Transformer : IDisposable
 
     public int LayerCount => _numLayers;
     public ComputeOps Ops => _ops;
+    private bool _debugDone;
 
 
     public Transformer(IComputeDevice device, IGGUFModel model)
@@ -128,6 +129,11 @@ public class Transformer : IDisposable
         Tensor x;
         {
             var (embF32, embScratch) = TempF32("token_embd.weight");
+            if (!_debugDone) {
+                // Check BOS embedding (token 1)
+                var bos = embF32.Buffer.ReadRange<float>(1UL * 2048 * 4, 6);
+                Console.WriteLine($"[Debug] BOS emb[0..5]: [{bos[0]:F4},{bos[1]:F4},{bos[2]:F4},{bos[3]:F4},{bos[4]:F4},{bos[5]:F4}]");
+            }
             x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
             if (!embScratch) embF32.Dispose();
         }
@@ -139,6 +145,13 @@ public class Transformer : IDisposable
         // 3. Final layer norm
         {
             var (normF32, normScratch) = TempF32("output_norm.weight");
+            if (!_debugDone) {
+                _debugDone = true;
+                var nd = normF32.ReadData();
+                Console.WriteLine($"[Debug] output_norm: [{nd[0]:F4},{nd[1]:F4},{nd[2]:F4}] maxAbs={nd.Max(Math.Abs):F4}");
+                var xd = x.ReadData();
+                Console.WriteLine($"[Debug] x_before_norm: [{xd[0]:F4},{xd[1]:F4},{xd[2]:F4}] maxAbs={xd.Max(Math.Abs):F4}");
+            }
             _ops.LayerNorm(x, normF32);
             if (!normScratch) normF32.Dispose();
         }
@@ -146,8 +159,17 @@ public class Transformer : IDisposable
         // 4. Vocab projection (GGUF column-major weight)
         Tensor logits;
         {
+            var outCached = _weightCache["output.weight"];
+            if (_debugDone == true && _debugDone == true) // always true, just for extra info once
+            {
+                // Print only once; _debugDone is set after first prefill
+            }
+            Console.WriteLine($"[Debug] output.weight type={outCached.DataType} shape={outCached.Shape}");
             var (outF32, outScratch) = TempF32("output.weight");
-            logits = _ops.MatMul(x, outF32, "logits");
+            // Check first 5 values of dequantized output.weight (row 0 = first vocab token's weights)
+            var ow = outF32.Buffer.ReadRange<float>(0, 5);
+            Console.WriteLine($"[Debug] output.weight dequant[0..4]: [{ow[0]:F4},{ow[1]:F4},{ow[2]:F4},{ow[3]:F4},{ow[4]:F4}]");
+            logits = _ops.MatMulWeights(x, outF32, "logits");
             if (!outScratch) outF32.Dispose();
         }
 
@@ -163,7 +185,7 @@ public class Transformer : IDisposable
         // Batch mode (one fence wait per layer): fast for generation (seqLen=1, tiny matrices).
         // For prefill (seqLen > 1) the large MatMuls exceed the Windows TDR timeout (~2 s),
         // so we fall back to per-op flush which keeps each submit safely under the limit.
-        bool useBatch = seqLen == 1;
+        bool useBatch = false; // DEBUG: disabled to test per-op accuracy
 
         if (useBatch)
         {
@@ -236,14 +258,16 @@ public class Transformer : IDisposable
         if (cached.DataType == DataType.F32)
             return (_ops.Clone(cached), false);
 
-        // Extract the per-layer key (strip "blk.N." prefix)
-        var dot2 = name.IndexOf('.', name.IndexOf('.') + 1);
-        var key = dot2 >= 0 ? name[(dot2 + 1)..] : name;
-
-        if (_scratchF32.TryGetValue(key, out var scratch))
+        // Scratch disabled temporarily to isolate potential reuse bugs
+        if (false)
         {
-            _ops.DequantizeInto(cached, scratch);
-            return (scratch, true);
+            var dot2 = name.IndexOf('.', name.IndexOf('.') + 1);
+            var key = dot2 >= 0 ? name[(dot2 + 1)..] : name;
+            if (_scratchF32.TryGetValue(key, out var scratch))
+            {
+                _ops.DequantizeInto(cached, scratch);
+                return (scratch, true);
+            }
         }
 
         return (_ops.Dequantize(cached), false);
@@ -303,4 +327,9 @@ public class Transformer : IDisposable
         GC.SuppressFinalize(this);
     }
 }
+
+
+
+
+
 

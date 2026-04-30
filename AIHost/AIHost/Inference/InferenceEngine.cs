@@ -136,6 +136,14 @@ public class InferenceEngine : IDisposable
             }
 
             int nextToken = Sample(lastLogits, tokens, config);
+            if (generatedCount == 0) // Only for first token
+            {
+                // Top 10 predictions
+                var indexed = lastLogits.Select((v, i) => (v, i))
+                    .OrderByDescending(x => x.v).Take(10).ToArray();
+                var top = string.Join(", ", indexed.Select(x => $"{x.i}('{_tokenizer.GetToken(x.i)}'={x.v:F1})"));
+                Console.WriteLine($"[Top10] {top}");
+            }
             tokens.Add(nextToken);
             generatedCount++;
             onToken?.Invoke(nextToken);

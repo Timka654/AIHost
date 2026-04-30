@@ -45,6 +45,14 @@ public static class ComputeShaders
     // Each KV head's headDim-block is repeated repeat_factor times.
     public static string RepeatKVHeads => TryLoadOrInline("repeat_kv_heads", _inlineRepeatKVHeads);
 
+    // Extract a contiguous column slice from a 2D tensor.
+    // Src: [rows, srcCols], colStart: first column index, colCount: number of columns
+    // Dst: [rows, colCount]
+    public static string SliceCols => TryLoadOrInline("slice_cols", _inlineSliceCols);
+
+    // Scatter (write) src [rows, colCount] into dst [rows, dstCols] starting at colStart.
+    public static string ScatterCols => TryLoadOrInline("scatter_cols", _inlineScatterCols);
+
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {
         try
@@ -545,6 +553,38 @@ void main() {
     uint outCol = gid % newCols;
     uint srcCol = outCol / params.repeatFactor;
     dst.data[gid] = src.data[row * params.cols + srcCol];
+}
+";
+
+    // Extract columns [colStart, colStart+colCount) from src[rows, srcCols] -> dst[rows, colCount]
+    private const string _inlineSliceCols = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
+layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint srcCols; uint colStart; uint colCount; } params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.rows * params.colCount) return;
+    uint row = gid / params.colCount;
+    uint col = gid % params.colCount;
+    dst.data[gid] = src.data[row * params.srcCols + params.colStart + col];
+}
+";
+
+    // Write src[rows, colCount] into dst[rows, dstCols] at column offset colStart.
+    private const string _inlineScatterCols = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
+layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint dstCols; uint colStart; uint colCount; } params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.rows * params.colCount) return;
+    uint row = gid / params.colCount;
+    uint col = gid % params.colCount;
+    dst.data[row * params.dstCols + params.colStart + col] = src.data[gid];
 }
 ";
 }

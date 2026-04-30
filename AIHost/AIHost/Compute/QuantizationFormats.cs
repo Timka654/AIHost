@@ -142,20 +142,29 @@ void get_scale_min_k4(uint j, uint sc_off, out float sc_out, out float min_out) 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid / 256u;
-    uint loc = gid % 256u;
-    uint off = blk * 144u;          // 144 bytes per block
+    uint e   = gid % 256u;   // element within block (0..255)
+    uint off = blk * 144u;   // 144 bytes per block
 
     float d    = f16tof32(readU16(off + 0u));  // d at offset 0
     float dmin = f16tof32(readU16(off + 2u));  // dmin at offset 2
 
-    // 8 sub-blocks of 32 elements each
-    uint sub = loc / 32u;           // 0..7
-    float sc, mn;
-    get_scale_min_k4(sub, off + 4u, sc, mn); // scales[12] at offset 4
+    // llama.cpp layout: block = 4 groups of 64 elements.
+    // Each group uses qs[group*32 .. group*32+31] (32 bytes = 64 nibbles).
+    //   elements [0 ..31]: lower nibbles, scale is=group*2
+    //   elements [32..63]: upper nibbles, scale is=group*2+1
+    uint group        = e / 64u;            // 0..3
+    uint within_group = e % 64u;            // 0..63
+    uint is_upper     = (within_group >= 32u) ? 1u : 0u;
+    uint wg_lower     = within_group % 32u; // 0..31
+    uint scale_index  = group * 2u + is_upper; // 0..7
 
-    // 4-bit quantized value from qs[128] at offset 16
-    uint qs_byte = readU8(off + 16u + (loc / 2u));
-    uint q = (qs_byte >> ((loc % 2u) * 4u)) & 0xFu;
+    float sc, mn;
+    get_scale_min_k4(scale_index, off + 4u, sc, mn);
+
+    // qs[128] starts at byte 16; each group uses 32 bytes starting at group*32
+    uint qs_off = off + 16u + group * 32u + wg_lower;
+    uint qs_byte = readU8(qs_off);
+    uint q = (qs_byte >> (is_upper * 4u)) & 0xFu;
 
     outBuf.data[gid] = d * sc * float(q) - dmin * mn;
 }
@@ -236,27 +245,45 @@ float f16tof32(uint h) {
     e = e - 15u + 127u; return uintBitsToFloat((s << 31u) | (e << 23u) | (m << 13u));
 }
 uint readU8(uint off) { return (inBuf.data[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu; }
-int  readI8(uint off) { uint v = readU8(off); return v >= 128u ? int(v) - 256 : int(v); }
+int readI8(uint off) { uint v = readU8(off); int sv = int(v); return (v >= 128u) ? (sv - 256) : sv; }
 uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid / 256u;
-    uint loc = gid % 256u;
-    uint off = blk * 210u;          // 210 bytes per block
+    uint e   = gid % 256u;   // element within block (0..255)
+    uint off = blk * 210u;   // 210 bytes per block
 
-    // Lower 4 bits from ql[128] at offset 0
-    uint ql = readU8(off + (loc / 2u));
-    // Upper 2 bits from qh[64] at offset 128
-    uint qh = readU8(off + 128u + (loc / 4u));
-    uint q = ((ql >> ((loc % 2u) * 4u)) & 0x0Fu) | (((qh >> ((loc % 4u) * 2u)) & 0x03u) << 4u);
+    // Q6_K layout (llama.cpp convention):
+    // Block = 2 halves of 128 elements.
+    // Each half: ql[64 bytes] stores 4x32 4-bit values; qh[32 bytes] stores 4x32 2-bit values.
+    // Elements within a half are interleaved into 4 quarters of 32 each.
+    uint blk_h    = e / 128u;
+    uint w        = e % 128u;
+    uint quarter  = w / 32u;    // 0..3
+    uint wq       = w % 32u;    // 0..31 within quarter
 
-    // Int8 scale from scales[16] at offset 192 (16-element sub-blocks)
-    int sc = readI8(off + 192u + (loc / 16u));
+    // ql offset: quarters 0,2 use ql[0..31], quarters 1,3 use ql[32..63] within the half
+    uint ql_extra = ((quarter == 1u || quarter == 3u) ? 32u : 0u);
+    uint ql_off   = off + blk_h * 64u + ql_extra + wq;
+    uint is_upper = (quarter == 2u || quarter == 3u) ? 1u : 0u;
+    uint lower_4  = (readU8(ql_off) >> (is_upper * 4u)) & 0xFu;
 
-    float d = f16tof32(readU16(off + 208u)); // d at offset 208
+    // qh offset: all quarters use qh[wq] within the half; bit positions differ per quarter
+    uint qh_off   = off + 128u + blk_h * 32u + wq;
+    // bit shifts: q0->0,q2->2,q1->4,q3->6 (formula: even quarters use quarter, odd use quarter+3)
+    uint qh_shift = (quarter % 2u == 0u) ? quarter : (quarter + 3u);
+    uint upper_2  = (readU8(qh_off) >> qh_shift) & 0x3u;
+
+    uint q = lower_4 | (upper_2 << 4u);  // 6-bit value
+
+    int  sc = readI8(off + 192u + (e / 16u));  // 16 elements per scale
+    float d = f16tof32(readU16(off + 208u));    // super-block scale
 
     outBuf.data[gid] = d * float(sc) * (float(q) - 32.0);
 }
 ";
 }
+
+
+

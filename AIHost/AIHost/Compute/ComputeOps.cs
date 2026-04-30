@@ -80,6 +80,47 @@ public class ComputeOps : IDisposable
     #region Matrix Operations
 
     /// <summary>
+    /// Matrix multiply where B is a GGUF weight stored in column-major order.
+    /// GGUF stores weight[k, n] at data[k + n * K] (ne[0]=K is innermost dim).
+    /// A: [M × K], B_gguf: [K × N] (column-major), C: [M × N]
+    /// </summary>
+    public Tensor MatMulWeights(Tensor a, Tensor b, string? resultName = null)
+    {
+        if (a.Shape.Rank != 2 || b.Shape.Rank != 2)
+            throw new ArgumentException("MatMulWeights requires 2D tensors");
+
+        int M = a.Shape[0];
+        int K = a.Shape[1];
+        int N = b.Shape[1];
+
+        if (K != b.Shape[0])
+            throw new ArgumentException($"Incompatible shapes for MatMulWeights: [{M}×{K}] × [{b.Shape[0]}×{N}]");
+
+        var result = Tensor.Create(_device, TensorShape.Matrix(M, N), DataType.F32, resultName);
+
+        uint[] paramsData = { (uint)M, (uint)K, (uint)N };
+        var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
+        paramsBuffer.Write(paramsData);
+
+        var kernel = GetOrCreateKernel("matmul_weights_f32", ComputeShaders.MatMulWeightsF32);
+        kernel.SetArgument(0, a.Buffer);
+        kernel.SetArgument(1, b.Buffer);
+        kernel.SetArgument(2, result.Buffer);
+        kernel.SetArgument(3, paramsBuffer);
+
+        uint[] globalWorkSize = {
+            (uint)((N + 15) / 16),
+            (uint)((M + 15) / 16)
+        };
+
+        _queue.Dispatch(kernel, globalWorkSize, null);
+        MaybeFlush();
+
+        Defer(paramsBuffer);
+        return result;
+    }
+
+    /// <summary>
     /// Matrix multiplication: C = A × B
     /// A: [M × K], B: [K × N], C: [M × N]
     /// </summary>
@@ -702,11 +743,11 @@ public class ComputeOps : IDisposable
             int numKvHeads = kvDim / headDimGQA;    // e.g., 256 / 64 = 4
             int repeatFactor = numHeads / numKvHeads;  // e.g., 32 / 4 = 8
             
-            // For GQA, we need to repeat K and V to match Q's dimensions
-            // Each KV head is shared across multiple Q heads
-            // Simplified approach: repeat K, V columns to match d_model
-            var K_expanded = RepeatColumns(K, repeatFactor, "K_expanded");
-            var V_expanded = RepeatColumns(V, repeatFactor, "V_expanded");
+            // Correct GQA expansion: each KV head's headDim block is replicated for
+            // repeatFactor Q heads. output[:,j] = K[:,kvHead*headDim + j%headDim]
+            // where kvHead = j / (repeatFactor * headDim).
+            var K_expanded = RepeatKVHeads(K, headDimGQA, repeatFactor, "K_expanded");
+            var V_expanded = RepeatKVHeads(V, headDimGQA, repeatFactor, "V_expanded");
             
             // Now run standard attention with expanded K, V
             var KT = Transpose(K_expanded, "KT");
@@ -761,6 +802,78 @@ public class ComputeOps : IDisposable
     }
 
     /// <summary>
+    /// Extract columns [colStart, colStart+colCount) from input [rows, srcCols] → [rows, colCount]
+    /// </summary>
+    public Tensor SliceCols(Tensor input, int colStart, int colCount, string? resultName = null)
+    {
+        int rows = input.Shape[0], srcCols = input.Shape[1];
+        var result = Tensor.Create(_device, TensorShape.Matrix(rows, colCount), DataType.F32, resultName);
+        var paramsBuffer = _device.CreateBuffer(16, BufferType.Storage, DataType.I32);
+        var p = new byte[16];
+        BitConverter.GetBytes((uint)rows).CopyTo(p, 0); BitConverter.GetBytes((uint)srcCols).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)colStart).CopyTo(p, 8); BitConverter.GetBytes((uint)colCount).CopyTo(p, 12);
+        paramsBuffer.Write(p);
+        var kernel = GetOrCreateKernel("slice_cols", ComputeShaders.SliceCols);
+        kernel.SetArgument(0, input.Buffer); kernel.SetArgument(1, result.Buffer); kernel.SetArgument(2, paramsBuffer);
+        _queue.Dispatch(kernel, new[] { ((uint)(rows * colCount) + 255u) / 256u }, null);
+        MaybeFlush(); Defer(paramsBuffer);
+        return result;
+    }
+
+    /// <summary>Write src[rows, colCount] into dst[rows, dstCols] at column offset colStart.</summary>
+    public void ScatterCols(Tensor dst, Tensor src, int colStart)
+    {
+        int rows = src.Shape[0], colCount = src.Shape[1], dstCols = dst.Shape[1];
+        var paramsBuffer = _device.CreateBuffer(16, BufferType.Storage, DataType.I32);
+        var p = new byte[16];
+        BitConverter.GetBytes((uint)rows).CopyTo(p, 0); BitConverter.GetBytes((uint)dstCols).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)colStart).CopyTo(p, 8); BitConverter.GetBytes((uint)colCount).CopyTo(p, 12);
+        paramsBuffer.Write(p);
+        var kernel = GetOrCreateKernel("scatter_cols", ComputeShaders.ScatterCols);
+        kernel.SetArgument(0, src.Buffer); kernel.SetArgument(1, dst.Buffer); kernel.SetArgument(2, paramsBuffer);
+        _queue.Dispatch(kernel, new[] { ((uint)(rows * colCount) + 255u) / 256u }, null);
+        MaybeFlush(); Defer(paramsBuffer);
+    }
+
+    /// <summary>
+    /// Correct GQA K/V head expansion.
+    /// Repeats each headDim-sized block of columns repeatFactor times so that
+    /// Q head h shares KV head (h / repeatFactor).
+    /// Input: [rows, numKvHeads*headDim], Output: [rows, numQHeads*headDim]
+    /// </summary>
+    private Tensor RepeatKVHeads(Tensor input, int headDim, int repeatFactor, string? resultName = null)
+    {
+        if (input.Shape.Rank != 2)
+            throw new ArgumentException("RepeatKVHeads requires 2D tensor");
+
+        int rows    = input.Shape[0];
+        int srcCols = input.Shape[1];
+        int dstCols = srcCols * repeatFactor;
+
+        var result = Tensor.Create(_device, TensorShape.Matrix(rows, dstCols), DataType.F32, resultName);
+
+        var paramsBuffer = _device.CreateBuffer(16, BufferType.Storage, DataType.I32);
+        var p = new byte[16];
+        BitConverter.GetBytes((uint)rows).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)srcCols).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)headDim).CopyTo(p, 8);
+        BitConverter.GetBytes((uint)repeatFactor).CopyTo(p, 12);
+        paramsBuffer.Write(p);
+
+        var kernel = GetOrCreateKernel("repeat_kv_heads", ComputeShaders.RepeatKVHeads);
+        kernel.SetArgument(0, input.Buffer);
+        kernel.SetArgument(1, result.Buffer);
+        kernel.SetArgument(2, paramsBuffer);
+
+        uint total = (uint)(rows * dstCols);
+        _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        MaybeFlush();
+
+        Defer(paramsBuffer);
+        return result;
+    }
+
+    /// <summary>
     /// Repeat columns of a tensor by a factor (for GQA K/V expansion)
     /// Input: [rows, cols], Output: [rows, cols * repeatFactor]
     /// Each column is repeated repeatFactor times sequentially
@@ -807,14 +920,14 @@ public class ComputeOps : IDisposable
         if (x.Shape.Rank != 2)
             throw new ArgumentException("Input must be 2D tensor");
 
-        // 1. Gate projection: gate = x @ W_gate
-        var gate = MatMul(x, wGate, "ffn_gate");
+        // 1. Gate projection: gate = x @ W_gate  (weights are GGUF column-major)
+        var gate = MatMulWeights(x, wGate, "ffn_gate");
 
         // 2. SiLU activation: gate = SiLU(gate)
         SiLU(gate);
 
         // 3. Up projection: up = x @ W_up
-        var up = MatMul(x, wUp, "ffn_up");
+        var up = MatMulWeights(x, wUp, "ffn_up");
 
         // 4. Element-wise multiply: gate_up = gate ⊙ up
         var gateUp = Multiply(gate, up, "ffn_gate_up");
@@ -822,7 +935,7 @@ public class ComputeOps : IDisposable
         Defer(up);
 
         // 5. Down projection: output = gate_up @ W_down
-        var output = MatMul(gateUp, wDown, resultName ?? "ffn_output");
+        var output = MatMulWeights(gateUp, wDown, resultName ?? "ffn_output");
         Defer(gateUp);
 
         return output;
@@ -857,10 +970,10 @@ public class ComputeOps : IDisposable
         var xNorm = Clone(x, "attn_norm_input");
         LayerNorm(xNorm, attnNormWeight, eps);
 
-        // 1.2 Q, K, V projections
-        var Q = MatMul(xNorm, wQ, "Q");
-        var K = MatMul(xNorm, wK, "K");
-        var V = MatMul(xNorm, wV, "V");
+        // 1.2 Q, K, V projections (GGUF column-major weights)
+        var Q = MatMulWeights(xNorm, wQ, "Q");
+        var K = MatMulWeights(xNorm, wK, "K");
+        var V = MatMulWeights(xNorm, wV, "V");
         Defer(xNorm);
 
         // 1.3 RoPE — apply rotary embeddings to Q and K before attention
@@ -899,8 +1012,8 @@ public class ComputeOps : IDisposable
             Defer(V);
         }
 
-        // 1.4 Output projection
-        var attnProj = MatMul(attnOut, wAttnOut, "attn_proj");
+        // 1.4 Output projection (GGUF column-major weight)
+        var attnProj = MatMulWeights(attnOut, wAttnOut, "attn_proj");
         Defer(attnOut);
 
         // 1.5 Residual connection
@@ -1018,3 +1131,9 @@ public class ComputeOps : IDisposable
         _disposed = true;
     }
 }
+
+
+
+
+
+
