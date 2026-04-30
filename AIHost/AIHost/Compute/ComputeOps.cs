@@ -718,87 +718,58 @@ public class ComputeOps : IDisposable
     }
 
     /// <summary>
-    /// Multi-head attention: Attention(Q, K, V) = Softmax(Q @ K^T / sqrt(d_k)) @ V
-    /// Q, K, V: [seq_len × d_model]
+    /// Correct multi-head / grouped-query attention computed per head.
+    /// Each Q head attends to its corresponding KV head independently,
+    /// then outputs are concatenated. This avoids the "mix-all-heads" bug
+    /// where Q @ K^T sums contributions from all heads before softmax.
+    ///
+    /// Q: [seqLen, numQHeads * headDim]
+    /// K: [kvSeqLen, numKvHeads * headDim]  (kvSeqLen may differ from seqLen with KV cache)
+    /// V: [kvSeqLen, numKvHeads * headDim]
     /// </summary>
     public Tensor MultiHeadAttention(Tensor Q, Tensor K, Tensor V, int numHeads, uint startPosition = 0, string? resultName = null)
     {
-#if DEEP_DEBUG
-        Console.WriteLine($"  [MHA Debug] Q shape: {Q.Shape}, K shape: {K.Shape}, V shape: {V.Shape}");
-#endif
-        
         if (Q.Shape.Rank != 2 || K.Shape.Rank != 2 || V.Shape.Rank != 2)
             throw new ArgumentException("Q, K, V must be 2D tensors");
 
-        int seqLen = Q.Shape[0];
+        int seqLen   = Q.Shape[0];
         int dModel_Q = Q.Shape[1];
-        int kvDim = K.Shape[1];
-        
-        // GQA (Grouped Query Attention): Q has more dimensions than K, V
-        // This is used in models like TinyLlama for efficiency
-        if (dModel_Q != kvDim)
+        int kvDim    = K.Shape[1];
+        int headDim  = dModel_Q / numHeads;
+        int numKvHeads   = kvDim / headDim;
+        int repeatFactor = numHeads / numKvHeads;
+
+        float scale = 1.0f / MathF.Sqrt(headDim);
+
+        // Allocate output [seqLen, dModel_Q]
+        var output = Tensor.Create(_device, TensorShape.Matrix(seqLen, dModel_Q), DataType.F32, resultName ?? "attn_out");
+
+        // Per-head loop
+        for (int h = 0; h < numHeads; h++)
         {
-            // Calculate dimensions
-            int headDimGQA = dModel_Q / numHeads;  // e.g., 2048 / 32 = 64
-            int numKvHeads = kvDim / headDimGQA;    // e.g., 256 / 64 = 4
-            int repeatFactor = numHeads / numKvHeads;  // e.g., 32 / 4 = 8
-            
-            // Correct GQA expansion: each KV head's headDim block is replicated for
-            // repeatFactor Q heads. output[:,j] = K[:,kvHead*headDim + j%headDim]
-            // where kvHead = j / (repeatFactor * headDim).
-            var K_expanded = RepeatKVHeads(K, headDimGQA, repeatFactor, "K_expanded");
-            var V_expanded = RepeatKVHeads(V, headDimGQA, repeatFactor, "V_expanded");
-            
-            // Now run standard attention with expanded K, V
-            var KT = Transpose(K_expanded, "KT");
-            var scores = MatMul(Q, KT, "attention_scores");
-            Defer(KT);
-            Defer(K_expanded);
-            
-            // Scale by 1/sqrt(d_k)
-            float scale = 1.0f / MathF.Sqrt(headDimGQA);
-            Scale(scores, scale);
+            int kvHead = h / repeatFactor;
 
-            // Causal mask for prefill (seqLen_q > 1)
-            ApplyCausalMask(scores, startPosition);
+            var Q_h  = SliceCols(Q, h      * headDim, headDim, $"Q_{h}");
+            var K_h  = SliceCols(K, kvHead * headDim, headDim, $"K_{h}");
+            var V_h  = SliceCols(V, kvHead * headDim, headDim, $"V_{h}");
 
-            // Row-wise Softmax
-            RowwiseSoftmax(scores);
-            
-            // Attention_weights @ V
-            var output = MatMul(scores, V_expanded, resultName ?? "attention_output");
-            Defer(scores);
-            Defer(V_expanded);
-            
-            return output;
+            var KT_h     = Transpose(K_h, $"KT_{h}");
+            var scores_h = MatMul(Q_h, KT_h, $"scores_{h}");
+
+            Defer(KT_h); Defer(K_h); Defer(Q_h);
+
+            Scale(scores_h, scale);
+            ApplyCausalMask(scores_h, startPosition);
+            RowwiseSoftmax(scores_h);
+
+            var out_h = MatMul(scores_h, V_h, $"out_{h}");
+            Defer(scores_h); Defer(V_h);
+
+            ScatterCols(output, out_h, h * headDim);
+            Defer(out_h);
         }
 
-        // Standard MHA (Multi-Head Attention) when Q, K, V have same dimensions
-        int headDim = dModel_Q / numHeads;
-
-        if (dModel_Q % numHeads != 0)
-            throw new ArgumentException($"d_model ({dModel_Q}) must be divisible by num_heads ({numHeads})");
-
-        // 1. Q @ K^T
-        var KT_std = Transpose(K, "KT");
-        var scores_std = MatMul(Q, KT_std, "attention_scores");
-        Defer(KT_std);
-
-        // 2. Scale by 1/sqrt(d_k)
-        float scale_std = 1.0f / MathF.Sqrt(headDim);
-        Scale(scores_std, scale_std);
-
-        // Causal mask for prefill (seqLen_q > 1)
-        ApplyCausalMask(scores_std, startPosition);
-
-        // 3. Row-wise Softmax
-        RowwiseSoftmax(scores_std);
-
-        // 4. Attention_weights @ V
-        var output_std = MatMul(scores_std, V, resultName ?? "attention_output");
-        Defer(scores_std);
-
-        return output_std;
+        return output;
     }
 
     /// <summary>
