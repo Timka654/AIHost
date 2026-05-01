@@ -47,7 +47,21 @@ public class Transformer : IDisposable
         _numHeads = metadata.GetValue<int>(GGUFMetadata.KeyAttentionHeadCount, 32);
         ContextLength = metadata.GetValue<int>(GGUFMetadata.KeyContextLength, 0);
 
-        Console.WriteLine($"Transformer initialized: layers={_numLayers} d_model={_dModel} heads={_numHeads} ctx={ContextLength}");
+        int GetInt(string key, int def) {
+            if (metadata.TryGetValue<int>(key, out var vi)) return vi;
+            if (metadata.TryGetValue<uint>(key, out var vu)) return (int)vu;
+            return def;
+        }
+        float GetFlt(string key, float def) {
+            if (metadata.TryGetValue<float>(key, out var vf)) return vf;
+            return def;
+        }
+        var ropeFreqBase = GetFlt(GGUFMetadata.KeyRopeFreqBase, 10000.0f);
+        var ffnLength    = GetInt("llama.feed_forward_length", 0);
+        var ropeDimCount = GetInt("llama.rope.dimension_count", _dModel / _numHeads);
+        var rmsEps       = GetFlt("llama.attention.layer_norm_rms_epsilon", 1e-5f);
+        var kvHeads      = GetInt("llama.attention.head_count_kv", 4);
+        Console.WriteLine($"Transformer: layers={_numLayers} d_model={_dModel} heads={_numHeads} kv_heads={kvHeads} ctx={ContextLength} ffn={ffnLength} rope={ropeFreqBase}");
     }
 
     /// <summary>
@@ -132,7 +146,7 @@ public class Transformer : IDisposable
             if (!embScratch) embF32.Dispose();
         }
 
-        // 2. All transformer layers (each layer dequantizes its own weights transiently)
+        // 2. All transformer layers
         for (int i = 0; i < _numLayers; i++)
             x = ApplyLayer(x, i, startPosition, kvCache);
 

@@ -718,6 +718,42 @@ public class ComputeOps : IDisposable
     }
 
     /// <summary>
+    /// Fused GQA attention for a single query token (seqLen=1).
+    /// One GPU dispatch covers all numQHeads heads — avoids per-head tensor allocations.
+    /// Q: [1, numQHeads*headDim], K/V: [kvSeqLen, numKvHeads*headDim]
+    /// Returns: [1, numQHeads*headDim]
+    /// </summary>
+    public Tensor FusedMHAGenerate(Tensor Q, Tensor K, Tensor V,
+        int numQHeads, int numKvHeads, int headDim, float scale, string? resultName = null)
+    {
+        int kvSeqLen = K.Shape[0];
+        var result = Tensor.Create(_device, TensorShape.Matrix(1, numQHeads * headDim), DataType.F32, resultName);
+
+        // Params: numQHeads, numKvHeads, headDim, kvSeqLen, scale (as float bits)
+        var paramsBuffer = _device.CreateBuffer(20, BufferType.Storage, DataType.I32);
+        var p = new byte[20];
+        BitConverter.GetBytes((uint)numQHeads).CopyTo(p, 0);
+        BitConverter.GetBytes((uint)numKvHeads).CopyTo(p, 4);
+        BitConverter.GetBytes((uint)headDim).CopyTo(p, 8);
+        BitConverter.GetBytes((uint)kvSeqLen).CopyTo(p, 12);
+        BitConverter.GetBytes(scale).CopyTo(p, 16);
+        paramsBuffer.Write(p);
+
+        var kernel = GetOrCreateKernel("fused_mha_generate", ComputeShaders.FusedMHAGenerate);
+        kernel.SetArgument(0, Q.Buffer);
+        kernel.SetArgument(1, K.Buffer);
+        kernel.SetArgument(2, V.Buffer);
+        kernel.SetArgument(3, result.Buffer);
+        kernel.SetArgument(4, paramsBuffer);
+
+        // One workgroup per Q head, each with 256 threads
+        _queue.Dispatch(kernel, new[] { (uint)numQHeads }, null);
+        MaybeFlush();
+        Defer(paramsBuffer);
+        return result;
+    }
+
+    /// <summary>
     /// Correct multi-head / grouped-query attention computed per head.
     /// Each Q head attends to its corresponding KV head independently,
     /// then outputs are concatenated. This avoids the "mix-all-heads" bug
@@ -737,25 +773,29 @@ public class ComputeOps : IDisposable
         int kvDim    = K.Shape[1];
         int headDim  = dModel_Q / numHeads;
         int numKvHeads   = kvDim / headDim;
-        int repeatFactor = numHeads / numKvHeads;
-
         float scale = 1.0f / MathF.Sqrt(headDim);
 
-        // Allocate output [seqLen, dModel_Q]
+        // ── Fast path: seqLen=1 (generation) ────────────────────────────────
+        // Single fused dispatch: one workgroup per Q head, no per-head allocs.
+        if (seqLen == 1)
+        {
+            return FusedMHAGenerate(Q, K, V, numHeads, numKvHeads, headDim, scale,
+                                    resultName ?? "attn_out");
+        }
+
+        // ── Slow path: seqLen>1 (prefill) — per-head loop ───────────────────
         var output = Tensor.Create(_device, TensorShape.Matrix(seqLen, dModel_Q), DataType.F32, resultName ?? "attn_out");
 
-        // Per-head loop
         for (int h = 0; h < numHeads; h++)
         {
-            int kvHead = h / repeatFactor;
+            int kvHead = h / (numHeads / numKvHeads);
 
             var Q_h  = SliceCols(Q, h      * headDim, headDim, $"Q_{h}");
             var K_h  = SliceCols(K, kvHead * headDim, headDim, $"K_{h}");
             var V_h  = SliceCols(V, kvHead * headDim, headDim, $"V_{h}");
+            var KT_h = Transpose(K_h, $"KT_{h}");
 
-            var KT_h     = Transpose(K_h, $"KT_{h}");
             var scores_h = MatMul(Q_h, KT_h, $"scores_{h}");
-
             Defer(KT_h); Defer(K_h); Defer(Q_h);
 
             Scale(scores_h, scale);
@@ -949,6 +989,7 @@ public class ComputeOps : IDisposable
 
         // 1.3 RoPE — apply rotary embeddings to Q and K before attention
         int numKVHeads = K.Shape[1] / headDim;
+
         ApplyRoPEFull(Q, position, numHeads, headDim);
         ApplyRoPEFull(K, position, numKVHeads, headDim);
 
@@ -1102,6 +1143,7 @@ public class ComputeOps : IDisposable
         _disposed = true;
     }
 }
+
 
 
 
