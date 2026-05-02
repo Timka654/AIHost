@@ -1,7 +1,6 @@
 using AIHost.Compute;
 using AIHost.GGUF;
 using AIHost.ICompute;
-using AIHost.ICompute.Vulkan;
 
 namespace AIHost.Inference;
 
@@ -15,19 +14,14 @@ public class MultiDeviceKVCache : IDisposable
     private bool _disposed;
 
     public MultiDeviceKVCache(ComputeOps[] ops)
-    {
-        _caches = ops.Select(o => new KVCache(o)).ToArray();
-    }
+        => _caches = ops.Select(o => new KVCache(o)).ToArray();
 
     public KVCache ForDevice(int devIndex) => _caches[devIndex];
 
     /// <summary>Sequence length (same on all devices after any forward pass).</summary>
     public int SequenceLength => _caches[0].SequenceLength;
 
-    public void Clear()
-    {
-        foreach (var c in _caches) c.Clear();
-    }
+    public void Clear() { foreach (var c in _caches) c.Clear(); }
 
     public void Dispose()
     {
@@ -46,51 +40,52 @@ public class MultiDeviceKVCache : IDisposable
 ///   ...
 ///   Device N-1: layers [split[N-2] .. numLayers) + output_norm + output.weight
 ///
+/// Each device gets its own IGGUFModel instance (same file, different device context)
+/// so GPU buffers are allocated on the correct device.
 /// Cross-device activation transfer goes through CPU staging (ReadData → FromData).
-/// For modest models (&lt;2 GB activation per token this is typically fast enough.
 /// </summary>
 public class MultiGPUTransformer : IDisposable
 {
     private readonly IComputeDevice[] _devices;
+    private readonly IGGUFModel[] _models;   // one per device
     private readonly Transformer[] _transformers;
     private readonly int[] _deviceFirstLayer; // global layer index where each device starts
     private bool _disposed;
 
-    public int DeviceCount => _devices.Length;
-    public int TotalLayers => _transformers[0].LayerCount; // numLayers from metadata
+    public int DeviceCount   => _devices.Length;
+    public int TotalLayers   => _transformers[0].LayerCount;
+    /// <summary>GGUF reader from device-0 model; use to load the tokenizer.</summary>
+    public IGGUFModel PrimaryModel => _models[0];
+
+    // ── Constructors ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Create a multi-GPU transformer with automatic even layer distribution.
+    /// Main constructor: factory creates one IGGUFModel per device so each device
+    /// owns its GPU buffers.  Devices are already-created IComputeDevice instances.
     /// </summary>
-    public static MultiGPUTransformer Create(IGGUFModel model, int[] deviceIndices)
-    {
-        if (deviceIndices.Length == 0)
-            throw new ArgumentException("Need at least one device");
-
-        var devices = deviceIndices.Select(i => (IComputeDevice)new VulkanComputeDevice(i)).ToArray();
-        return new MultiGPUTransformer(devices, model, layerSplit: null);
-    }
-
-    /// <summary>
-    /// Create with explicit devices and optional layer-split boundaries.
-    /// layerSplit[i] = global layer index where device i+1 starts.
-    /// If null, layers are distributed evenly across devices.
-    /// </summary>
-    public MultiGPUTransformer(IComputeDevice[] devices, IGGUFModel model, int[]? layerSplit = null)
+    public MultiGPUTransformer(
+        IComputeDevice[]          devices,
+        Func<IComputeDevice, IGGUFModel> modelFactory,
+        int[]?                    layerSplit = null)
     {
         _devices = devices;
         int n = devices.Length;
 
-        // Build per-device layer ranges
-        var tempTransformer = new Transformer(devices[0], model);
-        int numLayers = tempTransformer.LayerCount;
-        tempTransformer.Dispose();
+        // Create one model per device (each calls CreateBuffer on its own device)
+        _models = devices.Select(modelFactory).ToArray();
 
-        _deviceFirstLayer = new int[n + 1]; // [n+1]: boundaries; last = numLayers
+        // Determine total layer count from first model
+        var tempXfm = new Transformer(devices[0], _models[0]);
+        int numLayers = tempXfm.LayerCount;
+        tempXfm.Dispose();
+
+        // Build per-device layer boundary array [0, split..., numLayers]
+        _deviceFirstLayer = new int[n + 1];
         if (layerSplit != null)
         {
             if (layerSplit.Length != n - 1)
-                throw new ArgumentException($"layerSplit must have {n - 1} entries for {n} devices");
+                throw new ArgumentException(
+                    $"layerSplit needs {n - 1} entries for {n} devices, got {layerSplit.Length}");
             _deviceFirstLayer[0] = 0;
             for (int i = 0; i < layerSplit.Length; i++)
                 _deviceFirstLayer[i + 1] = layerSplit[i];
@@ -98,51 +93,45 @@ public class MultiGPUTransformer : IDisposable
         }
         else
         {
-            // Even split
             for (int i = 0; i <= n; i++)
-                _deviceFirstLayer[i] = (numLayers * i) / n;
+                _deviceFirstLayer[i] = numLayers * i / n;
         }
 
         // Create and load one Transformer per device
         _transformers = new Transformer[n];
         for (int d = 0; d < n; d++)
         {
-            _transformers[d] = new Transformer(devices[d], model);
-            bool isFirst = d == 0;
-            bool isLast  = d == n - 1;
+            _transformers[d] = new Transformer(devices[d], _models[d]);
             _transformers[d].LoadWeightsPartial(
                 globalFirstLayer: _deviceFirstLayer[d],
                 globalLastLayer:  _deviceFirstLayer[d + 1],
-                withEmbedding:    isFirst,
-                withHead:         isLast);
+                withEmbedding:    d == 0,
+                withHead:         d == n - 1);
         }
 
         Console.WriteLine($"[MultiGPU] {n} device(s), {numLayers} layers total");
         for (int d = 0; d < n; d++)
-            Console.WriteLine($"  Device {d}: layers {_deviceFirstLayer[d]}..{_deviceFirstLayer[d + 1] - 1}");
+            Console.WriteLine($"  Device {d}: layers {_deviceFirstLayer[d]}..{_deviceFirstLayer[d + 1] - 1}" +
+                              (d == 0 ? " + embedding" : "") + (d == n - 1 ? " + head" : ""));
     }
 
-    // ── Forward pass ────────────────────────────────────────────────────────────
+    // ── Forward pass ─────────────────────────────────────────────────────────
 
     /// <summary>
     /// Full forward pass across all GPUs.
-    /// Returns logits tensor on the last device. Caller disposes it.
+    /// Returns logits tensor on the last device — caller disposes.
     /// </summary>
     public Tensor Forward(int[] tokenIds, uint startPosition, MultiDeviceKVCache? kvCache = null)
     {
         // 1. Embedding on device 0
         Tensor x = _transformers[0].ForwardEmbedding(tokenIds);
-        int prevDevice = 0;
 
-        // 2. Layers: each device runs its slice
+        // 2. Layers: each device runs its slice, transferring activations as needed
         for (int d = 0; d < _devices.Length; d++)
         {
             if (d > 0)
-            {
-                // Transfer activation from previous device to device d (via CPU)
-                x = TransferTensor(x, _transformers[d].Ops, "x_transfer");
-                prevDevice = d;
-            }
+                x = TransferTensor(x, _transformers[d].Ops);
+
             x = _transformers[d].ForwardLayers(x, startPosition, kvCache?.ForDevice(d));
         }
 
@@ -150,22 +139,20 @@ public class MultiGPUTransformer : IDisposable
         return _transformers[^1].ForwardHead(x);
     }
 
-    /// <summary>
-    /// Create a fresh MultiDeviceKVCache for this model's devices.
-    /// </summary>
+    /// <summary>Create a fresh KV-cache sized for this model's devices.</summary>
     public MultiDeviceKVCache CreateKVCache()
-        => new MultiDeviceKVCache(_transformers.Select(t => t.Ops).ToArray());
+        => new(_transformers.Select(t => t.Ops).ToArray());
 
-    // ── Internals ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Transfer a tensor between GPU devices via CPU staging buffer.
-    /// src is disposed; returns a new tensor on dstOps.Device.
+    /// CPU-staged transfer: read src from its GPU, upload to dstOps.Device.
+    /// src is disposed; caller receives the new tensor.
     /// </summary>
-    private static Tensor TransferTensor(Tensor src, ComputeOps dstOps, string name)
+    private static Tensor TransferTensor(Tensor src, ComputeOps dstOps)
     {
         float[] data = src.ReadData();
-        var dst = Tensor.FromData(dstOps.Device, data, src.Shape, name);
+        var dst = Tensor.FromData(dstOps.Device, data, src.Shape, "x_transfer");
         src.Dispose();
         return dst;
     }
@@ -174,7 +161,8 @@ public class MultiGPUTransformer : IDisposable
     {
         if (_disposed) return;
         foreach (var t in _transformers) t.Dispose();
-        foreach (var d in _devices) d.Dispose();
+        foreach (var m in _models)      m.Dispose();
+        foreach (var d in _devices)     d.Dispose();
         _disposed = true;
     }
 }

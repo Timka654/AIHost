@@ -115,6 +115,25 @@ public class ModelConfig
     /// </summary>
     [JsonPropertyName("allow_shared_memory")]
     public bool AllowSharedMemory { get; set; } = false;
+
+    // ── Multi-GPU settings ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// GPU device indices for multi-GPU inference (e.g. [0, 1]).
+    /// When set, overrides device_index and splits layers across the listed GPUs.
+    /// Null or single-element array → single-GPU mode (use device_index instead).
+    /// </summary>
+    [JsonPropertyName("device_indices")]
+    public int[]? DeviceIndices { get; set; }
+
+    /// <summary>
+    /// Manual layer-split boundaries for multi-GPU (length = DeviceIndices.Length - 1).
+    /// layer_split[i] = global layer index where device i+1 starts.
+    /// Null = distribute layers evenly ("auto" mode).
+    /// Example for 22-layer model on 2 GPUs: [11] → GPU0 gets 0..10, GPU1 gets 11..21.
+    /// </summary>
+    [JsonPropertyName("layer_split")]
+    public int[]? LayerSplit { get; set; }
 }
 
 /// <summary>
