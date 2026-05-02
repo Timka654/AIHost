@@ -32,7 +32,14 @@ public class Transformer : IDisposable
     // Sized to hold F32 data for any layer (all layers share the same weight shapes).
     private readonly Dictionary<string, Tensor> _scratchF32 = [];
 
+    // For multi-GPU: offset added to local layer index when looking up weight names.
+    // Default 0 (single-GPU). Device 1 handling global layers 11-21 sets this to 11.
+    private int _layerOffset = 0;
+    // How many layers this instance handles (all layers by default).
+    private int _localLayerCount;
+
     public int LayerCount => _numLayers;
+    public int LocalLayerCount => _localLayerCount;
     public ComputeOps Ops => _ops;
 
 
@@ -61,6 +68,7 @@ public class Transformer : IDisposable
         var ropeDimCount = GetInt("llama.rope.dimension_count", _dModel / _numHeads);
         var rmsEps       = GetFlt("llama.attention.layer_norm_rms_epsilon", 1e-5f);
         var kvHeads      = GetInt("llama.attention.head_count_kv", 4);
+        _localLayerCount = _numLayers;
         Console.WriteLine($"Transformer: layers={_numLayers} d_model={_dModel} heads={_numHeads} kv_heads={kvHeads} ctx={ContextLength} ffn={ffnLength} rope={ropeFreqBase}");
     }
 
@@ -101,6 +109,81 @@ public class Transformer : IDisposable
         // CPU reference verification: run single BOS token through layer 0 on CPU, compare with GPU
         RunCpuReferenceLayer0();
     }
+
+    // ── Multi-GPU support ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Load only a subset of layers plus optionally the embedding table and lm-head.
+    /// Used by MultiGPUTransformer to split a model across devices.
+    /// </summary>
+    public void LoadWeightsPartial(int globalFirstLayer, int globalLastLayer,
+                                    bool withEmbedding, bool withHead)
+    {
+        _layerOffset      = globalFirstLayer;
+        _localLayerCount  = globalLastLayer - globalFirstLayer;
+
+        Console.WriteLine($"[MultiGPU] Loading layers {globalFirstLayer}..{globalLastLayer - 1}" +
+                          (withEmbedding ? " + embedding" : "") + (withHead ? " + head" : ""));
+
+        if (withEmbedding) CacheWeight("token_embd.weight");
+        if (withHead)      { CacheWeight("output_norm.weight"); CacheWeight("output.weight"); }
+
+        for (int i = globalFirstLayer; i < globalLastLayer; i++)
+        {
+            string p = $"blk.{i}";
+            CacheWeight($"{p}.attn_norm.weight");
+            CacheWeight($"{p}.attn_q.weight");
+            CacheWeight($"{p}.attn_k.weight");
+            CacheWeight($"{p}.attn_v.weight");
+            CacheWeight($"{p}.attn_output.weight");
+            CacheWeight($"{p}.ffn_norm.weight");
+            CacheWeight($"{p}.ffn_gate.weight");
+            CacheWeight($"{p}.ffn_up.weight");
+            CacheWeight($"{p}.ffn_down.weight");
+        }
+
+        Console.WriteLine($"[MultiGPU] ✓ Loaded {_weightCache.Count} tensors for device");
+        if (_localLayerCount > 0)
+            AllocateScratchWeights($"blk.{globalFirstLayer}");
+    }
+
+    /// <summary>Token embedding lookup. Returns [seqLen, dModel] on this device's GPU.</summary>
+    public Tensor ForwardEmbedding(int[] tokenIds)
+    {
+        var (embF32, embScratch) = TempF32("token_embd.weight");
+        var x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
+        if (!embScratch) embF32.Dispose();
+        return x;
+    }
+
+    /// <summary>
+    /// Run the locally-loaded layers on activation tensor x.
+    /// KV-cache uses LOCAL layer indices (0-based for this device).
+    /// </summary>
+    public Tensor ForwardLayers(Tensor x, uint startPos, KVCache? cache = null)
+    {
+        for (int i = 0; i < _localLayerCount; i++)
+            x = ApplyLayer(x, i, startPos, cache);
+        return x;
+    }
+
+    /// <summary>
+    /// Apply output_norm + lm-head projection. Returns logits [seqLen, vocabSize].
+    /// </summary>
+    public Tensor ForwardHead(Tensor x)
+    {
+        var (normF32, normScratch) = TempF32("output_norm.weight");
+        _ops.LayerNorm(x, normF32);
+        if (!normScratch) normF32.Dispose();
+
+        var (outF32, outScratch) = TempF32("output.weight");
+        var logits = _ops.MatMulWeights(x, outF32, "logits");
+        if (!outScratch) outF32.Dispose();
+        x.Dispose();
+        return logits;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
 
     /// Run layer 0 forward pass on CPU for BOS (token ID 1) and compare key values with GPU.
     private void RunCpuReferenceLayer0()
@@ -256,7 +339,8 @@ public class Transformer : IDisposable
 
     private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null)
     {
-        string p = $"blk.{layerIdx}";
+        // layerIdx is LOCAL (0-based for this device); weight names use global index.
+        string p = $"blk.{layerIdx + _layerOffset}";
         int seqLen = x.Shape[0];
 
         // Batch mode (one fence wait per layer): fast for generation (seqLen=1, tiny matrices).
