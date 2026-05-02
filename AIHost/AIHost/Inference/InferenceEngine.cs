@@ -93,7 +93,7 @@ public class InferenceEngine : IDisposable
             Console.WriteLine($"[Inference] Prompt truncated: {tokens.Count + removed} → {tokens.Count} tokens");
         }
 
-        Console.WriteLine($"[Inference] Prompt tokens: {tokens.Count}");
+        Console.WriteLine($"[Inference] Prompt tokens: {tokens.Count} ids=[{string.Join(",",tokens)}]");
 
         if (config.UseKVCache)
         {
@@ -135,6 +135,14 @@ public class InferenceEngine : IDisposable
                 Console.WriteLine($"[Inference] Token {generatedCount}: {iterSw.ElapsedMilliseconds}ms | avg {tps:F1} tok/s | kvLen={startPos}");
             }
 
+            if (generatedCount == 0)
+            {
+                var sorted = lastLogits.Select((v,i)=>(v,i)).OrderByDescending(x=>x.v).ToArray();
+                int rankQuin = Array.FindIndex(sorted, x => x.i == 24150);
+                int rankComma = Array.FindIndex(sorted, x => x.i == 1919);
+                Console.WriteLine($"[LogitCmp] 'quin'(24150)=rank{rankQuin+1},logit{lastLogits[24150]:F3} | ' ,'(1919)=rank{rankComma+1},logit{lastLogits[1919]:F3}");
+                Console.WriteLine($"[LogitCmp] top1={sorted[0].i}('{_tokenizer.GetToken(sorted[0].i)}')={sorted[0].v:F3}");
+            }
             int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
             generatedCount++;

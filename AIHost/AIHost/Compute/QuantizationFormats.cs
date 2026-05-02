@@ -269,10 +269,11 @@ void main() {
     uint is_upper = (quarter == 2u || quarter == 3u) ? 1u : 0u;
     uint lower_4  = (readU8(ql_off) >> (is_upper * 4u)) & 0xFu;
 
-    // qh offset: all quarters use qh[wq] within the half; bit positions differ per quarter
+    // qh offset: all quarters use qh[wq] within the half; bit positions 0,2,4,6
+    // ggml dequantize_row_q6_K: q1->bits0-1, q2->bits2-3, q3->bits4-5, q4->bits6-7
+    // quarter 0 = q1 (y[l+0]), quarter 1 = q2 (y[l+32]), quarter 2 = q3 (y[l+64]), quarter 3 = q4 (y[l+96])
     uint qh_off   = off + 128u + blk_h * 32u + wq;
-    // bit shifts: q0->0,q2->2,q1->4,q3->6 (formula: even quarters use quarter, odd use quarter+3)
-    uint qh_shift = (quarter % 2u == 0u) ? quarter : (quarter + 3u);
+    uint qh_shift = quarter * 2u;  // 0, 2, 4, 6 for quarters 0..3
     uint upper_2  = (readU8(qh_off) >> qh_shift) & 0x3u;
 
     uint q = lower_4 | (upper_2 << 4u);  // 6-bit value

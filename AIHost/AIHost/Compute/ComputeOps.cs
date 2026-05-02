@@ -21,6 +21,7 @@ public class ComputeOps : IDisposable
     // Deferred disposals accumulate here and are released after the flush.
     private bool _batchMode;
     private readonly List<IDisposable> _deferred = [];
+    internal bool _dbgLayer0 = true;
 
     public IComputeDevice Device => _device;
 
@@ -1030,6 +1031,16 @@ public class ComputeOps : IDisposable
 
         // 1.5 Residual connection
         var x1 = Add(x, attnProj, "x_after_attn");
+
+        // Single-shot diagnostic: print attnProj for layer 0, seqLen<=3 only once
+        if (_dbgLayer0 && layerIdx == 0 && seqLen <= 3)
+        {
+            var ap = attnProj.ReadData();
+            var xraw = x.ReadData(); int lastRow = seqLen - 1;
+            Console.WriteLine($"[L0] x[last,0..2]=[{xraw[lastRow*dModel]:F5},{xraw[lastRow*dModel+1]:F5},{xraw[lastRow*dModel+2]:F5}]");
+            Console.WriteLine($"[L0] attnProj[last,0..2]=[{ap[lastRow*dModel]:F5},{ap[lastRow*dModel+1]:F5},{ap[lastRow*dModel+2]:F5}] maxAbs={ap.Max(Math.Abs):F4}");
+        }
+
         Defer(attnProj);
 
         // 2. FFN block
@@ -1041,6 +1052,15 @@ public class ComputeOps : IDisposable
 
         // 2.3 Residual connection
         var output = Add(x1, ffnOut, resultName ?? "layer_output");
+
+        if (_dbgLayer0 && layerIdx == 0 && seqLen <= 3)
+        {
+            var ff = ffnOut.ReadData(); int lr = seqLen - 1;
+            Console.WriteLine($"[L0] ffnOut[last,0..2]=[{ff[lr*dModel]:F5},{ff[lr*dModel+1]:F5},{ff[lr*dModel+2]:F5}] maxAbs={ff.Max(Math.Abs):F4}");
+            var outp = output.ReadData();
+            Console.WriteLine($"[L0] output[last,0..2]=[{outp[lr*dModel]:F5},{outp[lr*dModel+1]:F5},{outp[lr*dModel+2]:F5}] maxAbs={outp.Max(Math.Abs):F4}");
+            _dbgLayer0 = false;
+        }
         Defer(x1);
         Defer(ffnOut);
 

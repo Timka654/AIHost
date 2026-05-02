@@ -98,6 +98,84 @@ public class Transformer : IDisposable
         // (all layers share the same weight shapes in transformer architectures).
         AllocateScratchWeights("blk.0");
         Console.WriteLine($"✓ F32 scratch buffers allocated ({_scratchF32.Count} tensors)\n");
+        // CPU reference verification: run single BOS token through layer 0 on CPU, compare with GPU
+        RunCpuReferenceLayer0();
+    }
+
+    /// Run layer 0 forward pass on CPU for BOS (token ID 1) and compare key values with GPU.
+    private void RunCpuReferenceLayer0()
+    {
+        try
+        {
+            // Read embedding for token 1 (BOS) on CPU
+            var embQ = _weightCache["token_embd.weight"];
+            var (embF32, _) = TempF32("token_embd.weight");
+            float[] emb = embF32.Buffer.ReadRange<float>(1 * 2048 * 4UL, 2048);
+            embF32.Dispose();
+
+            // Compute RMSNorm on CPU
+            var normW = _weightCache["blk.0.attn_norm.weight"].Buffer.Read<float>();
+            float sumSq = 0f; foreach (var v in emb) sumSq += v * v;
+            float rms = MathF.Sqrt(sumSq / 2048 + 1e-5f);
+            float[] xn = new float[2048];
+            for (int i = 0; i < 2048; i++) xn[i] = emb[i] / rms * normW[i];
+
+            Console.WriteLine($"[CPURef] BOS emb[:3]=[{emb[0]:F5},{emb[1]:F5},{emb[2]:F5}] rms={rms:F6}");
+            Console.WriteLine($"[CPURef] xnorm[:3]=[{xn[0]:F5},{xn[1]:F5},{xn[2]:F5}] maxAbs={xn.Max(MathF.Abs):F4}");
+
+            // Compute Q = xnorm @ wQ (column-major) — first 4 output dims
+            var wqF32 = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
+            float[] wqData = wqF32.Buffer.ReadRange<float>(0, 2048 * 4); wqF32.Dispose(); // first 4 output cols
+            float[] q4 = new float[4];
+            for (int n = 0; n < 4; n++)
+                for (int k = 0; k < 2048; k++) q4[n] += xn[k] * wqData[k + n * 2048];
+            Console.WriteLine($"[CPURef] Q[:4]=[{q4[0]:F5},{q4[1]:F5},{q4[2]:F5},{q4[3]:F5}]");
+
+            // Also compute V for BOS and compare
+            var wvData = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
+            float[] wvArr = wvData.Buffer.ReadRange<float>(0, 2048 * 4); wvData.Dispose(); // first 4 output dims
+            float[] bosV4 = new float[4];
+            for (int n=0;n<4;n++) for (int k=0;k<2048;k++) bosV4[n]+=xn[k]*wvArr[k+n*2048];
+            Console.WriteLine($"[CPURef] BOS V[:4]=[{bosV4[0]:F5},{bosV4[1]:F5},{bosV4[2]:F5},{bosV4[3]:F5}]");
+            var wvGpu = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
+            var xnT = Tensor.FromData(_ops.Device, xn, new TensorShape(new[]{1,2048}), "xn_bos_v");
+            var bosVgpu = _ops.MatMulWeights(xnT, wvGpu, "V_bos");
+            float[] gv = bosVgpu.Buffer.ReadRange<float>(0,4); bosVgpu.Dispose(); xnT.Dispose(); wvGpu.Dispose();
+            Console.WriteLine($"[CPURef] BOS GPU V[:4]=[{gv[0]:F5},{gv[1]:F5},{gv[2]:F5},{gv[3]:F5}] match={Math.Abs(bosV4[0]-gv[0])<1e-3f}");
+
+            // GPU Q for comparison: run a minimal forward pass
+            var wqF32Tensor = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
+            var xnTensor = Tensor.FromData(_ops.Device, xn, new TensorShape(new[]{1,2048}), "xn_bos");
+            var gpuQ = _ops.MatMulWeights(xnTensor, wqF32Tensor, "Q_bos");
+            float[] gq = gpuQ.Buffer.ReadRange<float>(0, 4);
+            gpuQ.Dispose(); xnTensor.Dispose(); wqF32Tensor.Dispose();
+            Console.WriteLine($"[CPURef] GPU Q[:4]=[{gq[0]:F5},{gq[1]:F5},{gq[2]:F5},{gq[3]:F5}]");
+            Console.WriteLine($"[CPURef] Q match={Math.Abs(q4[0]-gq[0])<1e-3f} diff={Math.Abs(q4[0]-gq[0]):F6}");
+
+            // Check token 6324 ('Hi') - actual token used in test
+            var embFull = _ops.Dequantize(_weightCache["token_embd.weight"]);
+            float[] hiEmb = embFull.Buffer.ReadRange<float>(6324UL * 2048 * 4, 2048); // token 6324 = 'Hi'
+            embFull.Dispose();
+            float hiSumSq = 0f; foreach (var v in hiEmb) hiSumSq += v * v;
+            float hiRms = MathF.Sqrt(hiSumSq / 2048 + 1e-5f);
+            float[] hiXn = new float[2048];
+            for (int i = 0; i < 2048; i++) hiXn[i] = hiEmb[i] / hiRms * normW[i];
+            float[] hiQ4 = new float[4];
+            for (int n = 0; n < 4; n++)
+                for (int k = 0; k < 2048; k++) hiQ4[n] += hiXn[k] * wqData[k + n * 2048];
+            // GPU version
+            var wqF32b = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
+            var hiTensor = Tensor.FromData(_ops.Device, hiXn, new TensorShape(new[]{1,2048}), "xn_hi");
+            var hiGpuQ = _ops.MatMulWeights(hiTensor, wqF32b, "Q_hi");
+            float[] hiGq = hiGpuQ.Buffer.ReadRange<float>(0, 4);
+            hiGpuQ.Dispose(); hiTensor.Dispose(); wqF32b.Dispose();
+            Console.WriteLine($"[CPURef] Hi(6324) rms={hiRms:F6} emb[:3]=[{hiEmb[0]:F6},{hiEmb[1]:F6},{hiEmb[2]:F6}]");
+            Console.WriteLine($"[CPURef] Hi xn[:3]=[{hiXn[0]:F5},{hiXn[1]:F5},{hiXn[2]:F5}]");
+            Console.WriteLine($"[CPURef] Hi CPU Q[:4]=[{hiQ4[0]:F5},{hiQ4[1]:F5},{hiQ4[2]:F5},{hiQ4[3]:F5}]");
+            Console.WriteLine($"[CPURef] Hi GPU Q[:4]=[{hiGq[0]:F5},{hiGq[1]:F5},{hiGq[2]:F5},{hiGq[3]:F5}]");
+            Console.WriteLine($"[CPURef] Hi Q match={Math.Abs(hiQ4[0]-hiGq[0])<1e-3f}");
+        }
+        catch (Exception ex) { Console.WriteLine($"[CPURef] FAILED: {ex.Message}"); }
     }
 
     private void AllocateScratchWeights(string layerPrefix)
@@ -160,6 +238,13 @@ public class Transformer : IDisposable
         // 4. Vocab projection (GGUF column-major weight)
         Tensor logits;
         {
+            // Debug: print x_normed for last token (compare with llama-cpp embed output)
+            if (tokenIds.Length <= 3)
+            {
+                var xd = x.ReadData();
+                int last = x.Shape[0] - 1;
+                Console.WriteLine($"[XNorm] seqLen={x.Shape[0]} last tok x_normed[:3]=[{xd[last*2048]:F5},{xd[last*2048+1]:F5},{xd[last*2048+2]:F5}] maxAbs={xd.Max(Math.Abs):F4}");
+            }
             var (outF32, outScratch) = TempF32("output.weight");
             logits = _ops.MatMulWeights(x, outF32, "logits");
             if (!outScratch) outF32.Dispose();
