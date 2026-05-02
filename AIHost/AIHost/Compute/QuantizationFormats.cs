@@ -36,22 +36,24 @@ uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid / 256u;
-    uint loc = gid % 256u;
+    uint e   = gid % 256u;
     uint off = blk * 84u;           // 84 bytes per block
 
-    // Scale/min for sub-block (16 elements per sub-block)
-    uint sub = loc / 16u;           // 0..15
-    uint sc = readU8(off + sub);    // scales[sub]
-    float sc_lo = float(sc & 0x0Fu);   // low nibble = scale factor
-    float sc_hi = float((sc >> 4u) & 0x0Fu); // high nibble = min factor
+    // Scale (1 per 16 elements, scales[] at offset 0, lower nibble=scale, upper=min)
+    uint sub  = e / 16u;
+    uint sc   = readU8(off + sub);
+    float sc_lo = float(sc & 0x0Fu);
+    float sc_hi = float((sc >> 4u) & 0x0Fu);
+    float d    = f16tof32(readU16(off + 80u));
+    float dmin = f16tof32(readU16(off + 82u));
 
-    // 2-bit quantized value
-    uint qs_byte = readU8(off + 16u + (loc / 4u)); // qs at offset 16
-    uint qv = (qs_byte >> ((loc % 4u) * 2u)) & 0x3u;
-
-    // Super-scales
-    float d    = f16tof32(readU16(off + 80u)); // d at offset 80
-    float dmin = f16tof32(readU16(off + 82u)); // dmin at offset 82
+    // ggml dequantize_row_q2_K: qs[chunk*32+l] with shift=(local/32)*2
+    // qs[0..31] store bits 0-1,2-3,4-5,6-7 for element groups of 32
+    uint chunk   = e / 128u;
+    uint local   = e % 128u;
+    uint qs_idx  = chunk * 32u + (local % 32u);
+    uint shift   = (local / 32u) * 2u;
+    uint qv = (readU8(off + 16u + qs_idx) >> shift) & 0x3u;
 
     outBuf.data[gid] = d * sc_lo * float(qv) - dmin * sc_hi;
 }
@@ -82,29 +84,47 @@ uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid / 256u;
-    uint loc = gid % 256u;
+    uint e   = gid % 256u;
     uint off = blk * 110u;          // 110 bytes per block
 
-    // Lower 2 bits from qs (at offset 32)
-    uint low2 = (readU8(off + 32u + (loc / 4u)) >> ((loc % 4u) * 2u)) & 3u;
+    // ggml dequantize_row_q3_K: same grouped layout as Q2_K for qs and hmask
+    uint chunk  = e / 128u;
+    uint local  = e % 128u;
+    uint qs_idx = chunk * 32u + (local % 32u);
+    uint shift  = (local / 32u) * 2u;
 
-    // High 1 bit from hmask (at offset 0)
-    uint high1 = (readU8(off + (loc / 8u)) >> (loc % 8u)) & 1u;
+    // Lower 2 bits from qs at offset 32
+    uint low2 = (readU8(off + 32u + qs_idx) >> shift) & 3u;
 
-    // 3-bit signed: q = low2|(high1<<2), val = q - 4 gives range [-4..3]
+    // High 1 bit from hmask at offset 0: hmask[local%32] bit (chunk*4 + local/32)
+    uint hm_idx = local % 32u;
+    uint hm_bit = chunk * 4u + (local / 32u);
+    uint high1  = (readU8(off + hm_idx) >> hm_bit) & 1u;
+
+    // 3-bit signed value: high1=1 → no subtract, high1=0 → subtract 4
     int qval = int(low2 | (high1 << 2u)) - 4;
 
-    // Scale: scales at offset 96, int8 values
-    // One scale per 16-element sub-block (linear, is=0..15).
-    // Bytes 12-13 overlap d field (matches CPU behavior).
-    // Clamp to 13 to avoid reading past block boundary on GPU.
-    uint is_idx = min(loc / 16u, 13u);
-    uint sc_raw = readU8(off + 96u + is_idx);
-    int sc = sc_raw >= 128u ? int(sc_raw) - 256 : int(sc_raw);
+    // Scale decoding: ggml applies aux[] transform to scales[12] at offset 96.
+    // For scale index is = e/16, aux_group = is/4, k = is%4:
+    //   aux[0][k] = (raw[k]   & 0xF) | (((raw[8+k]>>0)&3)<<4)
+    //   aux[1][k] = (raw[k+4] & 0xF) | (((raw[8+k]>>2)&3)<<4)
+    //   aux[2][k] = (raw[k]  >>4)    | (((raw[8+k]>>4)&3)<<4)
+    //   aux[3][k] = (raw[k+4]>>4)    | (((raw[8+k]>>6)&3)<<4)
+    uint is_sc  = e / 16u;
+    uint k      = is_sc % 4u;
+    uint ag     = is_sc / 4u;
+    uint sc_off = off + 96u;
+    uint tmp_b  = readU8(sc_off + 8u + k);
+    uint rk, scale_byte;
+    if      (ag == 0u) { rk = readU8(sc_off + k);     scale_byte = (rk & 0xFu) | (((tmp_b >> 0u) & 3u) << 4u); }
+    else if (ag == 1u) { rk = readU8(sc_off + k + 4u); scale_byte = (rk & 0xFu) | (((tmp_b >> 2u) & 3u) << 4u); }
+    else if (ag == 2u) { rk = readU8(sc_off + k);     scale_byte = ((rk >> 4u) & 0xFu) | (((tmp_b >> 4u) & 3u) << 4u); }
+    else               { rk = readU8(sc_off + k + 4u); scale_byte = ((rk >> 4u) & 0xFu) | (((tmp_b >> 6u) & 3u) << 4u); }
 
-    float d = f16tof32(readU16(off + 108u)); // d at offset 108
+    float d = f16tof32(readU16(off + 108u));
+    float dl = d * float(int(scale_byte) - 32);
 
-    outBuf.data[gid] = d * float(sc) * float(qval);
+    outBuf.data[gid] = dl * float(qval);
 }
 ";
 
@@ -202,24 +222,31 @@ void get_scale_min_k4(uint j, uint sc_off, out float sc_out, out float min_out) 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid / 256u;
-    uint loc = gid % 256u;
+    uint e   = gid % 256u;
     uint off = blk * 176u;          // 176 bytes per block
 
-    float d    = f16tof32(readU16(off + 0u));  // d at offset 0
-    float dmin = f16tof32(readU16(off + 2u));  // dmin at offset 2
+    float d    = f16tof32(readU16(off + 0u));
+    float dmin = f16tof32(readU16(off + 2u));
 
-    // 8 sub-blocks of 32 elements each
-    uint sub = loc / 32u;           // 0..7
+    // Scale: 8 sub-blocks of 32 elements (same index as before)
+    uint sub = e / 32u;
     float sc, mn;
-    get_scale_min_k4(sub, off + 4u, sc, mn); // scales[12] at offset 4
+    get_scale_min_k4(sub, off + 4u, sc, mn);
+
+    // ggml dequantize_row_q5_K: j groups of 64, within each 32 lower + 32 upper nibbles
+    // ql[j*32+l] stores lower nibble for element j*64+l, upper nibble for j*64+32+l
+    uint j        = e / 64u;
+    uint local    = e % 64u;
+    uint is_upper = (local >= 32u) ? 1u : 0u;
+    uint l        = local % 32u;
+    uint ql_idx   = j * 32u + l;
 
     // Lower 4 bits from qs[128] at offset 48
-    uint qs_byte = readU8(off + 48u + (loc / 2u));
-    uint ql = (qs_byte >> ((loc % 2u) * 4u)) & 0xFu;
+    uint ql = (readU8(off + 48u + ql_idx) >> (is_upper * 4u)) & 0xFu;
 
-    // High 1 bit from qh[32] at offset 16
-    uint qh_byte = readU8(off + 16u + (loc / 8u));
-    uint qh = (qh_byte >> (loc % 8u)) & 1u;
+    // High 1 bit from qh[32] at offset 16: qh[ql_idx] bit (j*2+is_upper)
+    uint qh_bit = j * 2u + is_upper;
+    uint qh = (readU8(off + 16u + ql_idx) >> qh_bit) & 1u;
 
     uint q = ql | (qh << 4u);      // 5-bit value 0..31
 
