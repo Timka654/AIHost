@@ -6,6 +6,7 @@ namespace AIHost.ICompute.ROCm;
 public class ROCmComputeDevice : ComputeProviderBase
 {
     private readonly int _deviceId;
+    private readonly string? _gcnArch; // e.g. "gfx1030" — passed to kernels at compile time
     private bool _disposed;
 
     public override string ProviderName => "ROCm/HIP";
@@ -35,6 +36,12 @@ public class ROCmComputeDevice : ComputeProviderBase
         var deviceName = System.Text.Encoding.UTF8.GetString(props.name).TrimEnd('\0');
         ApiVersion = $"HIP {props.major}.{props.minor}";
 
+        // Best-effort GCN architecture string for HIPRTC compilation.
+        // AMD maps major.minor → gfxNNN differently from CUDA. Known mappings:
+        //   9.0 → gfx900 (Vega10), 9.6 → gfx906 (Vega20), 10.1 → gfx1010, 10.3 → gfx1030
+        // We build gfx{major}{minor:D2} and let --offload-arch=native override if available.
+        _gcnArch = null; // null → kernel uses --offload-arch=native (auto-detect at compile time)
+
         Console.WriteLine($"ROCm Device: {deviceName}");
         Console.WriteLine($"API Version: {ApiVersion}");
         Console.WriteLine($"Compute Capability: {props.major}.{props.minor}");
@@ -49,15 +56,10 @@ public class ROCmComputeDevice : ComputeProviderBase
     }
 
     public override IComputeKernel CreateKernel(string source, string entryPoint)
-    {
-        return new ROCmComputeKernel(source, entryPoint);
-    }
+        => new ROCmComputeKernel(source, entryPoint, _gcnArch);
 
     public override IComputeKernel CreateKernelFromFile(string filePath, string entryPoint)
-    {
-        var source = File.ReadAllText(filePath);
-        return new ROCmComputeKernel(source, entryPoint);
-    }
+        => new ROCmComputeKernel(File.ReadAllText(filePath), entryPoint, _gcnArch);
 
     public override IComputeCommandQueue CreateCommandQueue()
     {

@@ -19,7 +19,10 @@ public unsafe class ROCmComputeCommandQueue : ComputeCommandQueueBase
         if (_disposed)
             throw new ObjectDisposedException(nameof(ROCmComputeCommandQueue));
 
-        // Dispatch is handled by kernel itself
+        // Route dispatch to this queue's HIP stream so work is ordered correctly.
+        if (kernel is ROCmComputeKernel rocmKernel)
+            rocmKernel.SetStream(_stream);
+
         kernel.Dispatch(globalWorkSize, localWorkSize);
     }
 

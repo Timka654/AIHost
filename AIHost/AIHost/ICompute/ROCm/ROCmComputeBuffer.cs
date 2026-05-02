@@ -42,8 +42,17 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
 
     public T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
     {
-        int start = (int)(byteOffset / (ulong)sizeof(T));
-        return Read<T>().Skip(start).Take(elementCount).ToArray();
+        if (_disposed) throw new ObjectDisposedException(nameof(ROCmComputeBuffer));
+        var result = new T[elementCount];
+        var byteCount = (ulong)(sizeof(T) * elementCount);
+        fixed (T* ptr = result)
+        {
+            HipApi.CheckError(
+                HipApi.hipMemcpy((IntPtr)ptr, _devicePtr + (nint)byteOffset, byteCount,
+                                 HipApi.HipMemcpyKind.DeviceToHost),
+                "hipMemcpy ReadRange");
+        }
+        return result;
     }
 
     public T[] Read<T>() where T : unmanaged

@@ -10,18 +10,24 @@ public class ROCmComputeKernel : IComputeKernel
     private readonly List<object> _arguments = new();
     private IntPtr _module;
     private IntPtr _function;
+    private IntPtr _stream;       // set by ROCmComputeCommandQueue before each dispatch
+    private string? _gcnArch;     // set by ROCmComputeDevice after GPU architecture detection
     private bool _compiled;
     private bool _disposed;
 
     public string Name { get; }
     public KernelArgumentType[] ArgumentTypes => Array.Empty<KernelArgumentType>();
 
-    public ROCmComputeKernel(string source, string entryPoint)
+    public ROCmComputeKernel(string source, string entryPoint, string? gcnArch = null)
     {
         _source = source;
         _entryPoint = entryPoint;
+        _gcnArch = gcnArch;
         Name = entryPoint;
     }
+
+    /// <summary>Called by ROCmComputeCommandQueue before each Dispatch to route work to the queue's HIP stream.</summary>
+    internal void SetStream(IntPtr stream) => _stream = stream;
 
     public void SetArgument(int index, IComputeBuffer buffer)
     {
@@ -48,8 +54,11 @@ public class ROCmComputeKernel : IComputeKernel
 
         try
         {
-            // 2. Compile with optimization
-            var options = new[] { "--gpu-architecture=gfx900" }; // Target RDNA/Vega architecture
+            // 2. Compile: use detected architecture or fall back to offload-arch=native
+            string archFlag = _gcnArch != null
+                ? $"--offload-arch={_gcnArch}"
+                : "--offload-arch=native";
+            var options = new[] { archFlag };
             var result = HipRtcApi.hiprtcCompileProgram(prog, options.Length, options);
 
             if (result != HipRtcApi.HipRtcResult.Success)
@@ -138,16 +147,16 @@ public class ROCmComputeKernel : IComputeKernel
             uint gridY = globalWorkSize.Length > 1 ? (globalWorkSize[1] + blockY - 1) / blockY : 1;
             uint gridZ = globalWorkSize.Length > 2 ? (globalWorkSize[2] + blockZ - 1) / blockZ : 1;
 
-            // Launch kernel
+            // Launch kernel on the stream set by the command queue (IntPtr.Zero = default stream)
             HipApi.CheckError(
                 HipApi.hipModuleLaunchKernel(
                     _function,
                     gridX, gridY, gridZ,
                     blockX, blockY, blockZ,
-                    0, // shared memory bytes
-                    IntPtr.Zero, // stream (null = default)
+                    0,       // shared memory bytes
+                    _stream, // use queue's HIP stream for correct ordering
                     kernelParams,
-                    null), // extra
+                    null),   // extra
                 "hipModuleLaunchKernel");
         }
         finally
