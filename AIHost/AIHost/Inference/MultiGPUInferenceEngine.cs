@@ -1,50 +1,54 @@
 using AIHost.Compute;
 using AIHost.GGUF;
 using AIHost.ICompute;
-using AIHost.ICompute.Vulkan;
 using AIHost.Tokenizer;
 
 namespace AIHost.Inference;
 
 /// <summary>
 /// Inference engine that splits a transformer model across multiple GPU devices.
-/// Layer distribution is automatic (even split) or configurable via layerSplit.
+/// Drop-in replacement for single-GPU InferenceEngine when DeviceIndices is set.
 /// </summary>
-public class MultiGPUInferenceEngine : IDisposable
+public class MultiGPUInferenceEngine : IInferenceEngine
 {
     private readonly MultiGPUTransformer _model;
     private readonly BPETokenizer _tokenizer;
+    private readonly int _batchSize;
     private Random _random;
     private MultiDeviceKVCache? _kvCache;
     private bool _disposed;
 
-    public int DeviceCount => _model.DeviceCount;
+    public BPETokenizer Tokenizer    => _tokenizer;
+    public int DeviceCount           => _model.DeviceCount;
+    public int ContextLength         => 0; // populated from model metadata if needed
 
     /// <summary>
-    /// Load a model split across the given Vulkan device indices.
-    /// layerSplit: optional array of N-1 layer boundaries (where device i+1 starts).
-    /// If null, layers are distributed evenly.
+    /// Construct from an already-built MultiGPUTransformer and tokenizer.
+    /// ModelManager calls this after creating transformer + tokenizer.
     /// </summary>
-    public MultiGPUInferenceEngine(IGGUFModel model, BPETokenizer tokenizer,
-                                    int[] deviceIndices, int[]? layerSplit = null)
+    public MultiGPUInferenceEngine(
+        MultiGPUTransformer model,
+        BPETokenizer        tokenizer,
+        int                 batchSize = 8)
     {
+        _model     = model;
         _tokenizer = tokenizer;
+        _batchSize = Math.Max(1, batchSize);
         _random    = new Random();
-
-        var devices = deviceIndices.Select(i => (IComputeDevice)new VulkanComputeDevice(i)).ToArray();
-        _model = new MultiGPUTransformer(devices, model, layerSplit);
     }
 
-    /// <summary>Generate text from a prompt.</summary>
+    // ── Public generation API (mirrors InferenceEngine) ──────────────────────
+
     public string Generate(string prompt, GenerationConfig config)
     {
         var tokens = Run(prompt, config, onToken: null);
         return _tokenizer.Decode(tokens.ToArray());
     }
 
-    /// <summary>Generate with streaming callback.</summary>
     public void GenerateStreaming(string prompt, GenerationConfig config, Action<string> onToken)
         => Run(prompt, config, onToken: id => onToken(_tokenizer.GetToken(id)));
+
+    // ── Core loop ────────────────────────────────────────────────────────────
 
     private List<int> Run(string prompt, GenerationConfig config, Action<int>? onToken)
     {
@@ -56,18 +60,22 @@ public class MultiGPUInferenceEngine : IDisposable
         {
             int removed = tokens.Count - config.MaxPromptTokens;
             tokens = [.. tokens.Take(1), .. tokens.Skip(removed + 1)];
+            Console.WriteLine($"[MultiGPU] Prompt truncated to {tokens.Count} tokens");
         }
 
-        Console.WriteLine($"[MultiGPU] Prompt tokens: {tokens.Count}");
+        Console.WriteLine($"[MultiGPU] Prompt tokens: {tokens.Count} ids=[{string.Join(",", tokens)}]");
 
         if (config.UseKVCache)
         {
             if (_kvCache == null) _kvCache = _model.CreateKVCache();
             else _kvCache.Clear();
         }
+        else _kvCache?.Clear();
 
         int eosToken = _tokenizer.EosToken;
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        bool prefillDone = false;
+        int generated = 0;
 
         for (int i = 0; i < config.MaxNewTokens; i++)
         {
@@ -76,65 +84,85 @@ public class MultiGPUInferenceEngine : IDisposable
                 ? new[] { tokens[^1] }
                 : tokens.ToArray();
 
+            var iterSw = System.Diagnostics.Stopwatch.StartNew();
             var logitsTensor = _model.Forward(inputTokens, startPos, _kvCache);
             int lastRow = logitsTensor.Shape[0] - 1;
             float[] lastLogits = logitsTensor.ReadRow(lastRow);
             logitsTensor.Dispose();
 
-            if (i == 0) Console.WriteLine($"[MultiGPU] Prefill {inputTokens.Length} tok: {sw.ElapsedMilliseconds}ms");
+            if (!prefillDone)
+            {
+                Console.WriteLine($"[MultiGPU] Prefill {inputTokens.Length} tok: {iterSw.ElapsedMilliseconds}ms");
+                prefillDone = true;
+            }
+            else if (generated % 10 == 0)
+            {
+                double tps = generated / sw.Elapsed.TotalSeconds;
+                Console.WriteLine($"[MultiGPU] Token {generated}: {iterSw.ElapsedMilliseconds}ms | {tps:F1} tok/s");
+            }
 
             int next = Sample(lastLogits, tokens, config);
             tokens.Add(next);
+            generated++;
             onToken?.Invoke(next);
 
-            if (next == eosToken) break;
+            if (next == eosToken) { Console.WriteLine($"[MultiGPU] EOS at {generated}"); break; }
         }
 
         return tokens;
     }
 
+    // ── Sampling (mirrors InferenceEngine) ───────────────────────────────────
+
     private int Sample(float[] logits, List<int> prev, GenerationConfig cfg)
     {
-        // Repetition penalty
         if (cfg.RepetitionPenalty != 1f)
             foreach (int t in prev)
                 if (t >= 0 && t < logits.Length)
                     logits[t] = logits[t] > 0 ? logits[t] / cfg.RepetitionPenalty : logits[t] * cfg.RepetitionPenalty;
 
-        // Temperature
         if (Math.Abs(cfg.Temperature - 1f) > 0.001f)
             for (int i = 0; i < logits.Length; i++) logits[i] /= cfg.Temperature;
 
-        // Softmax
-        float max = logits.Max();
-        float[] p = logits.Select(v => MathF.Exp(v - max)).ToArray();
-        float sum = p.Sum(); for (int i = 0; i < p.Length; i++) p[i] /= sum;
+        float[] p = Softmax(logits);
+        if (cfg.TopK > 0)  p = ApplyTopK(p, cfg.TopK);
+        if (cfg.TopP < 1f) p = ApplyTopP(p, cfg.TopP);
+        return SampleFromDistribution(p);
+    }
 
-        // Top-K
-        if (cfg.TopK > 0)
-        {
-            var topk = p.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(cfg.TopK).ToArray();
-            var filtered = new float[p.Length];
-            float s2 = 0; foreach (var (v, i) in topk) { filtered[i] = v; s2 += v; }
-            if (s2 > 0) for (int i = 0; i < filtered.Length; i++) filtered[i] /= s2;
-            p = filtered;
-        }
+    private static float[] Softmax(float[] x)
+    {
+        float max = x.Max();
+        float[] e = x.Select(v => MathF.Exp(v - max)).ToArray();
+        float s = e.Sum();
+        return e.Select(v => v / s).ToArray();
+    }
 
-        // Top-P
-        if (cfg.TopP < 1f)
-        {
-            var sorted = p.Select((v, i) => (v, i)).OrderByDescending(x => x.v).ToArray();
-            float cum = 0; int cut = 0;
-            for (int i = 0; i < sorted.Length; i++) { cum += sorted[i].v; cut = i + 1; if (cum >= cfg.TopP) break; }
-            var filtered = new float[p.Length]; float s2 = 0;
-            for (int i = 0; i < cut; i++) { filtered[sorted[i].i] = sorted[i].v; s2 += sorted[i].v; }
-            if (s2 > 0) for (int i = 0; i < filtered.Length; i++) filtered[i] /= s2;
-            p = filtered;
-        }
+    private static float[] ApplyTopK(float[] p, int k)
+    {
+        var topk = p.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(k).ToArray();
+        var f = new float[p.Length];
+        float s = 0;
+        foreach (var (v, i) in topk) { f[i] = v; s += v; }
+        if (s > 0) for (int i = 0; i < f.Length; i++) f[i] /= s;
+        return f;
+    }
 
-        // Sample
-        float r = (float)_random.NextDouble(), cumSum = 0;
-        for (int i = 0; i < p.Length; i++) { cumSum += p[i]; if (r < cumSum) return i; }
+    private static float[] ApplyTopP(float[] p, float nucleus)
+    {
+        var sorted = p.Select((v, i) => (v, i)).OrderByDescending(x => x.v).ToArray();
+        float cum = 0; int cut = 0;
+        for (int i = 0; i < sorted.Length; i++) { cum += sorted[i].v; cut = i + 1; if (cum >= nucleus) break; }
+        var f = new float[p.Length]; float s = 0;
+        for (int i = 0; i < cut; i++) { f[sorted[i].i] = sorted[i].v; s += sorted[i].v; }
+        if (s > 0) for (int i = 0; i < f.Length; i++) f[i] /= s;
+        return f;
+    }
+
+    private int SampleFromDistribution(float[] p)
+    {
+        float r = (float)_random.NextDouble(), cum = 0;
+        for (int i = 0; i < p.Length; i++) { cum += p[i]; if (r < cum) return i; }
         for (int i = p.Length - 1; i >= 0; i--) if (p[i] > 0) return i;
         return 0;
     }

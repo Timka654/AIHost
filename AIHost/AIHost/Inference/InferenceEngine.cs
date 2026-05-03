@@ -24,7 +24,7 @@ public class GenerationConfig
 /// <summary>
 /// High-level inference engine with sampling strategies and KV-cache
 /// </summary>
-public class InferenceEngine : IDisposable
+public class InferenceEngine : IInferenceEngine
 {
     private readonly Transformer _model;
     private readonly BPETokenizer _tokenizer;

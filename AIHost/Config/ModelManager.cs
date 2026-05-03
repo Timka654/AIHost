@@ -4,6 +4,7 @@ using AIHost.Compute;
 using AIHost.GGUF;
 using AIHost.ICompute;
 using AIHost.Inference;
+using AIHost.ICompute.Vulkan;
 using AIHost.Tokenizer;
 
 namespace AIHost.Config;
@@ -118,49 +119,71 @@ public class ModelManager : IDisposable
         if (!File.Exists(modelPath))
             throw new FileNotFoundException($"Model file not found: {modelPath}");
 
-        // Determine which device to use
+        // Determine single-GPU device (skipped when multi-GPU devices[] is configured)
+        bool isMultiGPUConfig = config.Devices is { Length: > 1 };
         IComputeDevice device = _device;
         IComputeDevice? perModelDevice = null;
-        
-        // Create per-model device if specific settings are provided
-        if (config.ComputeProvider != null || config.DeviceIndex != null)
+
+        if (!isMultiGPUConfig && (config.ComputeProvider != null || config.DeviceIndex != null))
         {
-            var provider = config.ComputeProvider ?? "vulkan";
+            var provider    = config.ComputeProvider ?? "vulkan";
             var deviceIndex = config.DeviceIndex ?? 0;
-            
             _logger.LogInformation("Creating dedicated {Provider} device (index {Index}) for model {Model}", provider, deviceIndex, modelName);
             perModelDevice = CreateComputeDevice(provider, deviceIndex);
             device = perModelDevice;
         }
 
         _logger.LogInformation(
-            "Loading model {Model} | provider={Provider} device={Device} keep_alive={KeepAlive}m gpu_layers={Layers} batch={Batch} mmap={Mmap} mlock={Mlock}",
+            "Loading model {Model} | provider={Provider} device={Device} keep_alive={KeepAlive}m batch={Batch} mmap={Mmap} mlock={Mlock}",
             modelName,
             config.ComputeProvider ?? "(global)",
             config.DeviceIndex?.ToString() ?? "(global)",
             config.KeepAliveMinutes?.ToString() ?? "(global)",
-            config.NumGpuLayers?.ToString() ?? "all",
             config.BatchSize?.ToString() ?? "8",
             config.EnableMmap, config.EnableMlock);
 
-        if (config.NumGpuLayers is >= 0)
-            _logger.LogWarning("num_gpu_layers requires Transformer changes for hybrid CPU/GPU — ignored");
         if (config.EnableMlock && !config.EnableMmap)
             _logger.LogWarning("enable_mlock requires enable_mmap to be true");
-        
-        // LazyGGUFModel owns its GGUFReader — reuse it for the tokenizer
-        // to avoid opening and parsing the same file twice.
-        IGGUFModel ggufModel = new AIHost.GGUF.LazyGGUFModel(modelPath, device, config.EnableMmap, config.EnableMlock, requireDeviceLocal: !config.AllowSharedMemory);
-        var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
-        // Transformer owns its ComputeOps; share it with InferenceEngine
-        var transformer = new Transformer(device, ggufModel);
-        transformer.LoadWeights();
 
-        // Use configured batch size or default to 8
         int batchSize = config.BatchSize ?? 8;
-        var engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize);
+        IInferenceEngine engine;
 
-        // Load system messages
+        // ── Multi-GPU path ────────────────────────────────────────────────────
+        if (isMultiGPUConfig)
+        {
+            var devCfgs = config.Devices!;
+            _logger.LogInformation("Multi-GPU: {Count} devices [{Indices}]",
+                devCfgs.Length,
+                string.Join(", ", devCfgs.Select(d => $"{d.Provider ?? config.ComputeProvider ?? "vulkan"}[{d.Index}]" +
+                                                       (d.Layers.HasValue ? $"×{d.Layers}L" : ""))));
+
+            // Build layer-split boundaries from per-device Layers field.
+            // Last device always gets the remainder (its Layers value is ignored).
+            int[]? layerSplit = BuildLayerSplit(devCfgs);
+
+            var xfm = new MultiGPUTransformer(
+                devices: devCfgs.Select(d =>
+                    CreateComputeDevice(d.Provider ?? config.ComputeProvider ?? "vulkan", d.Index)).ToArray(),
+                modelFactory: d => new AIHost.GGUF.LazyGGUFModel(
+                    modelPath, d, config.EnableMmap, config.EnableMlock,
+                    requireDeviceLocal: !config.AllowSharedMemory),
+                layerSplit: layerSplit);
+
+            engine = new MultiGPUInferenceEngine(xfm, BPETokenizer.FromGGUF(xfm.PrimaryModel.Reader), batchSize);
+        }
+        else
+        {
+            // ── Single-GPU path (unchanged) ───────────────────────────────────
+            IGGUFModel ggufModel = new AIHost.GGUF.LazyGGUFModel(
+                modelPath, device,
+                config.EnableMmap, config.EnableMlock,
+                requireDeviceLocal: !config.AllowSharedMemory);
+            var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
+            var transformer = new Transformer(device, ggufModel);
+            transformer.LoadWeights();
+            engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize);
+        }
+
         var systemMessages = await LoadSystemMessagesAsync(config);
 
         var loaded = new ModelInstance
@@ -382,6 +405,31 @@ public class ModelManager : IDisposable
     }
 
     /// <summary>
+    /// Converts per-device Layers fields into the int[] layerSplit expected by MultiGPUTransformer.
+    /// Returns null if all devices have Layers = null (auto even split).
+    /// The last device's Layers value is always ignored — it gets the remainder.
+    /// </summary>
+    private static int[]? BuildLayerSplit(MultiGpuDeviceConfig[] devices)
+    {
+        int n = devices.Length;
+        // If no device specifies Layers, use auto-split
+        if (devices.Take(n - 1).All(d => d.Layers == null)) return null;
+
+        // Build cumulative boundaries: layerSplit[i] = first layer of device i+1
+        var splits = new int[n - 1];
+        int consumed = 0;
+        for (int i = 0; i < n - 1; i++)
+        {
+            if (devices[i].Layers is int l)
+                consumed += l;
+            // If Layers is null for a non-last device: leave as-is (will be filled by MultiGPUTransformer auto logic)
+            // but we still need a value — use 0 as sentinel meaning "auto from here"
+            splits[i] = consumed;
+        }
+        return splits;
+    }
+
+    /// <summary>
     /// Create compute device by provider name
     /// </summary>
     private static IComputeDevice CreateComputeDevice(string provider, int deviceIndex)
@@ -416,7 +464,7 @@ public class ModelInstance : IDisposable
 {
     public string Name { get; set; } = "";
     public ModelConfig Config { get; set; } = null!;
-    public InferenceEngine Engine { get; set; } = null!;
+    public IInferenceEngine Engine { get; set; } = null!;
     public IComputeDevice? Device { get; set; }
     public List<string> SystemMessages { get; set; } = new();
     public DateTime LoadedAt { get; set; }

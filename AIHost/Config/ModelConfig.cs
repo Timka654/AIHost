@@ -115,6 +115,43 @@ public class ModelConfig
     /// </summary>
     [JsonPropertyName("allow_shared_memory")]
     public bool AllowSharedMemory { get; set; } = false;
+
+    // ── Multi-GPU settings ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Per-device configuration for multi-GPU inference.
+    /// When set with 2+ entries, the model is split across these devices.
+    /// Null / single entry → single-GPU (device_index / compute_provider apply).
+    ///
+    /// Example — 22-layer model across RX 6600 XT and iGPU:
+    /// "devices": [
+    ///   { "index": 0, "provider": "vulkan", "layers": 18 },
+    ///   { "index": 1, "provider": "vulkan" }
+    /// ]
+    /// Last entry omits "layers" — it gets all remaining layers automatically.
+    /// </summary>
+    [JsonPropertyName("devices")]
+    public MultiGpuDeviceConfig[]? Devices { get; set; }
+}
+
+/// <summary>Per-device settings for multi-GPU model splitting.</summary>
+public class MultiGpuDeviceConfig
+{
+    /// <summary>Vulkan/CUDA/ROCm device index.</summary>
+    [JsonPropertyName("index")]
+    public int Index { get; set; } = 0;
+
+    /// <summary>Compute provider: "vulkan", "cuda", "rocm". Null = use model-level compute_provider.</summary>
+    [JsonPropertyName("provider")]
+    public string? Provider { get; set; }
+
+    /// <summary>
+    /// Number of transformer layers to run on this device.
+    /// Null (or absent) on the LAST entry means "all remaining layers".
+    /// Ignored on the last entry if set — the last device always gets the remainder.
+    /// </summary>
+    [JsonPropertyName("layers")]
+    public int? Layers { get; set; }
 }
 
 /// <summary>
