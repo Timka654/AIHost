@@ -102,11 +102,9 @@ public class Transformer : IDisposable
 
         Console.WriteLine($"✓ Weights loaded ({_weightCache.Count} tensors, quantized in VRAM)");
 
-        // Pre-allocate F32 scratch tensors using layer 0 as the template for all layers
-        // (all layers share the same weight shapes in transformer architectures).
         AllocateScratchWeights("blk.0");
+        TryAllocateScratchHead();
         Console.WriteLine($"✓ F32 scratch buffers allocated ({_scratchF32.Count} tensors)\n");
-        // CPU reference verification: run single BOS token through layer 0 on CPU, compare with GPU
         RunCpuReferenceLayer0();
     }
 
@@ -144,7 +142,38 @@ public class Transformer : IDisposable
 
         Console.WriteLine($"[MultiGPU] ✓ Loaded {_weightCache.Count} tensors for device");
         if (_localLayerCount > 0)
-            AllocateScratchWeights($"blk.{globalFirstLayer}");
+            TryAllocateScratch($"blk.{globalFirstLayer}");
+        if (withHead)
+            TryAllocateScratchHead();
+    }
+
+    private void TryAllocateScratch(string layerPrefix)
+    {
+        try { AllocateScratchWeights(layerPrefix); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Warning] Scratch allocation failed for {layerPrefix}: {ex.Message} — will allocate per inference");
+        }
+    }
+
+    private void TryAllocateScratchHead()
+    {
+        foreach (var name in new[] { "output.weight", "token_embd.weight" })
+        {
+            if (!_weightCache.TryGetValue(name, out var cached)) continue;
+            if (cached.DataType == DataType.F32) continue;
+            if (_scratchF32.ContainsKey(name)) continue;
+            try
+            {
+                var scratch = Tensor.Create(_ops.Device, cached.Shape, DataType.F32, name + "_scratch");
+                _scratchF32[name] = scratch;
+                Console.WriteLine($"[MultiGPU]   scratch {name} ({scratch.Shape.TotalElements * 4L / 1024 / 1024} MB F32)");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Warning] Scratch for {name} failed: {ex.Message} — will allocate per inference");
+            }
+        }
     }
 
     /// <summary>Token embedding lookup. Returns [seqLen, dModel] on this device's GPU.</summary>

@@ -119,21 +119,39 @@ public class ModelConfig
     // ── Multi-GPU settings ────────────────────────────────────────────────────
 
     /// <summary>
-    /// GPU device indices for multi-GPU inference (e.g. [0, 1]).
-    /// When set, overrides device_index and splits layers across the listed GPUs.
-    /// Null or single-element array → single-GPU mode (use device_index instead).
+    /// Per-device configuration for multi-GPU inference.
+    /// When set with 2+ entries, the model is split across these devices.
+    /// Null / single entry → single-GPU (device_index / compute_provider apply).
+    ///
+    /// Example — 22-layer model across RX 6600 XT and iGPU:
+    /// "devices": [
+    ///   { "index": 0, "provider": "vulkan", "layers": 18 },
+    ///   { "index": 1, "provider": "vulkan" }
+    /// ]
+    /// Last entry omits "layers" — it gets all remaining layers automatically.
     /// </summary>
-    [JsonPropertyName("device_indices")]
-    public int[]? DeviceIndices { get; set; }
+    [JsonPropertyName("devices")]
+    public MultiGpuDeviceConfig[]? Devices { get; set; }
+}
+
+/// <summary>Per-device settings for multi-GPU model splitting.</summary>
+public class MultiGpuDeviceConfig
+{
+    /// <summary>Vulkan/CUDA/ROCm device index.</summary>
+    [JsonPropertyName("index")]
+    public int Index { get; set; } = 0;
+
+    /// <summary>Compute provider: "vulkan", "cuda", "rocm". Null = use model-level compute_provider.</summary>
+    [JsonPropertyName("provider")]
+    public string? Provider { get; set; }
 
     /// <summary>
-    /// Manual layer-split boundaries for multi-GPU (length = DeviceIndices.Length - 1).
-    /// layer_split[i] = global layer index where device i+1 starts.
-    /// Null = distribute layers evenly ("auto" mode).
-    /// Example for 22-layer model on 2 GPUs: [11] → GPU0 gets 0..10, GPU1 gets 11..21.
+    /// Number of transformer layers to run on this device.
+    /// Null (or absent) on the LAST entry means "all remaining layers".
+    /// Ignored on the last entry if set — the last device always gets the remainder.
     /// </summary>
-    [JsonPropertyName("layer_split")]
-    public int[]? LayerSplit { get; set; }
+    [JsonPropertyName("layers")]
+    public int? Layers { get; set; }
 }
 
 /// <summary>

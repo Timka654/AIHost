@@ -119,8 +119,8 @@ public class ModelManager : IDisposable
         if (!File.Exists(modelPath))
             throw new FileNotFoundException($"Model file not found: {modelPath}");
 
-        // Determine which device to use (skipped for multi-GPU — each device is created inside the multi-GPU block)
-        bool isMultiGPUConfig = config.DeviceIndices is { Length: > 1 };
+        // Determine single-GPU device (skipped when multi-GPU devices[] is configured)
+        bool isMultiGPUConfig = config.Devices is { Length: > 1 };
         IComputeDevice device = _device;
         IComputeDevice? perModelDevice = null;
 
@@ -134,17 +134,14 @@ public class ModelManager : IDisposable
         }
 
         _logger.LogInformation(
-            "Loading model {Model} | provider={Provider} device={Device} keep_alive={KeepAlive}m gpu_layers={Layers} batch={Batch} mmap={Mmap} mlock={Mlock}",
+            "Loading model {Model} | provider={Provider} device={Device} keep_alive={KeepAlive}m batch={Batch} mmap={Mmap} mlock={Mlock}",
             modelName,
             config.ComputeProvider ?? "(global)",
             config.DeviceIndex?.ToString() ?? "(global)",
             config.KeepAliveMinutes?.ToString() ?? "(global)",
-            config.NumGpuLayers?.ToString() ?? "all",
             config.BatchSize?.ToString() ?? "8",
             config.EnableMmap, config.EnableMlock);
 
-        if (config.NumGpuLayers is >= 0)
-            _logger.LogWarning("num_gpu_layers requires Transformer changes for hybrid CPU/GPU — ignored");
         if (config.EnableMlock && !config.EnableMmap)
             _logger.LogWarning("enable_mlock requires enable_mmap to be true");
 
@@ -154,21 +151,23 @@ public class ModelManager : IDisposable
         // ── Multi-GPU path ────────────────────────────────────────────────────
         if (isMultiGPUConfig)
         {
-            var indices  = config.DeviceIndices!;
-            var provider = config.ComputeProvider ?? "vulkan";
-            _logger.LogInformation("Multi-GPU: provider={Provider} devices=[{Devices}] split={Split}",
-                provider, string.Join(",", indices),
-                config.LayerSplit != null ? string.Join(",", config.LayerSplit) : "auto");
+            var devCfgs = config.Devices!;
+            _logger.LogInformation("Multi-GPU: {Count} devices [{Indices}]",
+                devCfgs.Length,
+                string.Join(", ", devCfgs.Select(d => $"{d.Provider ?? config.ComputeProvider ?? "vulkan"}[{d.Index}]" +
+                                                       (d.Layers.HasValue ? $"×{d.Layers}L" : ""))));
 
-            // MultiGPUTransformer owns all devices and models — perModelDevice stays null
-            // so ModelInstance.Device doesn't double-dispose anything already owned by the engine.
+            // Build layer-split boundaries from per-device Layers field.
+            // Last device always gets the remainder (its Layers value is ignored).
+            int[]? layerSplit = BuildLayerSplit(devCfgs);
+
             var xfm = new MultiGPUTransformer(
-                devices:      indices.Select(idx => CreateComputeDevice(provider, idx)).ToArray(),
+                devices: devCfgs.Select(d =>
+                    CreateComputeDevice(d.Provider ?? config.ComputeProvider ?? "vulkan", d.Index)).ToArray(),
                 modelFactory: d => new AIHost.GGUF.LazyGGUFModel(
-                                       modelPath, d,
-                                       config.EnableMmap, config.EnableMlock,
-                                       requireDeviceLocal: !config.AllowSharedMemory),
-                layerSplit:   config.LayerSplit);
+                    modelPath, d, config.EnableMmap, config.EnableMlock,
+                    requireDeviceLocal: !config.AllowSharedMemory),
+                layerSplit: layerSplit);
 
             engine = new MultiGPUInferenceEngine(xfm, BPETokenizer.FromGGUF(xfm.PrimaryModel.Reader), batchSize);
         }
@@ -403,6 +402,31 @@ public class ModelManager : IDisposable
         {
             _logger.LogInformation("Model config removed: {Model}", modelName);
         }
+    }
+
+    /// <summary>
+    /// Converts per-device Layers fields into the int[] layerSplit expected by MultiGPUTransformer.
+    /// Returns null if all devices have Layers = null (auto even split).
+    /// The last device's Layers value is always ignored — it gets the remainder.
+    /// </summary>
+    private static int[]? BuildLayerSplit(MultiGpuDeviceConfig[] devices)
+    {
+        int n = devices.Length;
+        // If no device specifies Layers, use auto-split
+        if (devices.Take(n - 1).All(d => d.Layers == null)) return null;
+
+        // Build cumulative boundaries: layerSplit[i] = first layer of device i+1
+        var splits = new int[n - 1];
+        int consumed = 0;
+        for (int i = 0; i < n - 1; i++)
+        {
+            if (devices[i].Layers is int l)
+                consumed += l;
+            // If Layers is null for a non-last device: leave as-is (will be filled by MultiGPUTransformer auto logic)
+            // but we still need a value — use 0 as sentinel meaning "auto from here"
+            splits[i] = consumed;
+        }
+        return splits;
     }
 
     /// <summary>

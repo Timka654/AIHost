@@ -97,7 +97,10 @@ public class MultiGPUTransformer : IDisposable
                 _deviceFirstLayer[i] = numLayers * i / n;
         }
 
-        // Create and load one Transformer per device
+        // Create and load one Transformer per device.
+        // Device 0 always owns the embedding AND the head (lm_head + output_norm)
+        // so the large head tensors stay on the primary GPU regardless of layer split.
+        // All other devices carry only their assigned transformer layers.
         _transformers = new Transformer[n];
         for (int d = 0; d < n; d++)
         {
@@ -106,13 +109,13 @@ public class MultiGPUTransformer : IDisposable
                 globalFirstLayer: _deviceFirstLayer[d],
                 globalLastLayer:  _deviceFirstLayer[d + 1],
                 withEmbedding:    d == 0,
-                withHead:         d == n - 1);
+                withHead:         d == 0);   // head always on device 0
         }
 
         Console.WriteLine($"[MultiGPU] {n} device(s), {numLayers} layers total");
         for (int d = 0; d < n; d++)
             Console.WriteLine($"  Device {d}: layers {_deviceFirstLayer[d]}..{_deviceFirstLayer[d + 1] - 1}" +
-                              (d == 0 ? " + embedding" : "") + (d == n - 1 ? " + head" : ""));
+                              (d == 0 ? " + embedding + head" : ""));
     }
 
     // ── Forward pass ─────────────────────────────────────────────────────────
@@ -126,7 +129,7 @@ public class MultiGPUTransformer : IDisposable
         // 1. Embedding on device 0
         Tensor x = _transformers[0].ForwardEmbedding(tokenIds);
 
-        // 2. Layers: each device runs its slice, transferring activations as needed
+        // 2. Layers: each device runs its slice
         for (int d = 0; d < _devices.Length; d++)
         {
             if (d > 0)
@@ -135,8 +138,11 @@ public class MultiGPUTransformer : IDisposable
             x = _transformers[d].ForwardLayers(x, startPosition, kvCache?.ForDevice(d));
         }
 
-        // 3. Head (output_norm + lm_head) on last device
-        return _transformers[^1].ForwardHead(x);
+        // 3. Head always on device 0: transfer back if we ended up on another device
+        if (_devices.Length > 1)
+            x = TransferTensor(x, _transformers[0].Ops);
+
+        return _transformers[0].ForwardHead(x);
     }
 
     /// <summary>Create a fresh KV-cache sized for this model's devices.</summary>
