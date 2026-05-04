@@ -1,0 +1,11 @@
+# Authentication Tokens Configuration
+# Format: <Modifier>:<Token>
+# Modifiers:
+#   A - All access (full access to everything)
+#   M - Manage access (can use /manage endpoints)
+#   U - User access (can use API endpoints, not /manage)
+#
+# Example tokens (uncomment to enable):
+# A:admin-full-access-token-123456
+# M:manager-token-789012
+# U:user-api-token-345678

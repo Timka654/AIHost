@@ -1,0 +1,198 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AIHost Model Configuration",
+  "description": "Configuration schema for AIHost LLM models",
+  "type": "object",
+  "required": ["name", "model", "format"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Unique model identifier (e.g., 'tinyllama-chat')",
+      "minLength": 1,
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "model": {
+      "type": "string",
+      "description": "Model file path (relative/absolute) or URL",
+      "minLength": 1
+    },
+    "format": {
+      "type": "string",
+      "description": "Model format",
+      "enum": ["gguf", "safetensors"],
+      "default": "gguf"
+    },
+    "auto_download": {
+      "type": "boolean",
+      "description": "Auto-download if model file doesn't exist",
+      "default": false
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable model description"
+    },
+    "tags": {
+      "type": "array",
+      "description": "Model tags (e.g., ['chat', 'instruct'])",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "system_messages": {
+      "type": "array",
+      "description": "System messages for the model",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "system_message_files": {
+      "type": "array",
+      "description": "Paths to external system message files",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "compute_provider": {
+      "type": "string",
+      "description": "Compute backend (null = use global setting)",
+      "enum": ["vulkan", "cuda", "rocm"],
+      "default": null
+    },
+    "device_index": {
+      "type": "integer",
+      "description": "GPU device index (null = use global setting)",
+      "minimum": 0,
+      "default": null
+    },
+    "keep_alive": {
+      "type": "integer",
+      "description": "Minutes to keep model in memory (0 = never unload, null = use global)",
+      "minimum": 0,
+      "default": null
+    },
+    "num_gpu_layers": {
+      "type": "integer",
+      "description": "Layers to offload to GPU (-1 = all, 0 = CPU only)",
+      "minimum": -1,
+      "default": null
+    },
+    "batch_size": {
+      "type": "integer",
+      "description": "Batch size for inference",
+      "minimum": 1,
+      "default": null
+    },
+    "enable_mmap": {
+      "type": "boolean",
+      "description": "Use memory mapping for model loading",
+      "default": true
+    },
+    "enable_mlock": {
+      "type": "boolean",
+      "description": "Lock model in RAM to prevent swapping",
+      "default": false
+    },
+    "allow_shared_memory": {
+      "type": "boolean",
+      "description": "Allow fallback to shared GPU memory (slower)",
+      "default": false
+    },
+    "devices": {
+      "type": "array",
+      "description": "Multi-GPU configuration (2+ devices)",
+      "items": {
+        "type": "object",
+        "required": ["index"],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "description": "Device index",
+            "minimum": 0
+          },
+          "provider": {
+            "type": "string",
+            "description": "Compute provider for this device",
+            "enum": ["vulkan", "cuda", "rocm"]
+          },
+          "layers": {
+            "type": "integer",
+            "description": "Number of layers (omit on last device)",
+            "minimum": 1
+          }
+        }
+      },
+      "minItems": 2
+    },
+    "parameters": {
+      "type": "object",
+      "description": "Generation parameters",
+      "properties": {
+        "temperature": {
+          "type": "number",
+          "description": "Sampling temperature",
+          "minimum": 0.0,
+          "maximum": 2.0,
+          "default": 0.7
+        },
+        "top_k": {
+          "type": "integer",
+          "description": "Top-K sampling",
+          "minimum": 1,
+          "default": 40
+        },
+        "top_p": {
+          "type": "number",
+          "description": "Top-P (nucleus) sampling",
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "default": 0.9
+        },
+        "repetition_penalty": {
+          "type": "number",
+          "description": "Repetition penalty",
+          "minimum": 0.0,
+          "default": 1.1
+        },
+        "context_size": {
+          "type": "integer",
+          "description": "Context size in tokens",
+          "minimum": 128,
+          "default": 2048
+        },
+        "max_tokens": {
+          "type": "integer",
+          "description": "Maximum tokens to generate",
+          "minimum": 1,
+          "default": 512
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Random seed (-1 for random)",
+          "default": -1
+        },
+        "use_kv_cache": {
+          "type": "boolean",
+          "description": "Enable KV cache",
+          "default": true
+        },
+        "kv_cache_quantization": {
+          "type": "string",
+          "description": "KV cache quantization",
+          "enum": ["none", "int8", "int4"],
+          "default": "none"
+        },
+        "stop": {
+          "type": "array",
+          "description": "Stop sequences",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    }
+  }
+}

@@ -5,13 +5,79 @@ using AIHost.Config;
 namespace AIHost.Middleware;
 
 /// <summary>
+/// Token access level
+/// </summary>
+public enum TokenAccessLevel
+{
+    /// <summary>
+    /// User access - can use API endpoints (not /manage)
+    /// </summary>
+    User,
+    
+    /// <summary>
+    /// Management access - can use /manage endpoints
+    /// </summary>
+    Manage,
+    
+    /// <summary>
+    /// All access - full access to everything
+    /// </summary>
+    All
+}
+
+/// <summary>
+/// Token entry with access level
+/// </summary>
+public class TokenEntry
+{
+    public string Token { get; set; } = "";
+    public TokenAccessLevel AccessLevel { get; set; }
+    
+    public static TokenEntry Parse(string line)
+    {
+        var parts = line.Split(':', 2);
+        if (parts.Length != 2)
+            throw new FormatException($"Invalid token format: {line}");
+        
+        var modifier = parts[0].Trim().ToUpperInvariant();
+        var token = parts[1].Trim();
+        
+        var accessLevel = modifier switch
+        {
+            "A" => TokenAccessLevel.All,
+            "M" => TokenAccessLevel.Manage,
+            "U" => TokenAccessLevel.User,
+            _ => throw new FormatException($"Invalid access modifier: {modifier}")
+        };
+        
+        return new TokenEntry
+        {
+            Token = token,
+            AccessLevel = accessLevel
+        };
+    }
+    
+    public override string ToString()
+    {
+        var modifier = AccessLevel switch
+        {
+            TokenAccessLevel.All => "A",
+            TokenAccessLevel.Manage => "M",
+            TokenAccessLevel.User => "U",
+            _ => "U"
+        };
+        return $"{modifier}:{Token}";
+    }
+}
+
+/// <summary>
 /// Middleware for token-based authentication with dynamic token reloading
 /// </summary>
 public class TokenAuthMiddleware : IDisposable
 {
     private readonly RequestDelegate _next;
     private readonly ILogger<TokenAuthMiddleware> _logger;
-    private readonly HashSet<string> _validTokens = new();
+    private readonly Dictionary<string, TokenAccessLevel> _validTokens = new();
     private readonly string? _manageToken;
     private readonly string? _tokensFilePath;
     private readonly object _lockObj = new();
@@ -111,23 +177,31 @@ public class TokenAuthMiddleware : IDisposable
             }
             
             var lines = File.ReadAllLines(filePath);
-            var newTokens = new HashSet<string>();
+            var newTokens = new Dictionary<string, TokenAccessLevel>();
             
             foreach (var line in lines)
             {
-                var token = line.Trim();
-                if (!string.IsNullOrEmpty(token) && !token.StartsWith("#"))
+                var trimmedLine = line.Trim();
+                if (string.IsNullOrEmpty(trimmedLine) || trimmedLine.StartsWith("#"))
+                    continue;
+                
+                try
                 {
-                    newTokens.Add(token);
+                    var entry = TokenEntry.Parse(trimmedLine);
+                    newTokens[entry.Token] = entry.AccessLevel;
+                }
+                catch (FormatException ex)
+                {
+                    _logger.LogWarning("Skipping invalid token line: {Error}", ex.Message);
                 }
             }
             
             lock (_lockObj)
             {
                 _validTokens.Clear();
-                foreach (var token in newTokens)
+                foreach (var kvp in newTokens)
                 {
-                    _validTokens.Add(token);
+                    _validTokens[kvp.Key] = kvp.Value;
                 }
             }
             
@@ -168,21 +242,48 @@ public class TokenAuthMiddleware : IDisposable
             return;
         }
 
-        // Management endpoints require manage token
+        // Management endpoints require manage token or A/M level access
         if (path.StartsWith("/manage"))
         {
+            // First check manage token (legacy)
             if (!string.IsNullOrEmpty(_manageToken))
             {
                 var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
                 var providedToken = authHeader?.Replace("Bearer ", "").Trim();
 
-                if (providedToken != _manageToken)
+                if (providedToken == _manageToken)
                 {
-                    context.Response.StatusCode = 401;
-                    await context.Response.WriteAsJsonAsync(new { error = "Unauthorized - invalid management token" });
+                    await _next(context);
                     return;
                 }
             }
+            
+            // Check token-based access with A or M level
+            if (RequireAuth)
+            {
+                var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+                var providedToken = authHeader?.Replace("Bearer ", "").Trim();
+
+                bool hasAccess = false;
+                if (!string.IsNullOrEmpty(providedToken))
+                {
+                    lock (_lockObj)
+                    {
+                        if (_validTokens.TryGetValue(providedToken, out var level))
+                        {
+                            hasAccess = level == TokenAccessLevel.All || level == TokenAccessLevel.Manage;
+                        }
+                    }
+                }
+
+                if (!hasAccess)
+                {
+                    context.Response.StatusCode = 401;
+                    await context.Response.WriteAsJsonAsync(new { error = "Unauthorized - management access required" });
+                    return;
+                }
+            }
+            
             await _next(context);
             return;
         }
@@ -198,7 +299,8 @@ public class TokenAuthMiddleware : IDisposable
             {
                 lock (_lockObj)
                 {
-                    isValid = _validTokens.Contains(providedToken);
+                    // Any valid token grants access to regular API endpoints
+                    isValid = _validTokens.ContainsKey(providedToken);
                 }
             }
 

@@ -1,0 +1,33 @@
+{
+  "$schema": "./model.schema.json",
+  "name": "tinyllama-chat",
+  "model": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+  "format": "gguf",
+  "auto_download": false,
+  "description": "TinyLlama 1.1B Chat Model - 4-bit quantized",
+  "tags": ["chat", "small", "fast"],
+  "system_messages": [
+    "You are a helpful AI assistant."
+  ],
+  "system_message_files": [],
+  "compute_provider": "vulkan",
+  "device_index": 0,
+  "keep_alive": 30,
+  "num_gpu_layers": -1,
+  "batch_size": 8,
+  "enable_mmap": true,
+  "enable_mlock": false,
+  "allow_shared_memory": false,
+  "parameters": {
+    "temperature": 0.7,
+    "top_k": 40,
+    "top_p": 0.9,
+    "repetition_penalty": 1.1,
+    "context_size": 2048,
+    "max_tokens": 512,
+    "seed": -1,
+    "use_kv_cache": true,
+    "kv_cache_quantization": "none",
+    "stop": []
+  }
+}

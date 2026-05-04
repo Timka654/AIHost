@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using AIHost.Config;
 using AIHost.Logging;
+using AIHost.Services;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -153,11 +154,13 @@ public class ManagementController : ControllerBase
 {
     private readonly ModelManager _modelManager;
     private readonly RequestLogger _requestLogger;
+    private readonly DownloadManager _downloadManager;
 
-    public ManagementController(ModelManager modelManager, RequestLogger requestLogger)
+    public ManagementController(ModelManager modelManager, RequestLogger requestLogger, DownloadManager downloadManager)
     {
         _modelManager = modelManager;
         _requestLogger = requestLogger;
+        _downloadManager = downloadManager;
     }
 
     /// <summary>
@@ -327,10 +330,10 @@ public class ManagementController : ControllerBase
     {
         try
         {
-            if (!Directory.Exists(_modelManager.ModelsDirectory))
+            if (!Directory.Exists(_modelManager.CacheDirectory))
                 return Ok(new { message = "Cache directory does not exist" });
 
-            var cacheDir = _modelManager.ModelsDirectory;
+            var cacheDir = _modelManager.CacheDirectory;
             var files = Directory.GetFiles(cacheDir, "*", SearchOption.AllDirectories);
             var dirs = Directory.GetDirectories(cacheDir, "*", SearchOption.AllDirectories);
 
@@ -355,16 +358,16 @@ public class ManagementController : ControllerBase
     {
         try
         {
-            if (!Directory.Exists(_modelManager.ModelsDirectory))
-                return Ok(new { path = _modelManager.ModelsDirectory, file_count = 0, total_size = 0, dir_count = 0 });
+            if (!Directory.Exists(_modelManager.CacheDirectory))
+                return Ok(new { path = _modelManager.CacheDirectory, file_count = 0, total_size = 0, dir_count = 0 });
 
-            var files = Directory.GetFiles(_modelManager.ModelsDirectory, "*", SearchOption.AllDirectories);
-            var dirs = Directory.GetDirectories(_modelManager.ModelsDirectory, "*", SearchOption.AllDirectories);
+            var files = Directory.GetFiles(_modelManager.CacheDirectory, "*", SearchOption.AllDirectories);
+            var dirs = Directory.GetDirectories(_modelManager.CacheDirectory, "*", SearchOption.AllDirectories);
             var totalSize = files.Sum(f => new FileInfo(f).Length);
 
             return Ok(new
             {
-                path = _modelManager.ModelsDirectory,
+                path = _modelManager.CacheDirectory,
                 file_count = files.Length,
                 total_size = totalSize,
                 dir_count = dirs.Length
@@ -377,7 +380,7 @@ public class ManagementController : ControllerBase
     }
 
     /// <summary>
-    /// Direct chat endpoint
+    /// Direct chat endpoint (auto-loads model if not loaded)
     /// </summary>
     [HttpPost("chat")]
     public async Task<IActionResult> DirectChat([FromBody] ChatRequest request)
@@ -390,6 +393,10 @@ public class ManagementController : ControllerBase
 
         try
         {
+            // Try to reload config if not found in memory
+            _modelManager.ReloadConfig(request.ModelName);
+            
+            // Auto-load model if not already loaded
             var model = await _modelManager.GetModelAsync(request.ModelName);
 
             var config = new AIHost.Inference.GenerationConfig
@@ -413,6 +420,14 @@ public class ManagementController : ControllerBase
                 finish_reason = "stop"
             });
         }
+        catch (ArgumentException ex)
+        {
+            return NotFound(new { error = $"Model config '{request.ModelName}' not found. Please check the config exists in the Configs section. Details: {ex.Message}" });
+        }
+        catch (FileNotFoundException ex)
+        {
+            return NotFound(new { error = $"Model file not found. Please initialize/download the model first. Details: {ex.Message}" });
+        }
         catch (Exception ex)
         {
             return StatusCode(500, new { error = $"Chat failed: {ex.Message}" });
@@ -432,32 +447,34 @@ public class ManagementController : ControllerBase
 
         try
         {
-            // Create model config
-            var modelDir = Path.Combine(_modelManager.ModelsDirectory, request.Name);
-
-            Directory.CreateDirectory(modelDir);
-
+            // Download to cache directory
             var fileName = Path.GetFileName(new Uri(request.Url).LocalPath);
-            var modelPath = Path.Combine(modelDir, fileName);
+            var cachePath = Path.Combine(_modelManager.CacheDirectory, fileName);
+            
+            // Create cache directory if needed
+            Directory.CreateDirectory(_modelManager.CacheDirectory);
 
             // Download
-            Console.WriteLine($"Downloading {request.Name} from {request.Url}...");
+            Console.WriteLine($"Downloading {request.Name} from {request.Url} to cache...");
             using var client = new HttpClient();
             client.Timeout = TimeSpan.FromHours(2);
 
             using var response = await client.GetAsync(request.Url, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
-            using var fileStream = System.IO.File.Create(modelPath);
+            using var fileStream = System.IO.File.Create(cachePath);
             await response.Content.CopyToAsync(fileStream);
 
-            Console.WriteLine($"Downloaded {request.Name} to {modelPath}");
+            Console.WriteLine($"Downloaded {request.Name} to {cachePath}");
 
-            // Create model.json
+            // Create model config in models directory
+            var modelDir = Path.Combine(_modelManager.ModelsDirectory, request.Name);
+            Directory.CreateDirectory(modelDir);
+            
             var config = new ModelConfig
             {
                 Name = request.Name,
-                ModelPath = modelPath,
+                ModelPath = fileName, // Relative path - will be found in cache
                 Format = request.Format,
                 Description = $"Downloaded from {request.Url}"
             };
@@ -467,8 +484,9 @@ public class ManagementController : ControllerBase
             await System.IO.File.WriteAllTextAsync(configPath, json);
 
             return Ok(new { 
-                message = $"Model '{request.Name}' downloaded successfully",
-                path = modelPath
+                message = $"Model '{request.Name}' downloaded successfully to cache",
+                cache_path = cachePath,
+                config_path = configPath
             });
         }
         catch (Exception ex)
@@ -488,20 +506,23 @@ public class ManagementController : ControllerBase
             var process = System.Diagnostics.Process.GetCurrentProcess();
             var gcInfo = GC.GetGCMemoryInfo();
 
-            // Get available physical memory (Windows-specific)
+            // Get available physical memory (platform-specific)
             long availableMemory = 0;
             long totalMemory = 0;
             
             if (OperatingSystem.IsWindows())
             {
+                // Windows: Use WMI if available
                 try
                 {
+#pragma warning disable CA1416 // Platform-specific
                     var searcher = new System.Management.ManagementObjectSearcher("SELECT * FROM Win32_OperatingSystem");
                     foreach (System.Management.ManagementObject obj in searcher.Get())
                     {
                         availableMemory = Convert.ToInt64(obj["FreePhysicalMemory"]) * 1024;
                         totalMemory = Convert.ToInt64(obj["TotalVisibleMemorySize"]) * 1024;
                     }
+#pragma warning restore CA1416
                 }
                 catch
                 {
@@ -510,8 +531,36 @@ public class ManagementController : ControllerBase
                     availableMemory = totalMemory - gcInfo.MemoryLoadBytes;
                 }
             }
+            else if (OperatingSystem.IsLinux())
+            {
+                // Linux: Parse /proc/meminfo
+                try
+                {
+                    var memInfo = System.IO.File.ReadAllLines("/proc/meminfo");
+                    foreach (var line in memInfo)
+                    {
+                        if (line.StartsWith("MemTotal:"))
+                        {
+                            var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            totalMemory = long.Parse(parts[1]) * 1024; // Convert from KB to bytes
+                        }
+                        else if (line.StartsWith("MemAvailable:"))
+                        {
+                            var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            availableMemory = long.Parse(parts[1]) * 1024; // Convert from KB to bytes
+                        }
+                    }
+                }
+                catch
+                {
+                    // Fallback if /proc/meminfo is not readable
+                    totalMemory = gcInfo.TotalAvailableMemoryBytes;
+                    availableMemory = totalMemory - gcInfo.MemoryLoadBytes;
+                }
+            }
             else
             {
+                // Generic fallback for other platforms (macOS, etc.)
                 totalMemory = gcInfo.TotalAvailableMemoryBytes;
                 availableMemory = totalMemory - gcInfo.MemoryLoadBytes;
             }
@@ -656,4 +705,573 @@ public class ManagementController : ControllerBase
             return StatusCode(500, new { error = $"Failed to get server status: {ex.Message}" });
         }
     }
+
+    /// <summary>
+    /// Get model configuration schema
+    /// </summary>
+    [HttpGet("configs/schema")]
+    public IActionResult GetConfigSchema()
+    {
+        try
+        {
+            var schemaPath = Path.Combine("data", "model.schema.json");
+            if (!System.IO.File.Exists(schemaPath))
+                return NotFound(new { error = "Schema file not found" });
+
+            var schema = System.IO.File.ReadAllText(schemaPath);
+            return Content(schema, "application/json");
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get schema: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get model configuration example
+    /// </summary>
+    [HttpGet("configs/example")]
+    public IActionResult GetConfigExample()
+    {
+        try
+        {
+            var examplePath = Path.Combine("data", "model.example.json");
+            if (!System.IO.File.Exists(examplePath))
+                return NotFound(new { error = "Example file not found" });
+
+            var example = System.IO.File.ReadAllText(examplePath);
+            return Content(example, "application/json");
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get example: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get specific model config
+    /// </summary>
+    [HttpGet("configs/{name}")]
+    public IActionResult GetConfig(string name)
+    {
+        try
+        {
+            var config = _modelManager.GetModelConfig(name);
+            if (config == null)
+                return NotFound(new { error = $"Config '{name}' not found" });
+
+            return Ok(config);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get config: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Update existing model config
+    /// </summary>
+    [HttpPut("configs/{name}")]
+    public async Task<IActionResult> UpdateConfig(string name, [FromBody] ModelConfig config)
+    {
+        if (string.IsNullOrEmpty(config.Name) || config.Name != name)
+            return BadRequest(new { error = "Config name mismatch" });
+
+        try
+        {
+            var modelDir = Path.Combine(_modelManager.ModelsDirectory, config.Name);
+            Directory.CreateDirectory(modelDir);
+
+            var configPath = Path.Combine(modelDir, "model.json");
+            var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            await System.IO.File.WriteAllTextAsync(configPath, json);
+
+            _modelManager.RegisterOrUpdateConfig(config);
+
+            return Ok(new { message = $"Model config '{config.Name}' updated successfully" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to update config: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Start downloading a model
+    /// </summary>
+    [HttpPost("downloads")]
+    public IActionResult StartDownload([FromBody] StartDownloadRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.Url))
+                return BadRequest(new { error = "URL is required" });
+
+            var downloadId = _downloadManager.StartDownload(request.Url, request.Filename);
+            return Ok(new { download_id = downloadId, message = "Download started" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to start download: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get all downloads
+    /// </summary>
+    [HttpGet("downloads")]
+    public IActionResult GetDownloads()
+    {
+        try
+        {
+            var downloads = _downloadManager.GetAllDownloads();
+            var response = downloads.Select(d => new
+            {
+                id = d.Id,
+                url = d.Url,
+                filename = d.Filename,
+                status = d.Status.ToString().ToLower(),
+                total_bytes = d.TotalBytes,
+                downloaded_bytes = d.DownloadedBytes,
+                progress = Math.Round(d.Progress, 2),
+                error = d.Error,
+                start_time = d.StartTime,
+                end_time = d.EndTime
+            });
+
+            return Ok(response);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get downloads: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get specific download status
+    /// </summary>
+    [HttpGet("downloads/{downloadId}")]
+    public IActionResult GetDownload(string downloadId)
+    {
+        try
+        {
+            var download = _downloadManager.GetDownload(downloadId);
+            if (download == null)
+                return NotFound(new { error = "Download not found" });
+
+            return Ok(new
+            {
+                id = download.Id,
+                url = download.Url,
+                filename = download.Filename,
+                status = download.Status.ToString().ToLower(),
+                total_bytes = download.TotalBytes,
+                downloaded_bytes = download.DownloadedBytes,
+                progress = Math.Round(download.Progress, 2),
+                error = download.Error,
+                start_time = download.StartTime,
+                end_time = download.EndTime
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get download: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Cancel a download
+    /// </summary>
+    [HttpDelete("downloads/{downloadId}")]
+    public IActionResult CancelDownload(string downloadId)
+    {
+        try
+        {
+            var success = _downloadManager.CancelDownload(downloadId);
+            if (!success)
+                return NotFound(new { error = "Download not found" });
+
+            return Ok(new { message = "Download cancelled" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to cancel download: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Clean up completed/failed downloads
+    /// </summary>
+    [HttpPost("downloads/cleanup")]
+    public IActionResult CleanupDownloads()
+    {
+        try
+        {
+            _downloadManager.CleanupCompleted();
+            return Ok(new { message = "Cleanup completed" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to cleanup downloads: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get all authentication tokens
+    /// </summary>
+    [HttpGet("tokens")]
+    public IActionResult GetTokens()
+    {
+        try
+        {
+            var tokensPath = Path.Combine("data", "config", "tokens.txt");
+            if (!System.IO.File.Exists(tokensPath))
+                return Ok(new { tokens = Array.Empty<object>() });
+
+            var lines = System.IO.File.ReadAllLines(tokensPath);
+            var tokens = new List<object>();
+
+            foreach (var line in lines)
+            {
+                var trimmed = line.Trim();
+                if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith("#"))
+                    continue;
+
+                try
+                {
+                    var entry = Middleware.TokenEntry.Parse(trimmed);
+                    tokens.Add(new
+                    {
+                        token = entry.Token,
+                        access_level = entry.AccessLevel.ToString().ToLower()
+                    });
+                }
+                catch
+                {
+                    // Skip invalid lines
+                }
+            }
+
+            return Ok(new { tokens });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get tokens: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Add a new token
+    /// </summary>
+    [HttpPost("tokens")]
+    public async Task<IActionResult> AddToken([FromBody] AddTokenRequest request)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(request.Token))
+                return BadRequest(new { error = "Token is required" });
+
+            var tokensPath = Path.Combine("data", "config", "tokens.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(tokensPath)!);
+
+            // Parse access level
+            var accessLevel = request.AccessLevel?.ToUpperInvariant() switch
+            {
+                "A" or "ALL" => Middleware.TokenAccessLevel.All,
+                "M" or "MANAGE" => Middleware.TokenAccessLevel.Manage,
+                "U" or "USER" => Middleware.TokenAccessLevel.User,
+                _ => Middleware.TokenAccessLevel.User
+            };
+
+            var entry = new Middleware.TokenEntry
+            {
+                Token = request.Token.Trim(),
+                AccessLevel = accessLevel
+            };
+
+            // Check if token already exists
+            if (System.IO.File.Exists(tokensPath))
+            {
+                var existingLines = await System.IO.File.ReadAllLinesAsync(tokensPath);
+                foreach (var line in existingLines)
+                {
+                    if (line.Contains(entry.Token))
+                        return BadRequest(new { error = "Token already exists" });
+                }
+            }
+
+            // Append token
+            await System.IO.File.AppendAllTextAsync(tokensPath, $"{entry}\n");
+
+            return Ok(new { message = "Token added successfully", token = entry.Token, access_level = entry.AccessLevel.ToString().ToLower() });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to add token: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Delete a token
+    /// </summary>
+    [HttpDelete("tokens/{token}")]
+    public async Task<IActionResult> DeleteToken(string token)
+    {
+        try
+        {
+            var tokensPath = Path.Combine("data", "config", "tokens.txt");
+            if (!System.IO.File.Exists(tokensPath))
+                return NotFound(new { error = "Tokens file not found" });
+
+            var lines = await System.IO.File.ReadAllLinesAsync(tokensPath);
+            var newLines = new List<string>();
+            var found = false;
+
+            foreach (var line in lines)
+            {
+                if (line.Contains(token))
+                {
+                    found = true;
+                    continue; // Skip this line
+                }
+                newLines.Add(line);
+            }
+
+            if (!found)
+                return NotFound(new { error = "Token not found" });
+
+            await System.IO.File.WriteAllLinesAsync(tokensPath, newLines);
+
+            return Ok(new { message = "Token deleted successfully" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to delete token: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Update token access level
+    /// </summary>
+    [HttpPut("tokens/{token}")]
+    public async Task<IActionResult> UpdateToken(string token, [FromBody] UpdateTokenRequest request)
+    {
+        try
+        {
+            var tokensPath = Path.Combine("data", "config", "tokens.txt");
+            if (!System.IO.File.Exists(tokensPath))
+                return NotFound(new { error = "Tokens file not found" });
+
+            var accessLevel = request.AccessLevel?.ToUpperInvariant() switch
+            {
+                "A" or "ALL" => Middleware.TokenAccessLevel.All,
+                "M" or "MANAGE" => Middleware.TokenAccessLevel.Manage,
+                "U" or "USER" => Middleware.TokenAccessLevel.User,
+                _ => Middleware.TokenAccessLevel.User
+            };
+
+            var lines = await System.IO.File.ReadAllLinesAsync(tokensPath);
+            var newLines = new List<string>();
+            var found = false;
+
+            foreach (var line in lines)
+            {
+                if (line.Contains(token))
+                {
+                    found = true;
+                    var entry = new Middleware.TokenEntry { Token = token, AccessLevel = accessLevel };
+                    newLines.Add(entry.ToString());
+                }
+                else
+                {
+                    newLines.Add(line);
+                }
+            }
+
+            if (!found)
+                return NotFound(new { error = "Token not found" });
+
+            await System.IO.File.WriteAllLinesAsync(tokensPath, newLines);
+
+            return Ok(new { message = "Token updated successfully" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to update token: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get server configuration
+    /// </summary>
+    [HttpGet("server-config")]
+    public IActionResult GetServerConfig()
+    {
+        try
+        {
+            var configPath = Path.Combine(AppContext.BaseDirectory, "data", "config", "server.config.json");
+            if (!System.IO.File.Exists(configPath))
+            {
+                // Create default config if it doesn't exist
+                Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
+                var defaultConfig = new
+                {
+                    models_directory = "./data/models",
+                    cache_directory = "./data/cache",
+                    host = "localhost",
+                    port = 11434,
+                    compute_provider = "vulkan",
+                    auto_unload_minutes = 30,
+                    manage_token = "",
+                    tokens_file = "./data/config/tokens.txt"
+                };
+                var configJson = JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true });
+                System.IO.File.WriteAllText(configPath, configJson);
+                return Content(configJson, "application/json");
+            }
+
+            var existingConfig = System.IO.File.ReadAllText(configPath);
+            return Content(existingConfig, "application/json");
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get server config: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Update server configuration
+    /// </summary>
+    [HttpPut("server-config")]
+    public async Task<IActionResult> UpdateServerConfig([FromBody] JsonElement config)
+    {
+        try
+        {
+            var configPath = Path.Combine(AppContext.BaseDirectory, "data", "config", "server.config.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
+
+            // Validate JSON structure
+            var configJson = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            await System.IO.File.WriteAllTextAsync(configPath, configJson);
+
+            return Ok(new { message = "Server config updated successfully. Restart server to apply changes." });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to update server config: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Load a model from config (auto-load if not already loaded)
+    /// </summary>
+    [HttpPost("models/{name}/load")]
+    public async Task<IActionResult> LoadModel(string name)
+    {
+        try
+        {
+            // Check if model is already loaded
+            var loadedModels = _modelManager.GetLoadedModels();
+            if (loadedModels.ContainsKey(name))
+            {
+                return Ok(new { message = "Model already loaded", name });
+            }
+
+            // Try to load the model
+            var model = await _modelManager.GetModelAsync(name);
+            
+            return Ok(new { message = "Model loaded successfully", name });
+        }
+        catch (FileNotFoundException ex)
+        {
+            return NotFound(new { error = $"Model config not found: {ex.Message}" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to load model: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Initialize model from config (download if needed)
+    /// </summary>
+    [HttpPost("configs/{name}/initialize")]
+    public async Task<IActionResult> InitializeModel(string name)
+    {
+        try
+        {
+            // Build absolute path to config file
+            var configPath = Path.IsPathRooted(_modelManager.ModelsDirectory)
+                ? Path.Combine(_modelManager.ModelsDirectory, $"{name}.json")
+                : Path.Combine(AppContext.BaseDirectory, _modelManager.ModelsDirectory, $"{name}.json");
+            
+            if (!System.IO.File.Exists(configPath))
+            {
+                return NotFound(new { error = $"Config not found: {configPath}" });
+            }
+
+            var configJson = await System.IO.File.ReadAllTextAsync(configPath);
+            var config = JsonSerializer.Deserialize<ModelConfig>(configJson);
+
+            if (config == null)
+                return BadRequest(new { error = "Invalid config format" });
+
+            if (string.IsNullOrEmpty(config.ModelPath))
+                return BadRequest(new { error = "Config has no model path specified" });
+
+            // Check if model file exists
+            var modelPath = Path.IsPathRooted(config.ModelPath)
+                ? config.ModelPath
+                : Path.IsPathRooted(_modelManager.CacheDirectory)
+                    ? Path.Combine(_modelManager.CacheDirectory, config.ModelPath)
+                    : Path.Combine(AppContext.BaseDirectory, _modelManager.CacheDirectory, config.ModelPath);
+
+            if (System.IO.File.Exists(modelPath))
+                return Ok(new { message = "Model file already exists", path = modelPath });
+
+            // If model starts with http, start download
+            if (config.ModelPath.StartsWith("http://") || config.ModelPath.StartsWith("https://"))
+            {
+                var filename = Path.GetFileName(new Uri(config.ModelPath).LocalPath);
+                var downloadId = _downloadManager.StartDownload(config.ModelPath, filename);
+                
+                return Ok(new 
+                { 
+                    message = "Download started", 
+                    download_id = downloadId,
+                    filename = filename
+                });
+            }
+
+            return BadRequest(new { error = $"Model path is not a URL and file does not exist. Expected path: {modelPath}" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to initialize model: {ex.Message}" });
+        }
+    }
+}
+
+public class AddTokenRequest
+{
+    [JsonPropertyName("token")]
+    public string Token { get; set; } = "";
+
+    [JsonPropertyName("access_level")]
+    public string AccessLevel { get; set; } = "U";
+}
+
+public class UpdateTokenRequest
+{
+    [JsonPropertyName("access_level")]
+    public string AccessLevel { get; set; } = "U";
+}
+
+public class StartDownloadRequest
+{
+    [JsonPropertyName("url")]
+    public string Url { get; set; } = "";
+
+    [JsonPropertyName("filename")]
+    public string? Filename { get; set; }
 }

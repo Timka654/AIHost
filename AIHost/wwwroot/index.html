@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AIHost Management</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.css">
     <style>
         * {
             margin: 0;
@@ -569,6 +570,36 @@
             white-space: pre-wrap;
             word-wrap: break-word;
         }
+
+        /* Monaco Editor styles */
+        .monaco-editor-container {
+            border: 2px solid #e9ecef;
+            border-radius: 5px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+
+        .config-editor-wrapper {
+            background: white;
+            padding: 20px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+
+        .editor-toolbar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+
+        .editor-toolbar input {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #e9ecef;
+            border-radius: 5px;
+            font-size: 14px;
+        }
     </style>
 </head>
 <body>
@@ -582,7 +613,10 @@
                 <button onclick="showSection('performance')" id="btn-performance">Performance</button>
                 <button onclick="showSection('logs')" id="btn-logs">Logs</button>
                 <button onclick="showSection('configs')" id="btn-configs">Configs</button>
+                <button onclick="showSection('server')" id="btn-server">Server</button>
+                <button onclick="showSection('tokens')" id="btn-tokens">Tokens</button>
                 <button onclick="showSection('cache')" id="btn-cache">Cache</button>
+                <button onclick="showSection('downloads')" id="btn-downloads">Downloads</button>
                 <button onclick="showSection('chat')" id="btn-chat">Chat</button>
             </div>
         </header>
@@ -701,58 +735,41 @@
             <div id="section-configs" class="section">
                 <div class="section-header">
                     <h2>Model Configs</h2>
-                    <button class="btn btn-secondary" onclick="showCreateConfig()">+ Create New</button>
+                    <button class="btn btn-secondary" onclick="showConfigForm()">+ Create New</button>
                 </div>
                 <div id="configs-container"></div>
-                <div id="create-config-form" class="config-item" style="display: none;">
-                    <h3>Create Model Config</h3>
-                    <form onsubmit="createConfig(event)">
-                        <div class="form-group">
-                            <label>Model Name:</label>
-                            <input type="text" id="config-name" placeholder="my-model" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Model Path:</label>
-                            <input type="text" id="config-model-path" placeholder="./data/models/my-model/model.gguf" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Format:</label>
-                            <input type="text" id="config-format" value="gguf" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Description:</label>
-                            <input type="text" id="config-description" placeholder="My model description">
-                        </div>
-                        <div class="form-group">
-                            <label>Temperature (0.0-2.0):</label>
-                            <input type="number" id="config-temperature" value="0.7" step="0.1" min="0" max="2">
-                        </div>
-                        <div class="form-group">
-                            <label>Top K:</label>
-                            <input type="number" id="config-top-k" value="40" min="1">
-                        </div>
-                        <div class="form-group">
-                            <label>Top P:</label>
-                            <input type="number" id="config-top-p" value="0.9" step="0.1" min="0" max="1">
-                        </div>
-                        <div class="form-group">
-                            <label>Max Tokens:</label>
-                            <input type="number" id="config-max-tokens" value="512" min="1">
-                        </div>
-                        <div class="form-group">
-                            <label>Management Token (optional):</label>
-                            <input type="password" id="manage-token" placeholder="Enter token if required">
-                        </div>
-                        <button type="submit" class="btn btn-success">Create Config</button>
-                        <button type="button" class="btn btn-secondary" onclick="showConfigs()">Cancel</button>
-                    </form>
+            </div>
+
+            <!-- Server Settings Section -->
+            <div id="section-server" class="section">
+                <div class="section-header">
+                    <h2>Server Configuration</h2>
                 </div>
+                <div id="server-container"></div>
+            </div>
+
+            <!-- Tokens Section -->
+            <div id="section-tokens" class="section">
+                <div class="section-header">
+                    <h2>Authentication Tokens</h2>
+                    <button class="btn btn-secondary" onclick="showAddTokenForm()">+ Add Token</button>
+                </div>
+                <div id="tokens-container"></div>
             </div>
 
             <!-- Cache Section -->
             <div id="section-cache" class="section">
                 <h2>Cache Directory</h2>
                 <div id="cache-container"></div>
+            </div>
+
+            <!-- Downloads Section -->
+            <div id="section-downloads" class="section">
+                <div class="section-header">
+                    <h2>Model Downloads</h2>
+                    <button class="btn btn-secondary" onclick="showDownloadForm()">+ Start Download</button>
+                </div>
+                <div id="downloads-container"></div>
             </div>
 
             <!-- Chat Section -->
@@ -787,6 +804,29 @@
 
     <button class="refresh-btn" onclick="refreshData()" title="Refresh Data">🔄</button>
 
+    <script>var require = { paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } };</script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.nls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/editor/editor.main.js"></script>
     <script src="app.js"></script>
+    <script>
+        // Initialize navigation from URL hash
+        window.addEventListener('DOMContentLoaded', () => {
+            const hash = window.location.hash.slice(1); // Remove '#' prefix
+            if (hash) {
+                showSection(hash);
+            } else {
+                showSection('dashboard');
+            }
+        });
+
+        // Handle hash changes (browser back/forward)
+        window.addEventListener('hashchange', () => {
+            const hash = window.location.hash.slice(1);
+            if (hash) {
+                showSection(hash);
+            }
+        });
+    </script>
 </body>
 </html>

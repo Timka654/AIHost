@@ -15,6 +15,72 @@ if (args.Contains("--manual"))
     return;
 }
 
+// Initialize data directory from templates if needed
+{
+    var dataDir = Path.Combine(AppContext.BaseDirectory, "data");
+    var dataInitDir = Path.Combine(AppContext.BaseDirectory, "data_init");
+
+    // If data_init doesn't exist, skip initialization
+    if (Directory.Exists(dataInitDir))
+    {
+        // Create data directory if it doesn't exist
+        Directory.CreateDirectory(dataDir);
+
+        // Check if data directory is empty or has no essential files
+        var needsInitialization = !File.Exists(Path.Combine(dataDir, "model.schema.json")) ||
+                                  !File.Exists(Path.Combine(dataDir, "model.example.json")) ||
+                                  !Directory.Exists(Path.Combine(dataDir, "config"));
+
+        if (needsInitialization)
+        {
+            Console.WriteLine("📦 Initializing data directory from templates...");
+
+            // Copy schema and example
+            var schemaSource = Path.Combine(dataInitDir, "model.schema.json");
+            var schemaTarget = Path.Combine(dataDir, "model.schema.json");
+            if (File.Exists(schemaSource) && !File.Exists(schemaTarget))
+            {
+                File.Copy(schemaSource, schemaTarget);
+                Console.WriteLine($"  ✓ Copied model.schema.json");
+            }
+
+            var exampleSource = Path.Combine(dataInitDir, "model.example.json");
+            var exampleTarget = Path.Combine(dataDir, "model.example.json");
+            if (File.Exists(exampleSource) && !File.Exists(exampleTarget))
+            {
+                File.Copy(exampleSource, exampleTarget);
+                Console.WriteLine($"  ✓ Copied model.example.json");
+            }
+
+            // Copy config directory
+            var configSourceDir = Path.Combine(dataInitDir, "config");
+            var configTargetDir = Path.Combine(dataDir, "config");
+            if (Directory.Exists(configSourceDir))
+            {
+                Directory.CreateDirectory(configTargetDir);
+                
+                foreach (var file in Directory.GetFiles(configSourceDir))
+                {
+                    var filename = Path.GetFileName(file);
+                    var targetFile = Path.Combine(configTargetDir, filename);
+                    if (!File.Exists(targetFile))
+                    {
+                        File.Copy(file, targetFile);
+                        Console.WriteLine($"  ✓ Copied config/{filename}");
+                    }
+                }
+            }
+
+            // Create other necessary subdirectories
+            Directory.CreateDirectory(Path.Combine(dataDir, "models"));
+            Directory.CreateDirectory(Path.Combine(dataDir, "cache"));
+            Directory.CreateDirectory(Path.Combine(dataDir, "logs"));
+
+            Console.WriteLine("✓ Data directory initialized successfully");
+        }
+    }
+}
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Locate server.json — prefer data/config, fall back to config/ for backward compat.
@@ -115,9 +181,15 @@ Console.WriteLine($"✓ Request logger initialized (persistent: {serverConfig.Pe
 builder.Services.AddSingleton(sp =>
     new ModelManager(
         serverConfig.ModelsDirectory,
+        serverConfig.CacheDirectory,
         computeDevice,
         sp.GetRequiredService<ILogger<ModelManager>>()));
 builder.Services.AddSingleton(serverConfig);
+
+// Initialize download manager
+builder.Services.AddSingleton(sp =>
+    new DownloadManager(serverConfig.CacheDirectory));
+
 // Register the global compute device so future services can receive it via DI.
 // Note: disposed manually at shutdown — DI doesn't own singleton instances registered this way.
 builder.Services.AddSingleton<IComputeDevice>(computeDevice);
@@ -251,14 +323,17 @@ static void EnsureDirectoryStructure(ServerConfig config)
 
         if (!File.Exists(tokensPath))
     {
-        var tokensTemplate = @"# API Authentication Tokens
-# Add one token per line. Lines starting with # are comments.
-# Example tokens (replace with your own!):
-# your-secret-token-here
-# another-token-12345
-
-# Uncomment the line below to enable authentication:
-# my-secret-api-token
+        var tokensTemplate = @"# Authentication Tokens Configuration
+# Format: <Modifier>:<Token>
+# Modifiers:
+#   A - All access (full access to everything)
+#   M - Manage access (can use /manage endpoints)
+#   U - User access (can use API endpoints, not /manage)
+#
+# Example tokens (uncomment to enable):
+# A:admin-full-access-token-123456
+# M:manager-token-789012
+# U:user-api-token-345678
 ";
         File.WriteAllText(tokensPath, tokensTemplate);
         Console.WriteLine($"✓ Created template tokens file: {tokensPath}");

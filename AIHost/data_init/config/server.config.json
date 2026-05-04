@@ -1,0 +1,19 @@
+{
+  "models_directory": "./data/models",
+  "cache_directory": "./data/cache",
+  "logs_directory": "./data/logs",
+  "host": "localhost",
+  "port": 11434,
+  "enable_openai_api": true,
+  "enable_ollama_api": true,
+  "compute_provider": "vulkan",
+  "device_index": 0,
+  "enable_cors": true,
+  "log_level": "info",
+  "manage_token": null,
+  "tokens_file": null,
+  "persistent_logs": true,
+  "max_log_files": 10,
+  "auto_unload_minutes": 30,
+  "rate_limit_requests_per_minute": 60
+}

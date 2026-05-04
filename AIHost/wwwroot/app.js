@@ -4,6 +4,10 @@ const API_BASE = window.location.origin;
 // Current section
 let currentSection = 'dashboard';
 
+// Monaco Editor instance
+let monacoEditor = null;
+let currentConfigSchema = null;
+
 // Show section
 function showSection(section) {
     // Hide all sections
@@ -15,6 +19,9 @@ function showSection(section) {
     document.getElementById(`btn-${section}`).classList.add('active');
 
     currentSection = section;
+
+    // Update URL hash
+    window.location.hash = section;
 
     // Load data for section
     if (section === 'dashboard') {
@@ -29,8 +36,14 @@ function showSection(section) {
         loadLogs();
     } else if (section === 'configs') {
         loadConfigs();
+    } else if (section === 'server') {
+        loadServerConfig();
+    } else if (section === 'tokens') {
+        loadTokens();
     } else if (section === 'cache') {
         loadCacheInfo();
+    } else if (section === 'downloads') {
+        loadDownloads();
     } else if (section === 'chat') {
         loadChatModels();
     }
@@ -157,6 +170,8 @@ function renderConfigs(configs) {
             <div class="config-item-header">
                 <div class="config-item-name">${escapeHtml(name)}</div>
                 <div class="config-item-actions">
+                    <button class="btn btn-secondary" onclick="initializeModel('${escapeHtml(name)}')">⬇️ Initialize</button>
+                    <button class="btn btn-secondary" onclick="editConfig('${escapeHtml(name)}')">✏️ Edit</button>
                     <button class="btn btn-secondary" onclick="deleteConfig('${escapeHtml(name)}')">🗑️ Delete</button>
                 </div>
             </div>
@@ -167,7 +182,7 @@ function renderConfigs(configs) {
                 </div>
                 <div class="config-stat">
                     <div class="config-stat-label">Path</div>
-                    <div class="config-stat-value" style="font-size: 11px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(config.model_path || 'N/A')}</div>
+                    <div class="config-stat-value" style="font-size: 11px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(config.model || config.model_path || 'N/A')}</div>
                 </div>
                 <div class="config-stat">
                     <div class="config-stat-label">Description</div>
@@ -238,7 +253,8 @@ function renderCacheInfo(info) {
 // Load chat models
 async function loadChatModels() {
     try {
-        const response = await fetch(`${API_BASE}/manage/models`, {
+        // Load available configs instead of loaded models
+        const response = await fetch(`${API_BASE}/manage/configs`, {
             headers: getAuthHeaders()
         });
 
@@ -246,14 +262,14 @@ async function loadChatModels() {
             throw new Error(`HTTP ${response.status}`);
         }
 
-        const models = await response.json();
-        renderChatModels(models);
+        const configs = await response.json();
+        renderChatModels(configs);
     } catch (error) {
         console.error('Failed to load chat models:', error);
         document.getElementById('chat-models-container').innerHTML = `
             <div class="empty-state">
                 <div>❌</div>
-                <p>Failed to load models</p>
+                <p>Failed to load model configs</p>
                 <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
             </div>
         `;
@@ -261,26 +277,30 @@ async function loadChatModels() {
 }
 
 // Render chat models
-function renderChatModels(models) {
+function renderChatModels(configs) {
     const container = document.getElementById('chat-models-container');
 
-    if (models.length === 0) {
+    if (Object.keys(configs).length === 0) {
         container.innerHTML = `
             <div class="empty-state">
-                <div>📦</div>
-                <p>No models loaded</p>
-                <p style="font-size: 12px;">Load a model first to start chatting</p>
+                <div>📋</div>
+                <p>No model configs found</p>
+                <p style="font-size: 12px;">Create a model config in the Configs section first</p>
+                <button class="btn btn-secondary" onclick="showSection('configs')" style="margin-top: 10px;">Go to Configs</button>
             </div>
         `;
         return;
     }
 
+    const configNames = Object.keys(configs);
+
     container.innerHTML = `
         <div class="form-group">
             <label>Select Model:</label>
             <select id="chat-model-select" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
-                ${models.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('')}
+                ${configNames.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}
             </select>
+            <small style="color: #6c757d;">Model will be auto-loaded on first message if not already loaded</small>
         </div>
         <div class="form-group">
             <label>System Message (optional):</label>
@@ -439,46 +459,158 @@ async function downloadModel(event) {
     }
 }
 
-// Create config
-async function createConfig(event) {
-    event.preventDefault();
+// Edit config
+async function editConfig(name) {
+    try {
+        // Fetch current config
+        const response = await fetch(`${API_BASE}/manage/configs/${encodeURIComponent(name)}`, {
+            headers: getAuthHeaders()
+        });
 
-    const name = document.getElementById('config-name').value;
-    const modelPath = document.getElementById('config-model-path').value;
-    const format = document.getElementById('config-format').value;
-    const description = document.getElementById('config-description').value;
-    const temperature = parseFloat(document.getElementById('config-temperature').value) || 0.7;
-    const topK = parseInt(document.getElementById('config-top-k').value) || 40;
-    const topP = parseFloat(document.getElementById('config-top-p').value) || 0.9;
-    const maxTokens = parseInt(document.getElementById('config-max-tokens').value) || 512;
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
 
-    if (!confirm(`Create model config "${name}"?`)) return;
+        const config = await response.json();
+        
+        // Show form with pre-filled data
+        showConfigForm(config, true);
+    } catch (error) {
+        alert(`Failed to load config: ${error.message}`);
+    }
+}
 
-    const submitBtn = event.target.querySelector('.btn-submit');
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Creating...';
+// Show config form with Monaco Editor
+async function showConfigForm(config = null, isEdit = false) {
+    const container = document.getElementById('configs-container');
+    const title = isEdit ? 'Edit Model Config' : 'Create Model Config';
+    const submitText = isEdit ? 'Update Config' : 'Create Config';
+    const originalName = config?.name || '';
+    
+    // Load schema if not already loaded
+    if (!currentConfigSchema) {
+        try {
+            const response = await fetch(`${API_BASE}/manage/configs/schema`, {
+                headers: getAuthHeaders()
+            });
+            currentConfigSchema = await response.json();
+        } catch (error) {
+            console.error('Failed to load schema:', error);
+        }
+    }
+
+    // Prepare initial config
+    const initialConfig = config || {
+        name: '',
+        model: '',
+        format: 'gguf',
+        description: '',
+        parameters: {
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.9,
+            max_tokens: 512
+        }
+    };
+
+    // Remove $schema from display
+    const { $schema, ...displayConfig } = initialConfig;
+
+    container.innerHTML = `
+        <div class="config-editor-wrapper">
+            <h3>${title}</h3>
+            <div class="editor-toolbar">
+                <div style="flex: 1;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold;">Config Name: *</label>
+                    <input type="text" id="config-name-input" placeholder="my-model" value="${escapeHtml(originalName)}" ${isEdit ? 'readonly' : ''} required>
+                </div>
+                <div style="margin-top: auto;">
+                    <button class="btn btn-success" onclick="saveConfigFromEditor(${isEdit}, '${escapeHtml(originalName)}')">${submitText}</button>
+                    <button class="btn btn-secondary" onclick="loadConfigs()">Cancel</button>
+                </div>
+            </div>
+            <div id="monaco-editor-container" class="monaco-editor-container" style="height: 500px;"></div>
+        </div>
+    `;
+
+    // Initialize Monaco Editor
+    setTimeout(() => {
+        require(['vs/editor/editor.main'], function() {
+            // Dispose previous editor if exists
+            if (monacoEditor) {
+                monacoEditor.dispose();
+            }
+
+            // Register JSON schema
+            if (currentConfigSchema) {
+                monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+                    validate: true,
+                    schemas: [{
+                        uri: 'http://aihost/model-config-schema.json',
+                        fileMatch: ['*'],
+                        schema: currentConfigSchema
+                    }]
+                });
+            }
+
+            // Create editor
+            monacoEditor = monaco.editor.create(document.getElementById('monaco-editor-container'), {
+                value: JSON.stringify(displayConfig, null, 2),
+                language: 'json',
+                theme: 'vs',
+                automaticLayout: true,
+                minimap: { enabled: false },
+                scrollBeyondLastLine: false,
+                formatOnPaste: true,
+                formatOnType: true
+            });
+        });
+    }, 100);
+}
+
+// Save config from Monaco Editor
+async function saveConfigFromEditor(isEdit, originalName) {
+    const configName = document.getElementById('config-name-input').value.trim();
+    
+    if (!configName) {
+        alert('Please enter a config name');
+        return;
+    }
+
+    if (!monacoEditor) {
+        alert('Editor not initialized');
+        return;
+    }
+
+    // Get editor content
+    let configData;
+    try {
+        configData = JSON.parse(monacoEditor.getValue());
+    } catch (error) {
+        alert(`Invalid JSON: ${error.message}`);
+        return;
+    }
+
+    // Set name from input
+    configData.name = configName;
+
+    // Confirm action
+    if (!confirm(`${isEdit ? 'Update' : 'Create'} config "${configName}"?`)) {
+        return;
+    }
 
     try {
-        const config = {
-            name: name,
-            model_path: modelPath,
-            format: format,
-            description: description,
-            parameters: {
-                temperature: temperature,
-                top_k: topK,
-                top_p: topP,
-                max_tokens: maxTokens
-            }
-        };
-
-        const response = await fetch(`${API_BASE}/manage/configs`, {
-            method: 'POST',
+        const url = isEdit 
+            ? `${API_BASE}/manage/configs/${encodeURIComponent(originalName)}`
+            : `${API_BASE}/manage/configs`;
+        
+        const response = await fetch(url, {
+            method: isEdit ? 'PUT' : 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 ...getAuthHeaders()
             },
-            body: JSON.stringify(config)
+            body: JSON.stringify(configData)
         });
 
         if (!response.ok) {
@@ -486,13 +618,10 @@ async function createConfig(event) {
             throw new Error(error.error || `HTTP ${response.status}`);
         }
 
-        alert(`Config "${name}" created successfully`);
+        alert(`Config "${configName}" ${isEdit ? 'updated' : 'created'} successfully`);
         loadConfigs();
     } catch (error) {
-        alert(`Failed to create config: ${error.message}`);
-    } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Create Config';
+        alert(`Failed to ${isEdit ? 'update' : 'create'} config: ${error.message}`);
     }
 }
 
@@ -541,20 +670,28 @@ async function clearCache() {
 
 // Send chat message
 async function sendChatMessage() {
-    const modelName = document.getElementById('chat-model-select').value;
-    const systemMessage = document.getElementById('chat-system-message').value;
-    const message = document.getElementById('chat-message').value;
-    const temperature = parseFloat(document.getElementById('chat-temperature').value) || 0.7;
-    const maxTokens = parseInt(document.getElementById('chat-max-tokens').value) || 512;
+    const modelName = document.getElementById('chat-model-select')?.value;
+    const systemMessage = document.getElementById('chat-system-message')?.value;
+    const message = document.getElementById('chat-message')?.value;
+    const temperature = parseFloat(document.getElementById('chat-temperature')?.value) || 0.7;
+    const maxTokens = parseInt(document.getElementById('chat-max-tokens')?.value) || 512;
 
-    if (!message.trim()) {
+    if (!modelName) {
+        alert('Please select a model config first.');
+        return;
+    }
+
+    if (!message || !message.trim()) {
         alert('Please enter a message');
         return;
     }
 
-    const submitBtn = document.querySelector('#chat-form button');
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Sending...';
+    // Find the send button
+    const submitBtn = document.querySelector('.btn-success[onclick="sendChatMessage()"]');
+    if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = '⏳ Loading model & sending...';
+    }
 
     try {
         const response = await fetch(`${API_BASE}/manage/chat`, {
@@ -578,13 +715,52 @@ async function sendChatMessage() {
         }
 
         const result = await response.json();
-        alert(`Response:\n\n${result.response}`);
+        
+        // Display result in a nicer format
+        displayChatResponse(message, result);
+        
+        // Clear message input
+        const messageInput = document.getElementById('chat-message');
+        if (messageInput) messageInput.value = '';
     } catch (error) {
         alert(`Chat failed: ${error.message}`);
     } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = '💬 Send Message';
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = '💬 Send Message';
+        }
     }
+}
+
+// Display chat response
+function displayChatResponse(userMessage, result) {
+    const container = document.getElementById('chat-models-container');
+    const existingMessages = document.getElementById('chat-messages');
+    
+    // Create messages container if it doesn't exist
+    if (!existingMessages) {
+        const messagesHtml = `
+            <div id="chat-messages" style="margin-top: 20px; padding: 15px; background: white; border: 2px solid #e9ecef; border-radius: 5px; max-height: 400px; overflow-y: auto;">
+                <h4>Conversation</h4>
+            </div>
+        `;
+        container.insertAdjacentHTML('beforeend', messagesHtml);
+    }
+    
+    const messages = document.getElementById('chat-messages');
+    const messageHtml = `
+        <div class="chat-message user" style="margin: 10px 0; padding: 10px; background: #f0f0f0; border-left: 3px solid #6c757d; border-radius: 5px;">
+            <div style="font-weight: bold; font-size: 12px; margin-bottom: 5px; color: #6c757d;">USER</div>
+            <div style="font-size: 14px; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(userMessage)}</div>
+        </div>
+        <div class="chat-message assistant" style="margin: 10px 0; padding: 10px; background: #e7f3ff; border-left: 3px solid #28a745; border-radius: 5px;">
+            <div style="font-weight: bold; font-size: 12px; margin-bottom: 5px; color: #28a745;">ASSISTANT (${escapeHtml(result.model)})</div>
+            <div style="font-size: 14px; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(result.response)}</div>
+            <div style="font-size: 11px; color: #6c757d; margin-top: 5px;">Tokens: ${result.tokens || 'N/A'}</div>
+        </div>
+    `;
+    messages.insertAdjacentHTML('beforeend', messageHtml);
+    messages.scrollTop = messages.scrollHeight;
 }
 
 // Get auth headers
@@ -610,8 +786,14 @@ function refreshData() {
         loadLogs();
     } else if (currentSection === 'configs') {
         loadConfigs();
+    } else if (currentSection === 'server') {
+        loadServerConfig();
+    } else if (currentSection === 'tokens') {
+        loadTokens();
     } else if (currentSection === 'cache') {
         loadCacheInfo();
+    } else if (currentSection === 'downloads') {
+        loadDownloads();
     } else if (currentSection === 'chat') {
         loadChatModels();
     }
@@ -756,6 +938,520 @@ async function loadPerformance() {
                 <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
             </div>
         `;
+    }
+}
+
+// Load downloads
+async function loadDownloads() {
+    try {
+        const response = await fetch(`${API_BASE}/manage/downloads`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const downloads = await response.json();
+        renderDownloads(downloads);
+    } catch (error) {
+        console.error('Failed to load downloads:', error);
+        document.getElementById('downloads-container').innerHTML = `
+            <div class="empty-state">
+                <div>❌</div>
+                <p>Failed to load downloads</p>
+                <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Render downloads
+function renderDownloads(downloads) {
+    const container = document.getElementById('downloads-container');
+
+    if (downloads.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div>📦</div>
+                <p>No active downloads</p>
+                <p style="font-size: 12px;">Click "+ Start Download" to download a model</p>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = downloads.map(d => `
+        <div class="config-item">
+            <div class="config-item-header">
+                <div class="config-item-name">${escapeHtml(d.filename)}</div>
+                <div class="config-item-actions">
+                    ${d.status === 'downloading' || d.status === 'pending' 
+                        ? `<button class="btn btn-secondary" onclick="cancelDownload('${escapeHtml(d.id)}')">🛑 Cancel</button>`
+                        : ''}
+                </div>
+            </div>
+            <div class="config-item-stats">
+                <div class="config-stat">
+                    <div class="config-stat-label">Status</div>
+                    <div class="config-stat-value">${getStatusBadge(d.status)}</div>
+                </div>
+                <div class="config-stat">
+                    <div class="config-stat-label">Progress</div>
+                    <div class="config-stat-value">${d.progress.toFixed(2)}%</div>
+                </div>
+                <div class="config-stat">
+                    <div class="config-stat-label">Downloaded</div>
+                    <div class="config-stat-value">${formatBytes(d.downloaded_bytes)} / ${formatBytes(d.total_bytes)}</div>
+                </div>
+                <div class="config-stat">
+                    <div class="config-stat-label">URL</div>
+                    <div class="config-stat-value" style="font-size: 11px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(d.url)}</div>
+                </div>
+            </div>
+            ${d.status === 'downloading' || d.status === 'pending'
+                ? `<div style="margin-top: 10px;"><div style="background: #e9ecef; height: 8px; border-radius: 4px; overflow: hidden;">
+                    <div style="background: linear-gradient(90deg, #667eea, #764ba2); height: 100%; width: ${d.progress}%; transition: width 0.3s;"></div>
+                </div></div>`
+                : ''}
+            ${d.error ? `<div style="margin-top: 10px; padding: 10px; background: #f8d7da; border-radius: 5px; color: #721c24; font-size: 12px;">${escapeHtml(d.error)}</div>` : ''}
+        </div>
+    `).join('');
+}
+
+// Show download form
+function showDownloadForm() {
+    const container = document.getElementById('downloads-container');
+    container.innerHTML = `
+        <div class="config-editor-wrapper">
+            <h3>Start New Download</h3>
+            <form onsubmit="startDownload(event)">
+                <div class="form-group">
+                    <label>Model URL: *</label>
+                    <input type="text" id="download-url" placeholder="https://huggingface.co/..." required>
+                    <small style="color: #6c757d;">Enter the direct URL to the model file (GGUF)</small>
+                </div>
+                <div class="form-group">
+                    <label>Filename (optional):</label>
+                    <input type="text" id="download-filename" placeholder="model.gguf">
+                    <small style="color: #6c757d;">Leave empty to use filename from URL</small>
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-success">🚀 Start Download</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadDownloads()">Cancel</button>
+                </div>
+            </form>
+        </div>
+    `;
+}
+
+// Start download
+async function startDownload(event) {
+    event.preventDefault();
+
+    const url = document.getElementById('download-url').value;
+    const filename = document.getElementById('download-filename').value || null;
+
+    try {
+        const response = await fetch(`${API_BASE}/manage/downloads`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...getAuthHeaders()
+            },
+            body: JSON.stringify({ url, filename })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || `HTTP ${response.status}`);
+        }
+
+        const result = await response.json();
+        alert(`Download started! ID: ${result.download_id}`);
+        loadDownloads();
+    } catch (error) {
+        alert(`Failed to start download: ${error.message}`);
+    }
+}
+
+// Cancel download
+async function cancelDownload(downloadId) {
+    if (!confirm('Cancel this download?')) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/manage/downloads/${encodeURIComponent(downloadId)}`, {
+            method: 'DELETE',
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        alert('Download cancelled');
+        loadDownloads();
+    } catch (error) {
+        alert(`Failed to cancel download: ${error.message}`);
+    }
+}
+
+// Helper: Get status badge
+function getStatusBadge(status) {
+    const badges = {
+        'pending': '🕐 Pending',
+        'downloading': '⬇️ Downloading',
+        'completed': '✅ Completed',
+        'failed': '❌ Failed',
+        'cancelled': '🛑 Cancelled'
+    };
+    return badges[status] || status;
+}
+
+// Helper: Format bytes
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// Load server configuration
+async function loadTokens() {
+    try {
+        const response = await fetch(`${API_BASE}/manage/tokens`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        renderTokens(data.tokens);
+    } catch (error) {
+        console.error('Failed to load tokens:', error);
+        document.getElementById('tokens-container').innerHTML = `
+            <div class="empty-state">
+                <div>❌</div>
+                <p>Failed to load tokens</p>
+                <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Render tokens
+function renderTokens(tokens) {
+    const container = document.getElementById('tokens-container');
+
+    if (tokens.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div>🔑</div>
+                <p>No tokens configured</p>
+                <p style="font-size: 12px;">Click "+ Add Token" to create authentication tokens</p>
+            </div>
+        `;
+        return;
+    }
+
+    const accessLevelBadge = (level) => {
+        const badges = {
+            'all': '<span style="background: #28a745; color: white; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">ALL ACCESS</span>',
+            'manage': '<span style="background: #ffc107; color: #333; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">MANAGE</span>',
+            'user': '<span style="background: #6c757d; color: white; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;">USER</span>'
+        };
+        return badges[level] || badges['user'];
+    };
+
+    container.innerHTML = tokens.map(t => `
+        <div class="config-item">
+            <div class="config-item-header">
+                <div class="config-item-name" style="font-family: monospace;">${escapeHtml(t.token)}</div>
+                <div class="config-item-actions">
+                    <button class="btn btn-secondary" onclick="changeTokenLevel('${escapeHtml(t.token)}', '${t.access_level}')">🔄 Change Level</button>
+                    <button class="btn btn-secondary" onclick="deleteToken('${escapeHtml(t.token)}')">🗑️ Delete</button>
+                </div>
+            </div>
+            <div class="config-item-stats">
+                <div class="config-stat">
+                    <div class="config-stat-label">Access Level</div>
+                    <div class="config-stat-value">${accessLevelBadge(t.access_level)}</div>
+                </div>
+            </div>
+        </div>
+    `).join('');
+}
+
+// Show add token form
+function showAddTokenForm() {
+    const container = document.getElementById('tokens-container');
+    container.innerHTML = `
+        <div class="config-editor-wrapper">
+            <h3>Add New Token</h3>
+            <form onsubmit="addToken(event)">
+                <div class="form-group">
+                    <label>Token: *</label>
+                    <input type="text" id="token-value" placeholder="my-secret-token-12345" required>
+                    <small style="color: #6c757d;">Enter a secure random token (recommended 32+ characters)</small>
+                </div>
+                <div class="form-group">
+                    <label>Access Level: *</label>
+                    <select id="token-access-level" required>
+                        <option value="U">User - API access only</option>
+                        <option value="M">Manage - Can use /manage endpoints</option>
+                        <option value="A">All - Full access to everything</option>
+                    </select>
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button type="submit" class="btn btn-success">✅ Add Token</button>
+                    <button type="button" class="btn btn-secondary" onclick="loadTokens()">Cancel</button>
+                    <button type="button" class="btn btn-secondary" onclick="generateRandomToken()">🎲 Generate Random</button>
+                </div>
+            </form>
+        </div>
+    `;
+}
+
+// Generate random token
+function generateRandomToken() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let token = '';
+    for (let i = 0; i < 32; i++) {
+        token += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    document.getElementById('token-value').value = token;
+}
+
+// Add token
+async function addToken(event) {
+    event.preventDefault();
+
+    const token = document.getElementById('token-value').value.trim();
+    const accessLevel = document.getElementById('token-access-level').value;
+
+    if (!token) {
+        alert('Please enter a token');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${API_BASE}/manage/tokens`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...getAuthHeaders()
+            },
+            body: JSON.stringify({ token, access_level: accessLevel })
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || `HTTP ${response.status}`);
+        }
+
+        alert('Token added successfully');
+        loadTokens();
+    } catch (error) {
+        alert(`Failed to add token: ${error.message}`);
+    }
+}
+
+// Change token level
+async function changeTokenLevel(token, currentLevel) {
+    const levels = ['user', 'manage', 'all'];
+    const levelCodes = { 'user': 'U', 'manage': 'M', 'all': 'A' };
+    const levelNames = { 'user': 'User', 'manage': 'Manage', 'all': 'All' };
+    
+    const currentIndex = levels.indexOf(currentLevel.toLowerCase());
+    const nextIndex = (currentIndex + 1) % levels.length;
+    const nextLevel = levels[nextIndex];
+    const nextCode = levelCodes[nextLevel];
+
+    if (!confirm(`Change token level to ${levelNames[nextLevel]}?`)) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/manage/tokens/${encodeURIComponent(token)}`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                ...getAuthHeaders()
+            },
+            body: JSON.stringify({ access_level: nextCode })
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        loadTokens();
+    } catch (error) {
+        alert(`Failed to update token: ${error.message}`);
+    }
+}
+
+// Delete token
+async function deleteToken(token) {
+    if (!confirm(`Delete token "${token}"?`)) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/manage/tokens/${encodeURIComponent(token)}`, {
+            method: 'DELETE',
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        alert('Token deleted successfully');
+        loadTokens();
+    } catch (error) {
+        alert(`Failed to delete token: ${error.message}`);
+    }
+}
+
+// Load server configuration
+async function loadServerConfig() {
+    const container = document.getElementById('server-container');
+    
+    try {
+        const response = await fetch(`${API_BASE}/manage/server-config`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const config = await response.json();
+        
+        container.innerHTML = `
+            <div class="config-editor-wrapper">
+                <div class="editor-toolbar">
+                    <h3>Server Configuration</h3>
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn btn-success" onclick="saveServerConfig()">💾 Save</button>
+                        <button class="btn btn-secondary" onclick="loadServerConfig()">🔄 Reload</button>
+                    </div>
+                </div>
+                <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 5px; padding: 10px; margin-bottom: 15px; font-size: 12px;">
+                    ⚠️ Changes require server restart to take effect
+                </div>
+                <div id="server-monaco-container" class="monaco-editor-container" style="height: 500px;"></div>
+            </div>
+            <div style="background: #f8f9fa; border-radius: 5px; padding: 15px;">
+                <h4>Configuration Options:</h4>
+                <ul style="line-height: 1.8;">
+                    <li><strong>models_directory</strong>: Path to models directory</li>
+                    <li><strong>cache_directory</strong>: Path to cache directory</li>
+                    <li><strong>host</strong>: Server host address</li>
+                    <li><strong>port</strong>: Server port (default: 11434)</li>
+                    <li><strong>compute_provider</strong>: vulkan, cuda, or rocm</li>
+                    <li><strong>auto_unload_minutes</strong>: Auto-unload idle models</li>
+                    <li><strong>manage_token</strong>: Admin API authentication token</li>
+                </ul>
+            </div>
+        </div>
+    `;
+
+        // Initialize Monaco Editor
+        setTimeout(() => {
+            require(['vs/editor/editor.main'], function() {
+                // Dispose previous editor if exists
+                if (window.serverMonacoEditor) {
+                    window.serverMonacoEditor.dispose();
+                }
+
+                // Create editor
+                window.serverMonacoEditor = monaco.editor.create(document.getElementById('server-monaco-container'), {
+                    value: JSON.stringify(config, null, 2),
+                    language: 'json',
+                    theme: 'vs',
+                    automaticLayout: true,
+                    minimap: { enabled: false },
+                    scrollBeyondLastLine: false,
+                    formatOnPaste: true,
+                    formatOnType: true
+                });
+            });
+        }, 100);
+    } catch (error) {
+        console.error('Failed to load server config:', error);
+        container.innerHTML = `
+            <div class="empty-state">
+                <div>❌</div>
+                <p>Failed to load server configuration</p>
+                <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Save server configuration
+async function saveServerConfig() {
+    if (!window.serverMonacoEditor) {
+        alert('Editor not initialized');
+        return;
+    }
+
+    try {
+        const configJson = window.serverMonacoEditor.getValue();
+        const config = JSON.parse(configJson);
+
+        const response = await fetch(`${API_BASE}/manage/server-config`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                ...getAuthHeaders()
+            },
+            body: configJson
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || `HTTP ${response.status}`);
+        }
+
+        const result = await response.json();
+        alert(result.message || 'Server config saved successfully. Restart server to apply changes.');
+    } catch (error) {
+        if (error instanceof SyntaxError) {
+            alert(`Invalid JSON: ${error.message}`);
+        } else {
+            alert(`Failed to save server config: ${error.message}`);
+        }
+    }
+}
+
+// Initialize model (download if needed)
+async function initializeModel(name) {
+    if (!confirm(`Initialize model from config "${name}"?\n\nThis will download the model if it's not already cached.`)) return;
+
+    try {
+        const response = await fetch(`${API_BASE}/manage/configs/${encodeURIComponent(name)}/initialize`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || `HTTP ${response.status}`);
+        }
+
+        const result = await response.json();
+        
+        if (result.download_id) {
+            alert(`Download started!\n\nFilename: ${result.filename}\nDownload ID: ${result.download_id}\n\nCheck the Downloads section to monitor progress.`);
+            // Switch to downloads section
+            showSection('downloads');
+        } else {
+            alert(result.message || 'Model initialized successfully');
+        }
+    } catch (error) {
+        alert(`Failed to initialize model: ${error.message}`);
     }
 }
 

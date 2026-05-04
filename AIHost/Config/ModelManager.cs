@@ -17,21 +17,28 @@ namespace AIHost.Config;
 public class ModelManager : IDisposable
 {
     private readonly string _modelsDirectory;
+    private readonly string _cacheDirectory;
     private readonly IComputeDevice _device;
     private readonly ILogger<ModelManager> _logger;
 
     public string ModelsDirectory => _modelsDirectory;
+    public string CacheDirectory => _cacheDirectory;
     private readonly ConcurrentDictionary<string, ModelInstance> _loadedModels = new();
     private readonly ConcurrentDictionary<string, ModelConfig> _modelConfigs = new();
     // Serializes the slow model-load path so the same model is never loaded twice.
     private readonly SemaphoreSlim _loadLock = new(1, 1);
     private bool _disposed;
 
-    public ModelManager(string modelsDirectory, IComputeDevice device, ILogger<ModelManager> logger)
+    public ModelManager(string modelsDirectory, string cacheDirectory, IComputeDevice device, ILogger<ModelManager> logger)
     {
         _modelsDirectory = modelsDirectory;
+        _cacheDirectory = cacheDirectory;
         _device = device;
         _logger = logger;
+
+        // Ensure directories exist
+        Directory.CreateDirectory(_modelsDirectory);
+        Directory.CreateDirectory(_cacheDirectory);
 
         // Load all model configs
         LoadModelConfigs();
@@ -49,6 +56,7 @@ public class ModelManager : IDisposable
             return;
         }
 
+        // Load configs from subdirectories (legacy format: subdir/model.json)
         foreach (var modelDir in Directory.GetDirectories(_modelsDirectory))
         {
             var configPath = Path.Combine(modelDir, "model.json");
@@ -72,7 +80,71 @@ public class ModelManager : IDisposable
             }
         }
 
+        // Also load configs directly from models directory (new format: name.json)
+        foreach (var configFile in Directory.GetFiles(_modelsDirectory, "*.json"))
+        {
+            try
+            {
+                var json = File.ReadAllText(configFile);
+                var config = JsonSerializer.Deserialize<ModelConfig>(json);
+                var configName = Path.GetFileNameWithoutExtension(configFile);
+
+                if (config != null)
+                {
+                    // Use filename as name if config.name is empty
+                    if (string.IsNullOrEmpty(config.Name))
+                        config.Name = configName;
+                    
+                    _modelConfigs[config.Name] = config;
+                    _logger.LogInformation("Loaded model config: {Name} from {File}", config.Name, Path.GetFileName(configFile));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load config from {Path}", configFile);
+            }
+        }
+
         _logger.LogInformation("Loaded {Count} model configuration(s)", _modelConfigs.Count);
+    }
+
+    /// <summary>
+    /// Reload a single config from disk
+    /// </summary>
+    public bool ReloadConfig(string configName)
+    {
+        try
+        {
+            var configPath = Path.Combine(_modelsDirectory, $"{configName}.json");
+            if (!File.Exists(configPath))
+            {
+                // Try legacy format
+                configPath = Path.Combine(_modelsDirectory, configName, "model.json");
+                if (!File.Exists(configPath))
+                {
+                    _logger.LogWarning("Config file not found: {Name}", configName);
+                    return false;
+                }
+            }
+
+            var json = File.ReadAllText(configPath);
+            var config = JsonSerializer.Deserialize<ModelConfig>(json);
+
+            if (config != null)
+            {
+                if (string.IsNullOrEmpty(config.Name))
+                    config.Name = configName;
+                
+                _modelConfigs[config.Name] = config;
+                _logger.LogInformation("Reloaded model config: {Name}", config.Name);
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to reload config: {Name}", configName);
+        }
+        return false;
     }
 
     /// <summary>
@@ -110,10 +182,13 @@ public class ModelManager : IDisposable
         // Resolve model path
         var modelPath = ResolveModelPath(config);
 
-        // Download if needed
+        // Download if needed (always to cache directory for URLs)
         if (!File.Exists(modelPath) && config.AutoDownload && IsUrl(config.ModelPath))
         {
-            await DownloadModelAsync(config.ModelPath, modelPath);
+            var fileName = Path.GetFileName(new Uri(config.ModelPath).LocalPath);
+            var cachePath = Path.Combine(_cacheDirectory, fileName);
+            await DownloadModelAsync(config.ModelPath, cachePath);
+            modelPath = cachePath;
         }
 
         if (!File.Exists(modelPath))
@@ -204,16 +279,23 @@ public class ModelManager : IDisposable
     }
 
     /// <summary>
-    /// Resolve model path (absolute or relative to model directory)
+    /// Resolve model path (searches in models dir, then cache)
     /// </summary>
     private string ResolveModelPath(ModelConfig config)
     {
         var path = config.ModelPath;
 
-        // If URL, use cache path
+        // If URL, check cache first, then model dir
         if (IsUrl(path))
         {
             var fileName = Path.GetFileName(new Uri(path).LocalPath);
+            
+            // Check cache directory first
+            var cachePath = Path.Combine(_cacheDirectory, fileName);
+            if (File.Exists(cachePath))
+                return cachePath;
+            
+            // Fall back to model directory
             return Path.Combine(_modelsDirectory, config.Name, fileName);
         }
 
@@ -221,8 +303,18 @@ public class ModelManager : IDisposable
         if (Path.IsPathRooted(path))
             return path;
 
-        // Relative to model directory
-        return Path.Combine(_modelsDirectory, config.Name, path);
+        // Relative path: check model directory first
+        var modelDirPath = Path.Combine(_modelsDirectory, config.Name, path);
+        if (File.Exists(modelDirPath))
+            return modelDirPath;
+
+        // Check cache directory as fallback
+        var cacheDirPath = Path.Combine(_cacheDirectory, path);
+        if (File.Exists(cacheDirPath))
+            return cacheDirPath;
+
+        // Return model directory path (will be used for download)
+        return modelDirPath;
     }
 
     /// <summary>
