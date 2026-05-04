@@ -576,16 +576,64 @@
         <header>
             <h1>🤖 AIHost Management Console</h1>
             <div class="nav">
-                <button onclick="showSection('models')" class="active" id="btn-models">Models</button>
-                <button onclick="showSection('logs')" id="btn-logs">Request Logs</button>
-                <button onclick="showSection('download')" id="btn-download">Download Model</button>
-                <button onclick="showSection('configs')" id="btn-configs">Model Configs</button>
+                <button onclick="showSection('dashboard')" class="active" id="btn-dashboard">Dashboard</button>
+                <button onclick="showSection('models')" id="btn-models">Models</button>
+                <button onclick="showSection('resources')" id="btn-resources">Resources</button>
+                <button onclick="showSection('performance')" id="btn-performance">Performance</button>
+                <button onclick="showSection('logs')" id="btn-logs">Logs</button>
+                <button onclick="showSection('configs')" id="btn-configs">Configs</button>
                 <button onclick="showSection('cache')" id="btn-cache">Cache</button>
                 <button onclick="showSection('chat')" id="btn-chat">Chat</button>
             </div>
         </header>
 
         <div class="content">
+            <!-- Dashboard Section -->
+            <div id="section-dashboard" class="section active">
+                <h2>System Dashboard</h2>
+                <div id="dashboard-container">
+                    <div class="cache-stats">
+                        <div class="cache-stat-box">
+                            <div class="value" id="dash-models">0</div>
+                            <div class="label">Loaded Models</div>
+                        </div>
+                        <div class="cache-stat-box">
+                            <div class="value" id="dash-requests">0</div>
+                            <div class="label">Total Requests</div>
+                        </div>
+                        <div class="cache-stat-box">
+                            <div class="value" id="dash-memory">0 MB</div>
+                            <div class="label">Memory Usage</div>
+                        </div>
+                        <div class="cache-stat-box">
+                            <div class="value" id="dash-uptime">0s</div>
+                            <div class="label">Uptime</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Resources Section -->
+            <div id="section-resources" class="section">
+                <h2>System Resources</h2>
+                <div id="resources-container">
+                    <div class="empty-state">
+                        <div>📊</div>
+                        <p>Loading resource information...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Performance Section -->
+            <div id="section-performance" class="section">
+                <h2>Performance Metrics</h2>
+                <div id="performance-container">
+                    <div class="empty-state">
+                        <div>⚡</div>
+                        <p>Loading performance data...</p>
+                    </div>
+                </div>
+            </div>
             <!-- Models Section -->
             <div id="section-models" class="section active">
                 <h2>Loaded Models</h2>

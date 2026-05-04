@@ -104,6 +104,22 @@ See [MANAGEMENT.md](MANAGEMENT.md) for complete configuration reference.
 
 ## 🌐 API Examples
 
+### Web Management Panel
+
+Open browser: `http://localhost:11434`
+
+**Features:**
+- 📊 **Dashboard** - System overview and real-time metrics
+- 🤖 **Models** - Manage loaded models, reload/unload
+- 💻 **Resources** - System memory, CPU, GPU monitoring
+- ⚡ **Performance** - Model performance metrics and TPS
+- 📝 **Logs** - Request logs with filtering
+- ⚙️ **Configs** - Model configuration management
+- 💾 **Cache** - Cache directory control
+- 💬 **Chat** - Direct model testing
+
+See [WEBPANEL.md](WEBPANEL.md) for complete documentation.
+
 ### Ollama API
 
 ```bash
@@ -118,6 +134,22 @@ curl http://localhost:11434/api/generate \
 curl http://localhost:11434/v1/chat/completions \
   -H "Authorization: Bearer your-token" \
   -d '{"model": "tinyllama-chat", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+### Management API
+
+```bash
+# Get server status
+curl http://localhost:11434/manage/status
+
+# List loaded models
+curl http://localhost:11434/manage/models
+
+# Get system resources
+curl http://localhost:11434/manage/system/resources
+
+# Get performance metrics
+curl http://localhost:11434/manage/performance
 ```
 
 ### Python (OpenAI SDK)

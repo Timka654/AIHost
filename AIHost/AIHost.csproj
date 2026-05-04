@@ -17,6 +17,7 @@
 		<PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.21.0" />
 		<PackageReference Include="Silk.NET.Shaderc" Version="2.21.0" />
 		<PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
+		<PackageReference Include="System.Management" Version="9.0.0" Condition="'$(TargetFramework)' == 'net10.0' AND '$(OS)' == 'Windows_NT'" />
 	</ItemGroup>
 
 	<ItemGroup>

@@ -2,7 +2,7 @@
 const API_BASE = window.location.origin;
 
 // Current section
-let currentSection = 'models';
+let currentSection = 'dashboard';
 
 // Show section
 function showSection(section) {
@@ -17,8 +17,14 @@ function showSection(section) {
     currentSection = section;
 
     // Load data for section
-    if (section === 'models') {
+    if (section === 'dashboard') {
+        loadDashboard();
+    } else if (section === 'models') {
         loadModels();
+    } else if (section === 'resources') {
+        loadResources();
+    } else if (section === 'performance') {
+        loadPerformance();
     } else if (section === 'logs') {
         loadLogs();
     } else if (section === 'configs') {
@@ -592,8 +598,14 @@ function getAuthHeaders() {
 
 // Refresh data
 function refreshData() {
-    if (currentSection === 'models') {
+    if (currentSection === 'dashboard') {
+        loadDashboard();
+    } else if (currentSection === 'models') {
         loadModels();
+    } else if (currentSection === 'resources') {
+        loadResources();
+    } else if (currentSection === 'performance') {
+        loadPerformance();
     } else if (currentSection === 'logs') {
         loadLogs();
     } else if (currentSection === 'configs') {
@@ -603,6 +615,222 @@ function refreshData() {
     } else if (currentSection === 'chat') {
         loadChatModels();
     }
+}
+
+// Load dashboard
+async function loadDashboard() {
+    try {
+        const response = await fetch(`${API_BASE}/manage/status`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const status = await response.json();
+        renderDashboard(status);
+    } catch (error) {
+        console.error('Failed to load dashboard:', error);
+    }
+}
+
+// Render dashboard
+function renderDashboard(status) {
+    document.getElementById('dash-models').textContent = status.loaded_models || 0;
+    document.getElementById('dash-requests').textContent = status.total_requests || 0;
+    document.getElementById('dash-memory').textContent = (status.memory_mb || 0).toFixed(1) + ' MB';
+    document.getElementById('dash-uptime').textContent = formatDuration(status.uptime_seconds || 0);
+}
+
+// Load resources
+async function loadResources() {
+    try {
+        const [resourcesResp, computeResp] = await Promise.all([
+            fetch(`${API_BASE}/manage/system/resources`, { headers: getAuthHeaders() }),
+            fetch(`${API_BASE}/manage/system/compute`, { headers: getAuthHeaders() })
+        ]);
+
+        if (!resourcesResp.ok || !computeResp.ok) {
+            throw new Error('Failed to load resources');
+        }
+
+        const resources = await resourcesResp.json();
+        const compute = await computeResp.json();
+
+        renderResources(resources, compute);
+    } catch (error) {
+        console.error('Failed to load resources:', error);
+        document.getElementById('resources-container').innerHTML = `
+            <div class="empty-state">
+                <div>❌</div>
+                <p>Failed to load resource information</p>
+                <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Render resources
+function renderResources(resources, compute) {
+    const container = document.getElementById('resources-container');
+    
+    const memUsagePercent = resources.total_memory_bytes > 0
+        ? (resources.used_memory_bytes / resources.total_memory_bytes * 100).toFixed(1)
+        : 0;
+
+    container.innerHTML = `
+        <div class="cache-stats">
+            <div class="cache-stat-box">
+                <div class="value">${formatBytes(resources.total_memory_bytes)}</div>
+                <div class="label">Total Memory</div>
+            </div>
+            <div class="cache-stat-box">
+                <div class="value">${formatBytes(resources.used_memory_bytes)}</div>
+                <div class="label">Used Memory (${memUsagePercent}%)</div>
+            </div>
+            <div class="cache-stat-box">
+                <div class="value">${formatBytes(resources.available_memory_bytes)}</div>
+                <div class="label">Available Memory</div>
+            </div>
+            <div class="cache-stat-box">
+                <div class="value">${formatBytes(resources.process_memory_bytes)}</div>
+                <div class="label">Process Memory</div>
+            </div>
+            <div class="cache-stat-box">
+                <div class="value">${formatBytes(resources.gc_total_memory_bytes)}</div>
+                <div class="label">GC Memory</div>
+            </div>
+            <div class="cache-stat-box">
+                <div class="value">${resources.thread_count}</div>
+                <div class="label">Thread Count</div>
+            </div>
+        </div>
+        
+        <div class="cache-info" style="margin-top: 20px;">
+            <h3>Compute Devices</h3>
+            ${compute.devices && compute.devices.length > 0 ? `
+                <div class="config-list">
+                    ${compute.devices.map(d => `
+                        <div class="config-item">
+                            <div class="config-item-header">
+                                <div class="config-item-name">${escapeHtml(d.device_name)}</div>
+                            </div>
+                            <div class="config-item-stats">
+                                <div class="config-stat">
+                                    <div class="config-stat-label">Model</div>
+                                    <div class="config-stat-value">${escapeHtml(d.model)}</div>
+                                </div>
+                                <div class="config-stat">
+                                    <div class="config-stat-label">Device Type</div>
+                                    <div class="config-stat-value">${escapeHtml(d.device_type)}</div>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            ` : '<p>No compute devices detected</p>'}
+        </div>
+    `;
+}
+
+// Load performance
+async function loadPerformance() {
+    try {
+        const response = await fetch(`${API_BASE}/manage/performance`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const perf = await response.json();
+        renderPerformance(perf);
+    } catch (error) {
+        console.error('Failed to load performance:', error);
+        document.getElementById('performance-container').innerHTML = `
+            <div class="empty-state">
+                <div>❌</div>
+                <p>Failed to load performance data</p>
+                <p style="font-size: 12px; color: #dc3545;">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Render performance
+function renderPerformance(perf) {
+    const container = document.getElementById('performance-container');
+
+    if (!perf.models || perf.models.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div>📊</div>
+                <p>No models loaded</p>
+                <p style="font-size: 12px;">Performance data will appear when models are loaded</p>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = `
+        <div class="cache-info">
+            <h3>Summary</h3>
+            <div class="cache-stats">
+                <div class="cache-stat-box">
+                    <div class="value">${perf.summary.total_models}</div>
+                    <div class="label">Total Models</div>
+                </div>
+                <div class="cache-stat-box">
+                    <div class="value">${perf.summary.total_requests}</div>
+                    <div class="label">Total Requests</div>
+                </div>
+                <div class="cache-stat-box">
+                    <div class="value">${perf.summary.average_tps.toFixed(2)}</div>
+                    <div class="label">Avg TPS</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="config-list" style="margin-top: 20px;">
+            ${perf.models.map(m => `
+                <div class="config-item">
+                    <div class="config-item-header">
+                        <div class="config-item-name">${escapeHtml(m.model)}</div>
+                    </div>
+                    <div class="config-item-stats">
+                        <div class="config-stat">
+                            <div class="config-stat-label">Total Requests</div>
+                            <div class="config-stat-value">${m.total_requests}</div>
+                        </div>
+                        <div class="config-stat">
+                            <div class="config-stat-label">Average TPS</div>
+                            <div class="config-stat-value">${m.average_tps.toFixed(2)}</div>
+                        </div>
+                        <div class="config-stat">
+                            <div class="config-stat-label">Uptime</div>
+                            <div class="config-stat-value">${formatDuration(m.uptime_seconds)}</div>
+                        </div>
+                        ${m.last_request_seconds_ago !== null ? `
+                        <div class="config-stat">
+                            <div class="config-stat-label">Last Request</div>
+                            <div class="config-stat-value">${formatDuration(m.last_request_seconds_ago)} ago</div>
+                        </div>
+                        ` : ''}
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+// Format duration
+function formatDuration(seconds) {
+    if (seconds < 60) return `${Math.floor(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+    return `${Math.floor(seconds / 86400)}d`;
 }
 
 // Format date
@@ -633,12 +861,12 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// Auto-refresh every 5 seconds if on models or logs page
+// Auto-refresh every 5 seconds if on active pages
 setInterval(() => {
-    if (currentSection === 'models' || currentSection === 'logs') {
+    if (['dashboard', 'models', 'resources', 'performance', 'logs'].includes(currentSection)) {
         refreshData();
     }
 }, 5000);
 
 // Initial load
-loadModels();
+loadDashboard();

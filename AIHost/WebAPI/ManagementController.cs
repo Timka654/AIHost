@@ -88,6 +88,63 @@ public class ChatMessage
 }
 
 /// <summary>
+/// System resource info
+/// </summary>
+public class SystemResourceResponse
+{
+    [JsonPropertyName("total_memory_bytes")]
+    public long TotalMemoryBytes { get; set; }
+
+    [JsonPropertyName("available_memory_bytes")]
+    public long AvailableMemoryBytes { get; set; }
+
+    [JsonPropertyName("used_memory_bytes")]
+    public long UsedMemoryBytes { get; set; }
+
+    [JsonPropertyName("cpu_usage_percent")]
+    public double CpuUsagePercent { get; set; }
+
+    [JsonPropertyName("thread_count")]
+    public int ThreadCount { get; set; }
+
+    [JsonPropertyName("process_memory_bytes")]
+    public long ProcessMemoryBytes { get; set; }
+
+    [JsonPropertyName("gc_total_memory_bytes")]
+    public long GcTotalMemoryBytes { get; set; }
+}
+
+/// <summary>
+/// Buffer pool statistics
+/// </summary>
+public class BufferPoolStatsResponse
+{
+    [JsonPropertyName("pooled_count")]
+    public int PooledCount { get; set; }
+
+    [JsonPropertyName("active_count")]
+    public int ActiveCount { get; set; }
+
+    [JsonPropertyName("total_allocations")]
+    public long TotalAllocations { get; set; }
+
+    [JsonPropertyName("pool_hits")]
+    public long PoolHits { get; set; }
+
+    [JsonPropertyName("pool_misses")]
+    public long PoolMisses { get; set; }
+
+    [JsonPropertyName("hit_rate_percent")]
+    public double HitRatePercent { get; set; }
+
+    [JsonPropertyName("pooled_memory_bytes")]
+    public long PooledMemoryBytes { get; set; }
+
+    [JsonPropertyName("active_memory_bytes")]
+    public long ActiveMemoryBytes { get; set; }
+}
+
+/// <summary>
 /// Management API controller for admin operations
 /// </summary>
 [ApiController]
@@ -417,6 +474,186 @@ public class ManagementController : ControllerBase
         catch (Exception ex)
         {
             return StatusCode(500, new { error = $"Download failed: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get system resource information
+    /// </summary>
+    [HttpGet("system/resources")]
+    public IActionResult GetSystemResources()
+    {
+        try
+        {
+            var process = System.Diagnostics.Process.GetCurrentProcess();
+            var gcInfo = GC.GetGCMemoryInfo();
+
+            // Get available physical memory (Windows-specific)
+            long availableMemory = 0;
+            long totalMemory = 0;
+            
+            if (OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    var searcher = new System.Management.ManagementObjectSearcher("SELECT * FROM Win32_OperatingSystem");
+                    foreach (System.Management.ManagementObject obj in searcher.Get())
+                    {
+                        availableMemory = Convert.ToInt64(obj["FreePhysicalMemory"]) * 1024;
+                        totalMemory = Convert.ToInt64(obj["TotalVisibleMemorySize"]) * 1024;
+                    }
+                }
+                catch
+                {
+                    // Fallback if WMI is not available
+                    totalMemory = gcInfo.TotalAvailableMemoryBytes;
+                    availableMemory = totalMemory - gcInfo.MemoryLoadBytes;
+                }
+            }
+            else
+            {
+                totalMemory = gcInfo.TotalAvailableMemoryBytes;
+                availableMemory = totalMemory - gcInfo.MemoryLoadBytes;
+            }
+
+            var response = new SystemResourceResponse
+            {
+                TotalMemoryBytes = totalMemory,
+                AvailableMemoryBytes = availableMemory,
+                UsedMemoryBytes = totalMemory - availableMemory,
+                CpuUsagePercent = process.TotalProcessorTime.TotalMilliseconds / Environment.ProcessorCount / Environment.TickCount * 100,
+                ThreadCount = process.Threads.Count,
+                ProcessMemoryBytes = process.WorkingSet64,
+                GcTotalMemoryBytes = GC.GetTotalMemory(false)
+            };
+
+            return Ok(response);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get system resources: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get compute device information
+    /// </summary>
+    [HttpGet("system/compute")]
+    public IActionResult GetComputeInfo()
+    {
+        try
+        {
+            var models = _modelManager.GetLoadedModels();
+            var computeDevices = models
+                .Where(m => m.Value.Device != null)
+                .Select(m => new
+                {
+                    model = m.Key,
+                    device_name = m.Value.Device?.ProviderName ?? "Unknown",
+                    device_type = m.Value.Device?.GetType().Name ?? "Unknown"
+                })
+                .ToList();
+
+            return Ok(new
+            {
+                devices = computeDevices,
+                total_models = models.Count,
+                has_gpu = computeDevices.Any()
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get compute info: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get buffer pool statistics (if available)
+    /// </summary>
+    [HttpGet("system/buffers")]
+    public IActionResult GetBufferPoolStats()
+    {
+        try
+        {
+            // This would need access to the buffer pool instance
+            // For now, return a placeholder
+            return Ok(new
+            {
+                message = "Buffer pool stats not yet implemented",
+                available = false
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get buffer stats: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get performance metrics for all models
+    /// </summary>
+    [HttpGet("performance")]
+    public IActionResult GetPerformanceMetrics()
+    {
+        try
+        {
+            var models = _modelManager.GetLoadedModels();
+            var metrics = models.Select(kvp => new
+            {
+                model = kvp.Key,
+                total_requests = kvp.Value.TotalRequests,
+                average_tps = kvp.Value.AverageTPS,
+                uptime_seconds = (DateTime.UtcNow - kvp.Value.LoadedAt).TotalSeconds,
+                last_request_seconds_ago = kvp.Value.LastRequestAt.HasValue
+                    ? (DateTime.UtcNow - kvp.Value.LastRequestAt.Value).TotalSeconds
+                    : (double?)null
+            }).ToList();
+
+            var totalRequests = metrics.Sum(m => m.total_requests);
+            var averageTPS = metrics.Any() ? metrics.Average(m => m.average_tps) : 0;
+
+            return Ok(new
+            {
+                models = metrics,
+                summary = new
+                {
+                    total_models = models.Count,
+                    total_requests = totalRequests,
+                    average_tps = averageTPS
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get performance metrics: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get current server status
+    /// </summary>
+    [HttpGet("status")]
+    public IActionResult GetServerStatus()
+    {
+        try
+        {
+            var process = System.Diagnostics.Process.GetCurrentProcess();
+            var models = _modelManager.GetLoadedModels();
+
+            return Ok(new
+            {
+                status = "running",
+                uptime_seconds = (DateTime.UtcNow - process.StartTime.ToUniversalTime()).TotalSeconds,
+                loaded_models = models.Count,
+                total_requests = models.Sum(m => m.Value.TotalRequests),
+                memory_mb = process.WorkingSet64 / (1024.0 * 1024.0),
+                thread_count = process.Threads.Count,
+                version = "1.0.0"
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get server status: {ex.Message}" });
         }
     }
 }
