@@ -4,6 +4,21 @@ const API_BASE = window.location.origin;
 // Current section
 let currentSection = 'dashboard';
 
+// Downloads auto-refresh timer
+let _downloadsTimer = null;
+
+function startDownloadsAutoRefresh() {
+    stopDownloadsAutoRefresh();
+    _downloadsTimer = setInterval(async () => {
+        if (currentSection !== 'downloads') { stopDownloadsAutoRefresh(); return; }
+        await loadDownloads();
+    }, 2000);
+}
+
+function stopDownloadsAutoRefresh() {
+    if (_downloadsTimer) { clearInterval(_downloadsTimer); _downloadsTimer = null; }
+}
+
 // Monaco Editor instance
 let monacoEditor = null;
 let currentConfigSchema = null;
@@ -44,6 +59,7 @@ function showSection(section) {
         loadCacheInfo();
     } else if (section === 'downloads') {
         loadDownloads();
+        startDownloadsAutoRefresh();
     } else if (section === 'chat') {
         loadChatModels();
     }
@@ -413,49 +429,6 @@ async function unloadModel(name) {
         loadModels();
     } catch (error) {
         alert(`Failed to unload model: ${error.message}`);
-    }
-}
-
-// Download model
-async function downloadModel(event) {
-    event.preventDefault();
-
-    const name = document.getElementById('download-name').value;
-    const url = document.getElementById('download-url').value;
-    const format = document.getElementById('download-format').value;
-
-    if (!confirm(`Download model "${name}" from ${url}?`)) return;
-
-    const submitBtn = event.target.querySelector('.btn-submit');
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Downloading...';
-
-    try {
-        const response = await fetch(`${API_BASE}/manage/download`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...getAuthHeaders()
-            },
-            body: JSON.stringify({ name, url, format })
-        });
-
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || `HTTP ${response.status}`);
-        }
-
-        const result = await response.json();
-        alert(`Success!\n${result.message}\nPath: ${result.path}`);
-
-        // Clear form
-        document.getElementById('download-name').value = '';
-        document.getElementById('download-url').value = '';
-    } catch (error) {
-        alert(`Download failed: ${error.message}`);
-    } finally {
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Download Model';
     }
 }
 
@@ -970,6 +943,14 @@ async function loadDownloads() {
 function renderDownloads(downloads) {
     const container = document.getElementById('downloads-container');
 
+    // Manage auto-refresh based on active downloads
+    const hasActive = downloads.some(d => d.status === 'downloading' || d.status === 'pending');
+    if (hasActive && currentSection === 'downloads') {
+        if (!_downloadsTimer) startDownloadsAutoRefresh();
+    } else if (!hasActive) {
+        stopDownloadsAutoRefresh();
+    }
+
     if (downloads.length === 0) {
         container.innerHTML = `
             <div class="empty-state">
@@ -1052,6 +1033,10 @@ async function startDownload(event) {
     const url = document.getElementById('download-url').value;
     const filename = document.getElementById('download-filename').value || null;
 
+    await doStartDownload(url, filename, false);
+}
+
+async function doStartDownload(url, filename, force) {
     try {
         const response = await fetch(`${API_BASE}/manage/downloads`, {
             method: 'POST',
@@ -1059,8 +1044,16 @@ async function startDownload(event) {
                 'Content-Type': 'application/json',
                 ...getAuthHeaders()
             },
-            body: JSON.stringify({ url, filename })
+            body: JSON.stringify({ url, filename, force })
         });
+
+        if (response.status === 409) {
+            const info = await response.json();
+            if (confirm(`Файл '${info.filename}' уже скачан.\nСкачать повторно и перезаписать?`)) {
+                await doStartDownload(url, filename, true);
+            }
+            return;
+        }
 
         if (!response.ok) {
             const error = await response.json();
@@ -1070,6 +1063,7 @@ async function startDownload(event) {
         const result = await response.json();
         alert(`Download started! ID: ${result.download_id}`);
         loadDownloads();
+        startDownloadsAutoRefresh();
     } catch (error) {
         alert(`Failed to start download: ${error.message}`);
     }

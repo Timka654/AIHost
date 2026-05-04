@@ -410,13 +410,19 @@ public class ManagementController : ControllerBase
                 UseKVCache = true
             };
 
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             var response = model.Engine.Generate(request.Message, config);
+            sw.Stop();
+
+            var tokenCount = response.Length;
+            var tps = sw.Elapsed.TotalSeconds > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
+            _modelManager.UpdateModelStats(request.ModelName, request.Message, tps);
 
             return Ok(new
             {
                 model = request.ModelName,
                 response = response,
-                tokens = response.Length,
+                tokens = tokenCount,
                 finish_reason = "stop"
             });
         }
@@ -807,7 +813,25 @@ public class ManagementController : ControllerBase
             if (string.IsNullOrWhiteSpace(request.Url))
                 return BadRequest(new { error = "URL is required" });
 
-            var downloadId = _downloadManager.StartDownload(request.Url, request.Filename);
+            // Resolve filename the same way DownloadManager would
+            var filename = string.IsNullOrWhiteSpace(request.Filename)
+                ? Path.GetFileName(new Uri(request.Url).LocalPath)
+                : request.Filename;
+
+            if (!request.Force)
+            {
+                var existingPath = Path.Combine(_downloadManager.CacheDirectory, filename);
+                if (System.IO.File.Exists(existingPath))
+                    return Conflict(new
+                    {
+                        error = "file_exists",
+                        message = $"File '{filename}' already exists in cache.",
+                        filename,
+                        path = existingPath
+                    });
+            }
+
+            var downloadId = _downloadManager.StartDownload(request.Url, filename);
             return Ok(new { download_id = downloadId, message = "Download started" });
         }
         catch (Exception ex)
@@ -1200,15 +1224,14 @@ public class ManagementController : ControllerBase
     {
         try
         {
-            // Build absolute path to config file
-            var configPath = Path.IsPathRooted(_modelManager.ModelsDirectory)
-                ? Path.Combine(_modelManager.ModelsDirectory, $"{name}.json")
-                : Path.Combine(AppContext.BaseDirectory, _modelManager.ModelsDirectory, $"{name}.json");
-            
+            // Configs are saved as {ModelsDirectory}/{name}/model.json
+            var configPath = Path.Combine(_modelManager.ModelsDirectory, name, "model.json");
+            // Fall back to flat format
             if (!System.IO.File.Exists(configPath))
-            {
-                return NotFound(new { error = $"Config not found: {configPath}" });
-            }
+                configPath = Path.Combine(_modelManager.ModelsDirectory, $"{name}.json");
+
+            if (!System.IO.File.Exists(configPath))
+                return NotFound(new { error = $"Config not found. Searched:\n  {Path.Combine(_modelManager.ModelsDirectory, name, "model.json")}\n  {Path.Combine(_modelManager.ModelsDirectory, $"{name}.json")}" });
 
             var configJson = await System.IO.File.ReadAllTextAsync(configPath);
             var config = JsonSerializer.Deserialize<ModelConfig>(configJson);
@@ -1217,33 +1240,31 @@ public class ManagementController : ControllerBase
                 return BadRequest(new { error = "Invalid config format" });
 
             if (string.IsNullOrEmpty(config.ModelPath))
-                return BadRequest(new { error = "Config has no model path specified" });
+                return BadRequest(new { error = "Config has no model path (\"model\" field) specified" });
 
-            // Check if model file exists
+            // Check if model file exists in cache directory
             var modelPath = Path.IsPathRooted(config.ModelPath)
                 ? config.ModelPath
-                : Path.IsPathRooted(_modelManager.CacheDirectory)
-                    ? Path.Combine(_modelManager.CacheDirectory, config.ModelPath)
-                    : Path.Combine(AppContext.BaseDirectory, _modelManager.CacheDirectory, config.ModelPath);
+                : Path.Combine(_modelManager.CacheDirectory, config.ModelPath);
 
             if (System.IO.File.Exists(modelPath))
                 return Ok(new { message = "Model file already exists", path = modelPath });
 
-            // If model starts with http, start download
+            // If model field is a URL, start download
             if (config.ModelPath.StartsWith("http://") || config.ModelPath.StartsWith("https://"))
             {
                 var filename = Path.GetFileName(new Uri(config.ModelPath).LocalPath);
                 var downloadId = _downloadManager.StartDownload(config.ModelPath, filename);
-                
-                return Ok(new 
-                { 
-                    message = "Download started", 
+
+                return Ok(new
+                {
+                    message = "Download started",
                     download_id = downloadId,
                     filename = filename
                 });
             }
 
-            return BadRequest(new { error = $"Model path is not a URL and file does not exist. Expected path: {modelPath}" });
+            return BadRequest(new { error = $"Model path is not a URL and file not found at: {modelPath}" });
         }
         catch (Exception ex)
         {
@@ -1274,4 +1295,7 @@ public class StartDownloadRequest
 
     [JsonPropertyName("filename")]
     public string? Filename { get; set; }
+
+    [JsonPropertyName("force")]
+    public bool Force { get; set; } = false;
 }

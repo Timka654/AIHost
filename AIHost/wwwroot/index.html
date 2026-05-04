@@ -703,33 +703,7 @@
                 </table>
             </div>
 
-            <!-- Download Section -->
-            <div id="section-download" class="section">
-                <h2>Download Model from URL</h2>
-                <div class="token-info">
-                    <strong>⚠️ Management Token Required</strong><br>
-                    This endpoint requires a management token in the Authorization header.
-                </div>
-                <form onsubmit="downloadModel(event)">
-                    <div class="form-group">
-                        <label>Model Name:</label>
-                        <input type="text" id="download-name" placeholder="my-model" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Download URL:</label>
-                        <input type="url" id="download-url" placeholder="https://huggingface.co/..." required>
-                    </div>
-                    <div class="form-group">
-                        <label>Format:</label>
-                        <input type="text" id="download-format" value="gguf" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Management Token (optional):</label>
-                        <input type="password" id="manage-token" placeholder="Enter token if required">
-                    </div>
-                    <button type="submit" class="btn-submit">Download Model</button>
-                </form>
-            </div>
+
 
             <!-- Configs Section -->
             <div id="section-configs" class="section">

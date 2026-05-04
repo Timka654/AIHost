@@ -31,8 +31,9 @@ public class ModelManager : IDisposable
 
     public ModelManager(string modelsDirectory, string cacheDirectory, IComputeDevice device, ILogger<ModelManager> logger)
     {
-        _modelsDirectory = modelsDirectory;
-        _cacheDirectory = cacheDirectory;
+        // Normalize paths (resolve ./ and ../ to absolute paths)
+        _modelsDirectory = Path.GetFullPath(modelsDirectory);
+        _cacheDirectory = Path.GetFullPath(cacheDirectory);
         _device = device;
         _logger = logger;
 
@@ -115,14 +116,15 @@ public class ModelManager : IDisposable
     {
         try
         {
-            var configPath = Path.Combine(_modelsDirectory, $"{configName}.json");
+            // Primary format: {name}/model.json (used by web panel save operations)
+            var configPath = Path.Combine(_modelsDirectory, configName, "model.json");
             if (!File.Exists(configPath))
             {
-                // Try legacy format
-                configPath = Path.Combine(_modelsDirectory, configName, "model.json");
+                // Flat format fallback: {name}.json
+                configPath = Path.Combine(_modelsDirectory, $"{configName}.json");
                 if (!File.Exists(configPath))
                 {
-                    _logger.LogWarning("Config file not found: {Name}", configName);
+                    _logger.LogWarning("Config file not found for: {Name}", configName);
                     return false;
                 }
             }
@@ -134,7 +136,7 @@ public class ModelManager : IDisposable
             {
                 if (string.IsNullOrEmpty(config.Name))
                     config.Name = configName;
-                
+
                 _modelConfigs[config.Name] = config;
                 _logger.LogInformation("Reloaded model config: {Name}", config.Name);
                 return true;

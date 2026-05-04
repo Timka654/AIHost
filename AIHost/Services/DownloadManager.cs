@@ -10,9 +10,12 @@ public class DownloadManager
 
     public DownloadManager(string cacheDirectory)
     {
-        _cacheDirectory = cacheDirectory;
+        // Normalize path (resolve ./ and ../ to absolute path)
+        _cacheDirectory = Path.GetFullPath(cacheDirectory);
         Directory.CreateDirectory(_cacheDirectory);
     }
+
+    public string CacheDirectory => _cacheDirectory;
 
     public string StartDownload(string url, string? filename = null)
     {

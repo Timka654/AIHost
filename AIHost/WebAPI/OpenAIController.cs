@@ -43,6 +43,9 @@ public class OpenAIController : ControllerBase
             var promptTokens = tokenizer.Encode(prompt).Length;
             var completionTokens = tokenizer.Encode(response).Length;
 
+            var tps = sw.Elapsed.TotalSeconds > 0 ? completionTokens / sw.Elapsed.TotalSeconds : 0;
+            _modelManager.UpdateModelStats(request.Model, prompt, tps);
+
             var result = new OpenAIChatResponse
             {
                 Model = request.Model,

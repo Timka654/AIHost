@@ -8,55 +8,55 @@ public static class ComputeShaders
 {
     private const string DefaultProvider = "Vulkan";
 
-    // Quantization shaders - lazy loaded from files with inline fallbacks
-    public static string DequantizeQ2K => TryLoadOrInline("dequant_q2k", QuantizationFormats.DequantizeQ2K_Correct);
-    public static string DequantizeQ3K => TryLoadOrInline("dequant_q3k", QuantizationFormats.DequantizeQ3K_Correct);
-    public static string DequantizeQ4K => TryLoadOrInline("dequant_q4k", QuantizationFormats.DequantizeQ4K_Correct);
-    public static string DequantizeQ5K => TryLoadOrInline("dequant_q5k", QuantizationFormats.DequantizeQ5K_Correct);
-    public static string DequantizeQ6K => TryLoadOrInline("dequant_q6k", QuantizationFormats.DequantizeQ6K_Correct);
+    // Quantization shaders - cached once at startup (inline fallback if .glsl file missing)
+    public static readonly string DequantizeQ2K = TryLoadOrInline("dequant_q2k", QuantizationFormats.DequantizeQ2K_Correct);
+    public static readonly string DequantizeQ3K = TryLoadOrInline("dequant_q3k", QuantizationFormats.DequantizeQ3K_Correct);
+    public static readonly string DequantizeQ4K = TryLoadOrInline("dequant_q4k", QuantizationFormats.DequantizeQ4K_Correct);
+    public static readonly string DequantizeQ5K = TryLoadOrInline("dequant_q5k", QuantizationFormats.DequantizeQ5K_Correct);
+    public static readonly string DequantizeQ6K = TryLoadOrInline("dequant_q6k", QuantizationFormats.DequantizeQ6K_Correct);
 
-    // Core operations - lazy loaded from files with inline fallbacks
-    public static string MatMulF32 => TryLoadOrInline("matmul", _inlineMatMul);
+    // Core operations
+    public static readonly string MatMulF32 = TryLoadOrInline("matmul", _inlineMatMul);
 
     // Weight matrices from GGUF are stored column-major (ne[0] is innermost/fastest dim).
     // This variant reads B as column-major: B[bRow, bCol] = data[bRow + bCol * K].
-    public static string MatMulWeightsF32 => TryLoadOrInline("matmul_weights", _inlineMatMulWeights);
-    public static string Softmax => TryLoadOrInline("softmax", _inlineSoftmax);
-    public static string SiLU => TryLoadOrInline("silu", _inlineSiLU);
-    public static string ElementWiseAdd => TryLoadOrInline("add", _inlineAdd);
-    public static string ConcatAxis1 => TryLoadOrInline("concat_axis1", _inlineConcat);
-    public static string ConcatAxis0 => TryLoadOrInline("concat_axis0", _inlineConcatAxis0);
-    
-    // Additional operations - lazy loaded from files with inline fallbacks
-    public static string LayerNorm => TryLoadOrInline("layernorm", _inlineLayerNorm);
-    public static string ElementWiseMul => TryLoadOrInline("elementwise_mul", _inlineElementWiseMul);
-    public static string RoPE => TryLoadOrInline("rope", _inlineRoPE);
-    public static string Transpose => TryLoadOrInline("transpose", _inlineTranspose);
-    public static string RowwiseSoftmax => TryLoadOrInline("rowwise_softmax", _inlineRowwiseSoftmax);
-    public static string Scale => TryLoadOrInline("scale", _inlineScale);
-    public static string EmbeddingLookup => TryLoadOrInline("embedding_lookup", _inlineEmbeddingLookup);
-    public static string RoPEFull => TryLoadOrInline("rope_full", _inlineRoPEFull);
-    public static string CausalMask => TryLoadOrInline("causal_mask", _inlineCausalMask);
-    public static string Copy => TryLoadOrInline("copy", _inlineCopy);
-    public static string RepeatColumns => TryLoadOrInline("repeat_columns", _inlineRepeatColumns);
+    public static readonly string MatMulWeightsF32 = TryLoadOrInline("matmul_weights", _inlineMatMulWeights);
+    public static readonly string Softmax = TryLoadOrInline("softmax", _inlineSoftmax);
+    public static readonly string SiLU = TryLoadOrInline("silu", _inlineSiLU);
+    public static readonly string ElementWiseAdd = TryLoadOrInline("add", _inlineAdd);
+    public static readonly string ConcatAxis1 = TryLoadOrInline("concat_axis1", _inlineConcat);
+    public static readonly string ConcatAxis0 = TryLoadOrInline("concat_axis0", _inlineConcatAxis0);
+
+    // Additional operations
+    public static readonly string LayerNorm = TryLoadOrInline("layernorm", _inlineLayerNorm);
+    public static readonly string ElementWiseMul = TryLoadOrInline("elementwise_mul", _inlineElementWiseMul);
+    public static readonly string RoPE = TryLoadOrInline("rope", _inlineRoPE);
+    public static readonly string Transpose = TryLoadOrInline("transpose", _inlineTranspose);
+    public static readonly string RowwiseSoftmax = TryLoadOrInline("rowwise_softmax", _inlineRowwiseSoftmax);
+    public static readonly string Scale = TryLoadOrInline("scale", _inlineScale);
+    public static readonly string EmbeddingLookup = TryLoadOrInline("embedding_lookup", _inlineEmbeddingLookup);
+    public static readonly string RoPEFull = TryLoadOrInline("rope_full", _inlineRoPEFull);
+    public static readonly string CausalMask = TryLoadOrInline("causal_mask", _inlineCausalMask);
+    public static readonly string Copy = TryLoadOrInline("copy", _inlineCopy);
+    public static readonly string RepeatColumns = TryLoadOrInline("repeat_columns", _inlineRepeatColumns);
 
     // Correct GQA K/V expansion: repeats groups of head_dim columns (not individual columns).
     // K[seq, numKvHeads*headDim] → K_expanded[seq, numQHeads*headDim]
     // Each KV head's headDim-block is repeated repeat_factor times.
-    public static string RepeatKVHeads => TryLoadOrInline("repeat_kv_heads", _inlineRepeatKVHeads);
+    public static readonly string RepeatKVHeads = TryLoadOrInline("repeat_kv_heads", _inlineRepeatKVHeads);
 
     // Extract a contiguous column slice from a 2D tensor.
     // Src: [rows, srcCols], colStart: first column index, colCount: number of columns
     // Dst: [rows, colCount]
-    public static string SliceCols => TryLoadOrInline("slice_cols", _inlineSliceCols);
+    public static readonly string SliceCols = TryLoadOrInline("slice_cols", _inlineSliceCols);
 
     // Scatter (write) src [rows, colCount] into dst [rows, dstCols] starting at colStart.
-    public static string ScatterCols => TryLoadOrInline("scatter_cols", _inlineScatterCols);
+    public static readonly string ScatterCols = TryLoadOrInline("scatter_cols", _inlineScatterCols);
 
     // Fused multi-head (GQA) attention for a SINGLE QUERY token (seqLen=1).
     // Avoids per-head SliceCols/ScatterCols/Transpose allocations.
     // Dispatch: globalWorkSize = { numQHeads } (one workgroup per Q head, 256 threads each)
-    public static string FusedMHAGenerate => TryLoadOrInline("fused_mha_generate", _inlineFusedMHAGenerate);
+    public static readonly string FusedMHAGenerate = TryLoadOrInline("fused_mha_generate", _inlineFusedMHAGenerate);
 
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {

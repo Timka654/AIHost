@@ -109,6 +109,9 @@ public class OllamaController : ControllerBase
         });
         await Response.WriteAsync(finalChunk + "\n");
 
+        var streamTps = evalCount / (evalSw.Elapsed.TotalSeconds > 0 ? evalSw.Elapsed.TotalSeconds : 1);
+        _modelManager.UpdateModelStats(modelName, prompt, streamTps);
+
         return new EmptyResult();
     }
 
