@@ -213,7 +213,7 @@ public class TokenAuthMiddleware : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"❌ Failed to load tokens: {ex.Message}");
+            _logger.LogError(ex, "Failed to load tokens");
         }
     }
     

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
 namespace AIHost.Logging;
 
@@ -31,6 +32,7 @@ public class RequestLogger
     private readonly bool _persistentLogs;
     private readonly int _maxLogFiles;
     private readonly object _fileLock = new();
+    private readonly ILogger<RequestLogger> _logger = AppLogger.Create<RequestLogger>();
 
     public RequestLogger(int maxLogs = 1000, string? logsDirectory = null, bool persistentLogs = true, int maxLogFiles = 10)
     {
@@ -42,7 +44,7 @@ public class RequestLogger
         if (_persistentLogs && !string.IsNullOrEmpty(_logsDirectory))
         {
             Directory.CreateDirectory(_logsDirectory);
-            Console.WriteLine($"✓ Persistent logs enabled: {_logsDirectory}");
+            _logger.LogInformation("Persistent logs enabled: {Directory}", _logsDirectory);
         }
     }
 
@@ -87,7 +89,7 @@ public class RequestLogger
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Failed to write log to disk: {ex.Message}");
+            _logger.LogWarning("Failed to write log to disk: {Error}", ex.Message);
         }
     }
 
@@ -179,7 +181,7 @@ public class RequestLogger
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Failed to load logs from disk: {ex.Message}");
+            _logger.LogWarning("Failed to load logs from disk: {Error}", ex.Message);
             return new List<RequestLogEntry>();
         }
     }

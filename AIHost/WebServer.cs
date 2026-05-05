@@ -1,3 +1,4 @@
+using AIHost;
 using AIHost.Config;
 using AIHost.ICompute;
 using AIHost.ICompute.Vulkan;
@@ -120,6 +121,19 @@ builder.WebHost.ConfigureKestrel(options =>
     options.ListenAnyIP(serverConfig.Port);
 });
 
+// Configure logging level from server config
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+var minLogLevel = serverConfig.LogLevel.ToLowerInvariant() switch
+{
+    "trace"   => Microsoft.Extensions.Logging.LogLevel.Trace,
+    "debug"   => Microsoft.Extensions.Logging.LogLevel.Debug,
+    "warning" => Microsoft.Extensions.Logging.LogLevel.Warning,
+    "error"   => Microsoft.Extensions.Logging.LogLevel.Error,
+    _         => Microsoft.Extensions.Logging.LogLevel.Information
+};
+builder.Logging.SetMinimumLevel(minLogLevel);
+
 // Add services
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
@@ -199,6 +213,10 @@ builder.Services.AddHostedService<ModelAutoUnloadService>();
 builder.Services.AddHostedService<ModelConfigWatcherService>();
 
 var app = builder.Build();
+
+// Initialize AppLogger so non-DI classes (Transformer, InferenceEngine, etc.) get typed loggers
+AppLogger.Initialize(app.Services.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>());
+
 var modelManager = app.Services.GetRequiredService<ModelManager>();
 
 // Configure middleware

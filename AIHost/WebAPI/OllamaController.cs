@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using AIHost.Config;
 using AIHost.Inference;
+using AIHost.Logging;
 using System.Diagnostics;
 
 namespace AIHost.WebAPI;
@@ -10,10 +11,12 @@ namespace AIHost.WebAPI;
 public class OllamaController : ControllerBase
 {
     private readonly ModelManager _modelManager;
+    private readonly RequestLogger _requestLogger;
 
-    public OllamaController(ModelManager modelManager)
+    public OllamaController(ModelManager modelManager, RequestLogger requestLogger)
     {
         _modelManager = modelManager;
+        _requestLogger = requestLogger;
     }
 
     [HttpGet("version")]
@@ -56,6 +59,19 @@ public class OllamaController : ControllerBase
             var evalCount = tokenizer.Encode(generated).Length;
 
             _modelManager.UpdateModelStats(request.Model, request.Prompt, evalCount / (evalDuration / 1e9));
+
+            _requestLogger.LogRequest(new RequestLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Endpoint = "/api/generate",
+                Method = "POST",
+                ModelName = request.Model,
+                Prompt = (request.Prompt?.Length ?? 0) > 200 ? request.Prompt![..200] : (request.Prompt ?? ""),
+                TokensGenerated = evalCount,
+                DurationMs = sw.Elapsed.TotalMilliseconds,
+                TPS = evalCount / (evalDuration / 1e9),
+                Success = true
+            });
 
             return Ok(new OllamaGenerateResponse
             {
@@ -112,6 +128,19 @@ public class OllamaController : ControllerBase
         var streamTps = evalCount / (evalSw.Elapsed.TotalSeconds > 0 ? evalSw.Elapsed.TotalSeconds : 1);
         _modelManager.UpdateModelStats(modelName, prompt, streamTps);
 
+        _requestLogger.LogRequest(new RequestLogEntry
+        {
+            Timestamp = DateTime.UtcNow,
+            Endpoint = "/api/generate (stream)",
+            Method = "POST",
+            ModelName = modelName,
+            Prompt = prompt.Length > 200 ? prompt[..200] : prompt,
+            TokensGenerated = evalCount,
+            DurationMs = sw.Elapsed.TotalMilliseconds,
+            TPS = streamTps,
+            Success = true
+        });
+
         return new EmptyResult();
     }
 
@@ -142,6 +171,19 @@ public class OllamaController : ControllerBase
             var evalCount = tokenizer.Encode(generated).Length;
 
             _modelManager.UpdateModelStats(request.Model, prompt, evalCount / (evalDuration / 1e9));
+
+            _requestLogger.LogRequest(new RequestLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Endpoint = "/api/chat",
+                Method = "POST",
+                ModelName = request.Model,
+                Prompt = prompt.Length > 200 ? prompt[..200] : prompt,
+                TokensGenerated = evalCount,
+                DurationMs = sw.Elapsed.TotalMilliseconds,
+                TPS = evalCount / (evalDuration / 1e9),
+                Success = true
+            });
 
             return Ok(new OllamaChatResponse
             {

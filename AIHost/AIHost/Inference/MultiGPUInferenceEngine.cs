@@ -2,6 +2,7 @@ using AIHost.Compute;
 using AIHost.GGUF;
 using AIHost.ICompute;
 using AIHost.Tokenizer;
+using Microsoft.Extensions.Logging;
 
 namespace AIHost.Inference;
 
@@ -17,6 +18,7 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     private Random _random;
     private MultiDeviceKVCache? _kvCache;
     private bool _disposed;
+    private readonly ILogger<MultiGPUInferenceEngine> _logger = AppLogger.Create<MultiGPUInferenceEngine>();
 
     public BPETokenizer Tokenizer    => _tokenizer;
     public int DeviceCount           => _model.DeviceCount;
@@ -60,10 +62,10 @@ public class MultiGPUInferenceEngine : IInferenceEngine
         {
             int removed = tokens.Count - config.MaxPromptTokens;
             tokens = [.. tokens.Take(1), .. tokens.Skip(removed + 1)];
-            Console.WriteLine($"[MultiGPU] Prompt truncated to {tokens.Count} tokens");
+            _logger.LogWarning("[MultiGPU] Prompt truncated to {Count} tokens", tokens.Count);
         }
 
-        Console.WriteLine($"[MultiGPU] Prompt tokens: {tokens.Count} ids=[{string.Join(",", tokens)}]");
+        _logger.LogDebug("[MultiGPU] Prompt tokens: {Count} ids=[{Ids}]", tokens.Count, string.Join(",", tokens));
 
         if (config.UseKVCache)
         {
@@ -92,13 +94,13 @@ public class MultiGPUInferenceEngine : IInferenceEngine
 
             if (!prefillDone)
             {
-                Console.WriteLine($"[MultiGPU] Prefill {inputTokens.Length} tok: {iterSw.ElapsedMilliseconds}ms");
+                _logger.LogDebug("[MultiGPU] Prefill {Count} tok: {Ms}ms", inputTokens.Length, iterSw.ElapsedMilliseconds);
                 prefillDone = true;
             }
             else if (generated % 10 == 0)
             {
                 double tps = generated / sw.Elapsed.TotalSeconds;
-                Console.WriteLine($"[MultiGPU] Token {generated}: {iterSw.ElapsedMilliseconds}ms | {tps:F1} tok/s");
+                _logger.LogDebug("[MultiGPU] Token {N}: {Ms}ms | {Tps:F1} tok/s", generated, iterSw.ElapsedMilliseconds, tps);
             }
 
             int next = Sample(lastLogits, tokens, config);
@@ -106,7 +108,7 @@ public class MultiGPUInferenceEngine : IInferenceEngine
             generated++;
             onToken?.Invoke(next);
 
-            if (next == eosToken) { Console.WriteLine($"[MultiGPU] EOS at {generated}"); break; }
+            if (next == eosToken) { _logger.LogDebug("[MultiGPU] EOS at {N}", generated); break; }
         }
 
         return tokens;

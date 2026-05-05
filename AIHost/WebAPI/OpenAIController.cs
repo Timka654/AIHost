@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using AIHost.Config;
 using AIHost.Inference;
+using AIHost.Logging;
 using System.Diagnostics;
 
 namespace AIHost.WebAPI;
@@ -10,10 +11,12 @@ namespace AIHost.WebAPI;
 public class OpenAIController : ControllerBase
 {
     private readonly ModelManager _modelManager;
+    private readonly RequestLogger _requestLogger;
 
-    public OpenAIController(ModelManager modelManager)
+    public OpenAIController(ModelManager modelManager, RequestLogger requestLogger)
     {
         _modelManager = modelManager;
+        _requestLogger = requestLogger;
     }
 
     /// <summary>
@@ -45,6 +48,19 @@ public class OpenAIController : ControllerBase
 
             var tps = sw.Elapsed.TotalSeconds > 0 ? completionTokens / sw.Elapsed.TotalSeconds : 0;
             _modelManager.UpdateModelStats(request.Model, prompt, tps);
+
+            _requestLogger.LogRequest(new RequestLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Endpoint = "/v1/chat/completions",
+                Method = "POST",
+                ModelName = request.Model,
+                Prompt = prompt.Length > 200 ? prompt[..200] : prompt,
+                TokensGenerated = completionTokens,
+                DurationMs = sw.Elapsed.TotalMilliseconds,
+                TPS = tps,
+                Success = true
+            });
 
             var result = new OpenAIChatResponse
             {

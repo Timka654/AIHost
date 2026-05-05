@@ -1,6 +1,7 @@
 using AIHost.GGUF;
 using AIHost.ICompute;
 using AIHost.Inference;
+using Microsoft.Extensions.Logging;
 
 namespace AIHost.Compute;
 
@@ -20,6 +21,7 @@ public class Transformer : IDisposable
     private readonly int _dModel;
     private readonly int _numHeads;
     private bool _disposed;
+    private readonly ILogger<Transformer> _logger = AppLogger.Create<Transformer>();
 
     /// <summary>Max context length from GGUF metadata (0 = unknown).</summary>
     public int ContextLength { get; private set; }
@@ -69,7 +71,9 @@ public class Transformer : IDisposable
         var rmsEps       = GetFlt("llama.attention.layer_norm_rms_epsilon", 1e-5f);
         var kvHeads      = GetInt("llama.attention.head_count_kv", 4);
         _localLayerCount = _numLayers;
-        Console.WriteLine($"Transformer: layers={_numLayers} d_model={_dModel} heads={_numHeads} kv_heads={kvHeads} ctx={ContextLength} ffn={ffnLength} rope={ropeFreqBase}");
+        _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} ctx={Ctx} ffn={Ffn} rope={Rope}",
+            _numLayers, _dModel, _numHeads, kvHeads, ContextLength, ffnLength, ropeFreqBase);
+        _logger.LogTrace("Transformer arch: rope_dim_count={RopeDims} rms_eps={RmsEps}", ropeDimCount, rmsEps);
     }
 
     /// <summary>
@@ -77,7 +81,7 @@ public class Transformer : IDisposable
     /// </summary>
     public void LoadWeights()
     {
-        Console.WriteLine("Loading model weights...");
+        _logger.LogInformation("Loading model weights...");
 
         CacheWeight("token_embd.weight");
         CacheWeight("output_norm.weight");
@@ -97,14 +101,14 @@ public class Transformer : IDisposable
             CacheWeight($"{p}.ffn_down.weight");
 
             if ((i + 1) % 5 == 0 || i == _numLayers - 1)
-                Console.WriteLine($"  Uploaded layer {i + 1}/{_numLayers}");
+                _logger.LogDebug("Uploaded layer {Current}/{Total}", i + 1, _numLayers);
         }
 
-        Console.WriteLine($"✓ Weights loaded ({_weightCache.Count} tensors, quantized in VRAM)");
+        _logger.LogInformation("Weights loaded: {Count} tensors, quantized in VRAM", _weightCache.Count);
 
         AllocateScratchWeights("blk.0");
         TryAllocateScratchHead();
-        Console.WriteLine($"✓ F32 scratch buffers allocated ({_scratchF32.Count} tensors)\n");
+        _logger.LogDebug("F32 scratch buffers allocated: {Count} tensors", _scratchF32.Count);
         RunCpuReferenceLayer0();
     }
 
@@ -120,8 +124,9 @@ public class Transformer : IDisposable
         _layerOffset      = globalFirstLayer;
         _localLayerCount  = globalLastLayer - globalFirstLayer;
 
-        Console.WriteLine($"[MultiGPU] Loading layers {globalFirstLayer}..{globalLastLayer - 1}" +
-                          (withEmbedding ? " + embedding" : "") + (withHead ? " + head" : ""));
+        _logger.LogInformation("[MultiGPU] Loading layers {First}..{Last}{Embed}{Head}",
+            globalFirstLayer, globalLastLayer - 1,
+            withEmbedding ? " + embedding" : "", withHead ? " + head" : "");
 
         if (withEmbedding) CacheWeight("token_embd.weight");
         if (withHead)      { CacheWeight("output_norm.weight"); CacheWeight("output.weight"); }
@@ -140,7 +145,7 @@ public class Transformer : IDisposable
             CacheWeight($"{p}.ffn_down.weight");
         }
 
-        Console.WriteLine($"[MultiGPU] ✓ Loaded {_weightCache.Count} tensors for device");
+        _logger.LogInformation("[MultiGPU] Loaded {Count} tensors for device", _weightCache.Count);
         if (_localLayerCount > 0)
             TryAllocateScratch($"blk.{globalFirstLayer}");
         if (withHead)
@@ -152,7 +157,7 @@ public class Transformer : IDisposable
         try { AllocateScratchWeights(layerPrefix); }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Warning] Scratch allocation failed for {layerPrefix}: {ex.Message} — will allocate per inference");
+            _logger.LogWarning("[Scratch] Allocation failed for {Layer}: {Error} — will allocate per inference", layerPrefix, ex.Message);
         }
     }
 
@@ -167,11 +172,11 @@ public class Transformer : IDisposable
             {
                 var scratch = Tensor.Create(_ops.Device, cached.Shape, DataType.F32, name + "_scratch");
                 _scratchF32[name] = scratch;
-                Console.WriteLine($"[MultiGPU]   scratch {name} ({scratch.Shape.TotalElements * 4L / 1024 / 1024} MB F32)");
+                _logger.LogDebug("[MultiGPU] Scratch {Name}: {SizeMB} MB F32", name, scratch.Shape.TotalElements * 4L / 1024 / 1024);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Warning] Scratch for {name} failed: {ex.Message} — will allocate per inference");
+                _logger.LogWarning("[Scratch] {Name} failed: {Error} — will allocate per inference", name, ex.Message);
             }
         }
     }
@@ -232,8 +237,8 @@ public class Transformer : IDisposable
             float[] xn = new float[2048];
             for (int i = 0; i < 2048; i++) xn[i] = emb[i] / rms * normW[i];
 
-            Console.WriteLine($"[CPURef] BOS emb[:3]=[{emb[0]:F5},{emb[1]:F5},{emb[2]:F5}] rms={rms:F6}");
-            Console.WriteLine($"[CPURef] xnorm[:3]=[{xn[0]:F5},{xn[1]:F5},{xn[2]:F5}] maxAbs={xn.Max(MathF.Abs):F4}");
+            _logger.LogTrace("[CPURef] BOS emb[:3]=[{E0:F5},{E1:F5},{E2:F5}] rms={Rms:F6}", emb[0], emb[1], emb[2], rms);
+            _logger.LogTrace("[CPURef] xnorm[:3]=[{X0:F5},{X1:F5},{X2:F5}] maxAbs={MaxAbs:F4}", xn[0], xn[1], xn[2], xn.Max(MathF.Abs));
 
             // Compute Q = xnorm @ wQ (column-major) — first 4 output dims
             var wqF32 = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
@@ -241,19 +246,19 @@ public class Transformer : IDisposable
             float[] q4 = new float[4];
             for (int n = 0; n < 4; n++)
                 for (int k = 0; k < 2048; k++) q4[n] += xn[k] * wqData[k + n * 2048];
-            Console.WriteLine($"[CPURef] Q[:4]=[{q4[0]:F5},{q4[1]:F5},{q4[2]:F5},{q4[3]:F5}]");
+            _logger.LogTrace("[CPURef] Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", q4[0], q4[1], q4[2], q4[3]);
 
             // Also compute V for BOS and compare
             var wvData = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
             float[] wvArr = wvData.Buffer.ReadRange<float>(0, 2048 * 4); wvData.Dispose(); // first 4 output dims
             float[] bosV4 = new float[4];
             for (int n=0;n<4;n++) for (int k=0;k<2048;k++) bosV4[n]+=xn[k]*wvArr[k+n*2048];
-            Console.WriteLine($"[CPURef] BOS V[:4]=[{bosV4[0]:F5},{bosV4[1]:F5},{bosV4[2]:F5},{bosV4[3]:F5}]");
+            _logger.LogTrace("[CPURef] BOS V[:4]=[{V0:F5},{V1:F5},{V2:F5},{V3:F5}]", bosV4[0], bosV4[1], bosV4[2], bosV4[3]);
             var wvGpu = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
             var xnT = Tensor.FromData(_ops.Device, xn, new TensorShape(new[]{1,2048}), "xn_bos_v");
             var bosVgpu = _ops.MatMulWeights(xnT, wvGpu, "V_bos");
             float[] gv = bosVgpu.Buffer.ReadRange<float>(0,4); bosVgpu.Dispose(); xnT.Dispose(); wvGpu.Dispose();
-            Console.WriteLine($"[CPURef] BOS GPU V[:4]=[{gv[0]:F5},{gv[1]:F5},{gv[2]:F5},{gv[3]:F5}] match={Math.Abs(bosV4[0]-gv[0])<1e-3f}");
+            _logger.LogTrace("[CPURef] BOS GPU V[:4]=[{V0:F5},{V1:F5},{V2:F5},{V3:F5}] match={Match}", gv[0], gv[1], gv[2], gv[3], Math.Abs(bosV4[0]-gv[0])<1e-3f);
 
             // GPU Q for comparison: run a minimal forward pass
             var wqF32Tensor = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
@@ -261,8 +266,8 @@ public class Transformer : IDisposable
             var gpuQ = _ops.MatMulWeights(xnTensor, wqF32Tensor, "Q_bos");
             float[] gq = gpuQ.Buffer.ReadRange<float>(0, 4);
             gpuQ.Dispose(); xnTensor.Dispose(); wqF32Tensor.Dispose();
-            Console.WriteLine($"[CPURef] GPU Q[:4]=[{gq[0]:F5},{gq[1]:F5},{gq[2]:F5},{gq[3]:F5}]");
-            Console.WriteLine($"[CPURef] Q match={Math.Abs(q4[0]-gq[0])<1e-3f} diff={Math.Abs(q4[0]-gq[0]):F6}");
+            _logger.LogTrace("[CPURef] GPU Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", gq[0], gq[1], gq[2], gq[3]);
+            _logger.LogTrace("[CPURef] Q match={Match} diff={Diff:F6}", Math.Abs(q4[0]-gq[0])<1e-3f, Math.Abs(q4[0]-gq[0]));
 
             // Check token 6324 ('Hi') - actual token used in test
             var embFull = _ops.Dequantize(_weightCache["token_embd.weight"]);
@@ -281,13 +286,13 @@ public class Transformer : IDisposable
             var hiGpuQ = _ops.MatMulWeights(hiTensor, wqF32b, "Q_hi");
             float[] hiGq = hiGpuQ.Buffer.ReadRange<float>(0, 4);
             hiGpuQ.Dispose(); hiTensor.Dispose(); wqF32b.Dispose();
-            Console.WriteLine($"[CPURef] Hi(6324) rms={hiRms:F6} emb[:3]=[{hiEmb[0]:F6},{hiEmb[1]:F6},{hiEmb[2]:F6}]");
-            Console.WriteLine($"[CPURef] Hi xn[:3]=[{hiXn[0]:F5},{hiXn[1]:F5},{hiXn[2]:F5}]");
-            Console.WriteLine($"[CPURef] Hi CPU Q[:4]=[{hiQ4[0]:F5},{hiQ4[1]:F5},{hiQ4[2]:F5},{hiQ4[3]:F5}]");
-            Console.WriteLine($"[CPURef] Hi GPU Q[:4]=[{hiGq[0]:F5},{hiGq[1]:F5},{hiGq[2]:F5},{hiGq[3]:F5}]");
-            Console.WriteLine($"[CPURef] Hi Q match={Math.Abs(hiQ4[0]-hiGq[0])<1e-3f}");
+            _logger.LogTrace("[CPURef] Hi(6324) rms={Rms:F6} emb[:3]=[{E0:F6},{E1:F6},{E2:F6}]", hiRms, hiEmb[0], hiEmb[1], hiEmb[2]);
+            _logger.LogTrace("[CPURef] Hi xn[:3]=[{X0:F5},{X1:F5},{X2:F5}]", hiXn[0], hiXn[1], hiXn[2]);
+            _logger.LogTrace("[CPURef] Hi CPU Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", hiQ4[0], hiQ4[1], hiQ4[2], hiQ4[3]);
+            _logger.LogTrace("[CPURef] Hi GPU Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", hiGq[0], hiGq[1], hiGq[2], hiGq[3]);
+            _logger.LogTrace("[CPURef] Hi Q match={Match}", Math.Abs(hiQ4[0]-hiGq[0])<1e-3f);
         }
-        catch (Exception ex) { Console.WriteLine($"[CPURef] FAILED: {ex.Message}"); }
+        catch (Exception ex) { _logger.LogTrace(ex, "[CPURef] FAILED"); }
     }
 
     private void AllocateScratchWeights(string layerPrefix)
@@ -355,7 +360,7 @@ public class Transformer : IDisposable
             {
                 var xd = x.ReadData();
                 int last = x.Shape[0] - 1;
-                Console.WriteLine($"[XNorm] seqLen={x.Shape[0]} last tok x_normed[:3]=[{xd[last*2048]:F5},{xd[last*2048+1]:F5},{xd[last*2048+2]:F5}] maxAbs={xd.Max(Math.Abs):F4}");
+                _logger.LogTrace("[XNorm] seqLen={SeqLen} last tok x_normed[:3]=[{X0:F5},{X1:F5},{X2:F5}] maxAbs={MaxAbs:F4}", x.Shape[0], xd[last*2048], xd[last*2048+1], xd[last*2048+2], xd.Max(Math.Abs));
             }
             var (outF32, outScratch) = TempF32("output.weight");
             logits = _ops.MatMulWeights(x, outF32, "logits");

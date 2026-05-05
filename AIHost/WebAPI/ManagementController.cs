@@ -418,6 +418,19 @@ public class ManagementController : ControllerBase
             var tps = sw.Elapsed.TotalSeconds > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
             _modelManager.UpdateModelStats(request.ModelName, request.Message, tps);
 
+            _requestLogger.LogRequest(new AIHost.Logging.RequestLogEntry
+            {
+                Timestamp = DateTime.UtcNow,
+                Endpoint = "/manage/chat",
+                Method = "POST",
+                ModelName = request.ModelName,
+                Prompt = request.Message.Length > 200 ? request.Message[..200] : request.Message,
+                TokensGenerated = tokenCount,
+                DurationMs = sw.Elapsed.TotalMilliseconds,
+                TPS = tps,
+                Success = true
+            });
+
             return Ok(new
             {
                 model = request.ModelName,

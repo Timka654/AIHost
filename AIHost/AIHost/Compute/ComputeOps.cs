@@ -2,6 +2,7 @@ using AIHost.GGUF;
 using AIHost.ICompute;
 using AIHost.ICompute.Vulkan;
 using AIHost.Inference;
+using Microsoft.Extensions.Logging;
 using System.Runtime.InteropServices;
 
 namespace AIHost.Compute;
@@ -22,6 +23,7 @@ public class ComputeOps : IDisposable
     private bool _batchMode;
     private readonly List<IDisposable> _deferred = [];
     internal bool _dbgLayer0 = true;
+    private readonly ILogger<ComputeOps> _logger = AppLogger.Create<ComputeOps>();
 
     public IComputeDevice Device => _device;
 
@@ -1037,8 +1039,8 @@ public class ComputeOps : IDisposable
         {
             var ap = attnProj.ReadData();
             var xraw = x.ReadData(); int lastRow = seqLen - 1;
-            Console.WriteLine($"[L0] x[last,0..2]=[{xraw[lastRow*dModel]:F5},{xraw[lastRow*dModel+1]:F5},{xraw[lastRow*dModel+2]:F5}]");
-            Console.WriteLine($"[L0] attnProj[last,0..2]=[{ap[lastRow*dModel]:F5},{ap[lastRow*dModel+1]:F5},{ap[lastRow*dModel+2]:F5}] maxAbs={ap.Max(Math.Abs):F4}");
+            _logger.LogTrace("[L0] x[last,0..2]=[{X0:F5},{X1:F5},{X2:F5}]", xraw[lastRow*dModel], xraw[lastRow*dModel+1], xraw[lastRow*dModel+2]);
+            _logger.LogTrace("[L0] attnProj[last,0..2]=[{A0:F5},{A1:F5},{A2:F5}] maxAbs={MaxAbs:F4}", ap[lastRow*dModel], ap[lastRow*dModel+1], ap[lastRow*dModel+2], ap.Max(Math.Abs));
         }
 
         Defer(attnProj);
@@ -1056,9 +1058,9 @@ public class ComputeOps : IDisposable
         if (_dbgLayer0 && layerIdx == 0 && seqLen <= 3)
         {
             var ff = ffnOut.ReadData(); int lr = seqLen - 1;
-            Console.WriteLine($"[L0] ffnOut[last,0..2]=[{ff[lr*dModel]:F5},{ff[lr*dModel+1]:F5},{ff[lr*dModel+2]:F5}] maxAbs={ff.Max(Math.Abs):F4}");
+            _logger.LogTrace("[L0] ffnOut[last,0..2]=[{F0:F5},{F1:F5},{F2:F5}] maxAbs={MaxAbs:F4}", ff[lr*dModel], ff[lr*dModel+1], ff[lr*dModel+2], ff.Max(Math.Abs));
             var outp = output.ReadData();
-            Console.WriteLine($"[L0] output[last,0..2]=[{outp[lr*dModel]:F5},{outp[lr*dModel+1]:F5},{outp[lr*dModel+2]:F5}] maxAbs={outp.Max(Math.Abs):F4}");
+            _logger.LogTrace("[L0] output[last,0..2]=[{O0:F5},{O1:F5},{O2:F5}] maxAbs={MaxAbs:F4}", outp[lr*dModel], outp[lr*dModel+1], outp[lr*dModel+2], outp.Max(Math.Abs));
             _dbgLayer0 = false;
         }
         Defer(x1);

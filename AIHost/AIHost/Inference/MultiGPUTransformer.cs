@@ -1,6 +1,7 @@
 using AIHost.Compute;
 using AIHost.GGUF;
 using AIHost.ICompute;
+using Microsoft.Extensions.Logging;
 
 namespace AIHost.Inference;
 
@@ -51,6 +52,7 @@ public class MultiGPUTransformer : IDisposable
     private readonly Transformer[] _transformers;
     private readonly int[] _deviceFirstLayer; // global layer index where each device starts
     private bool _disposed;
+    private readonly ILogger<MultiGPUTransformer> _logger = AppLogger.Create<MultiGPUTransformer>();
 
     public int DeviceCount   => _devices.Length;
     public int TotalLayers   => _transformers[0].LayerCount;
@@ -112,10 +114,9 @@ public class MultiGPUTransformer : IDisposable
                 withHead:         d == 0);   // head always on device 0
         }
 
-        Console.WriteLine($"[MultiGPU] {n} device(s), {numLayers} layers total");
+        _logger.LogInformation("[MultiGPU] {Count} device(s), {Layers} layers total", n, numLayers);
         for (int d = 0; d < n; d++)
-            Console.WriteLine($"  Device {d}: layers {_deviceFirstLayer[d]}..{_deviceFirstLayer[d + 1] - 1}" +
-                              (d == 0 ? " + embedding + head" : ""));
+            _logger.LogInformation("  Device {D}: layers {First}..{Last}{Extra}", d, _deviceFirstLayer[d], _deviceFirstLayer[d + 1] - 1, d == 0 ? " + embedding + head" : "");
     }
 
     // ── Forward pass ─────────────────────────────────────────────────────────
