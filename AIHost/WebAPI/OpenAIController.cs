@@ -12,11 +12,13 @@ public class OpenAIController : ControllerBase
 {
     private readonly ModelManager _modelManager;
     private readonly RequestLogger _requestLogger;
+    private readonly ILogger<OpenAIController> _logger;
 
-    public OpenAIController(ModelManager modelManager, RequestLogger requestLogger)
+    public OpenAIController(ModelManager modelManager, RequestLogger requestLogger, ILogger<OpenAIController> logger)
     {
         _modelManager = modelManager;
         _requestLogger = requestLogger;
+        _logger = logger;
     }
 
     /// <summary>
@@ -90,11 +92,12 @@ public class OpenAIController : ControllerBase
         }
         catch (Exception ex)
         {
+            _logger.LogError(ex, "OpenAI request failed [{Type}]: {Message}", ex.GetType().FullName, ex.Message);
             return BadRequest(new OpenAIErrorResponse
             {
                 Error = new OpenAIError
                 {
-                    Message = ex.Message,
+                    Message = $"{ex.Message} | type={ex.GetType().FullName} | inner={ex.InnerException?.Message} | stack={ex.StackTrace}",
                     Type = "invalid_request_error"
                 }
             });

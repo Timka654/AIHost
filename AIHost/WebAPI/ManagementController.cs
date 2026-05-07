@@ -155,12 +155,15 @@ public class ManagementController : ControllerBase
     private readonly ModelManager _modelManager;
     private readonly RequestLogger _requestLogger;
     private readonly DownloadManager _downloadManager;
+    private readonly ILogger<ManagementController> _logger;
 
-    public ManagementController(ModelManager modelManager, RequestLogger requestLogger, DownloadManager downloadManager)
+    public ManagementController(ModelManager modelManager, RequestLogger requestLogger,
+                                 DownloadManager downloadManager, ILogger<ManagementController> logger)
     {
         _modelManager = modelManager;
         _requestLogger = requestLogger;
         _downloadManager = downloadManager;
+        _logger = logger;
     }
 
     /// <summary>
@@ -441,15 +444,18 @@ public class ManagementController : ControllerBase
         }
         catch (ArgumentException ex)
         {
-            return NotFound(new { error = $"Model config '{request.ModelName}' not found. Please check the config exists in the Configs section. Details: {ex.Message}" });
+            _logger.LogError(ex, "Model config not found for DirectChat: {Model}", request.ModelName);
+            return NotFound(new { error = $"Model config '{request.ModelName}' not found.", detail = ex.Message, stack = ex.ToString() });
         }
         catch (FileNotFoundException ex)
         {
-            return NotFound(new { error = $"Model file not found. Please initialize/download the model first. Details: {ex.Message}" });
+            _logger.LogError(ex, "File/library not found during DirectChat for model {Model}", request.ModelName);
+            return NotFound(new { error = "Model file or required library not found.", detail = ex.Message, stack = ex.ToString() });
         }
         catch (Exception ex)
         {
-            return StatusCode(500, new { error = $"Chat failed: {ex.Message}" });
+            _logger.LogError(ex, "DirectChat failed for model {Model}: {Type}: {Message}", request.ModelName, ex.GetType().FullName, ex.Message);
+            return StatusCode(500, new { error = ex.Message, type = ex.GetType().FullName, detail = ex.InnerException?.Message, stack = ex.ToString() });
         }
     }
 

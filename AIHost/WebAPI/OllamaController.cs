@@ -12,11 +12,13 @@ public class OllamaController : ControllerBase
 {
     private readonly ModelManager _modelManager;
     private readonly RequestLogger _requestLogger;
+    private readonly ILogger<OllamaController> _logger;
 
-    public OllamaController(ModelManager modelManager, RequestLogger requestLogger)
+    public OllamaController(ModelManager modelManager, RequestLogger requestLogger, ILogger<OllamaController> logger)
     {
         _modelManager = modelManager;
         _requestLogger = requestLogger;
+        _logger = logger;
     }
 
     [HttpGet("version")]
@@ -87,7 +89,8 @@ public class OllamaController : ControllerBase
         }
         catch (Exception ex)
         {
-            return BadRequest(new { error = ex.Message });
+            _logger.LogError(ex, "Request failed [{Type}]: {Message}", ex.GetType().FullName, ex.Message);
+            return BadRequest(new { error = ex.Message, type = ex.GetType().FullName, detail = ex.InnerException?.Message, stack = ex.ToString() });
         }
     }
 
@@ -199,7 +202,8 @@ public class OllamaController : ControllerBase
         }
         catch (Exception ex)
         {
-            return BadRequest(new { error = ex.Message });
+            _logger.LogError(ex, "Request failed [{Type}]: {Message}", ex.GetType().FullName, ex.Message);
+            return BadRequest(new { error = ex.Message, type = ex.GetType().FullName, detail = ex.InnerException?.Message, stack = ex.ToString() });
         }
     }
 
