@@ -20,14 +20,38 @@ public class TensorNameMapper
         _allTensorNames = model.Tensors.Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
 
         Console.WriteLine($"[Arch] model architecture = '{_arch}'");
+        PrintDiagnostics(model);
+    }
 
-        // Warn about unsupported features detected in tensor names
+    private void PrintDiagnostics(IGGUFModel model)
+    {
+        // Print all blk.0.* tensor names so mismatches are immediately visible in logs.
+        var layer0 = _allTensorNames
+            .Where(n => n.StartsWith("blk.0.") || n.StartsWith("blk.0_"))
+            .OrderBy(n => n).ToList();
+
+        if (layer0.Count > 0)
+        {
+            Console.WriteLine("[Arch] Layer-0 tensors in GGUF:");
+            foreach (var n in layer0) Console.WriteLine($"  {n}");
+        }
+        else
+        {
+            Console.WriteLine("[Arch] Warning: no 'blk.0.*' tensors found — tensor name format may differ");
+            Console.WriteLine("[Arch] First 20 tensor names:");
+            foreach (var n in _allTensorNames.OrderBy(x => x).Take(20))
+                Console.WriteLine($"  {n}");
+        }
+
+        // Detect and warn about special architectures
         if (HasAny("attn_q_a.weight", "attn_kv_a_mqa.weight"))
             Console.WriteLine("[Arch] MLA attention detected (DeepSeek-style) — not fully supported");
         if (HasAny("ffn_gate_exps.weight", ".ffn_exp.0."))
-            Console.WriteLine("[Arch] MoE FFN detected — using expert 0 as representative (single-path inference only)");
-        if (HasAny("attn_qkv.weight"))
-            Console.WriteLine("[Arch] Combined QKV weight detected (Phi/Falcon-style)");
+            Console.WriteLine("[Arch] MoE FFN detected — expert 0 used for single-path inference");
+        if (HasCombinedQKV)
+            Console.WriteLine("[Arch] Combined QKV weight — using ApplyLayerCombinedQKV");
+        if (HasAny("attn_q.weight") && !HasCombinedQKV)
+            Console.WriteLine("[Arch] Separate Q/K/V weights — standard attention path");
     }
 
     // ── Attention layout ─────────────────────────────────────────────────────
