@@ -38,15 +38,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mesa-opencl-icd \
     libgl1 \
     libglib2.0-0 \
-    # libshaderc1 provides libshaderc_shared.so.1 required by Silk.NET.Shaderc
-    # for runtime GLSL → SPIR-V compilation of Vulkan compute kernels.
-    libshaderc1 \
+    # libshaderc-dev: installs libshaderc_shared.so.1 AND the unversioned .so symlink
+    # that Silk.NET.Shaderc requires for GLSL→SPIR-V kernel compilation.
+    libshaderc-dev \
     nvidia-cuda-toolkit \
     pciutils \
     lshw \
     libamdhip64-dev \
     rocm-smi \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # Ensure ldconfig cache includes the shaderc library.
+    && ldconfig
 
 # Этот этап используется в рабочей среде или при запуске из VS в обычном режиме (по умолчанию, когда конфигурация отладки не используется)
 FROM pre_final AS final

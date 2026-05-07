@@ -7,7 +7,37 @@ using AIHost.ICompute.ROCm;
 using AIHost.Logging;
 using AIHost.Middleware;
 using AIHost.Services;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+
+// ── Silk.NET.Shaderc native library resolver ─────────────────────────────────
+// Silk.NET.Shaderc tries to load "shaderc_shared" or "libshaderc_shared" at runtime
+// for GLSL→SPIR-V compilation. On Linux the installed library may only exist as
+// "libshaderc_shared.so.1" (versioned) without an unversioned symlink.
+// This resolver tries all common variants before the OS dynamic linker gives up.
+NativeLibrary.SetDllImportResolver(
+    typeof(Silk.NET.Shaderc.Shaderc).Assembly,
+    (libName, assembly, searchPath) =>
+    {
+        // Only intercept shaderc — let everything else resolve normally
+        if (!libName.Contains("shaderc", StringComparison.OrdinalIgnoreCase))
+            return IntPtr.Zero;
+
+        string[] candidates = RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+            ? ["libshaderc_shared.so.1", "libshaderc_shared.so", "libshaderc.so.1",
+               "shaderc_shared", "libshaderc_combined.so.1"]
+            : ["shaderc_shared", "shaderc"];
+
+        foreach (var name in candidates)
+            if (NativeLibrary.TryLoad(name, assembly, searchPath, out var h))
+            {
+                Console.WriteLine($"[Shaderc] Loaded native library as '{name}'");
+                return h;
+            }
+
+        Console.WriteLine($"[Shaderc] WARNING: could not load shaderc — tried: {string.Join(", ", candidates)}");
+        return IntPtr.Zero;   // let Silk.NET throw its normal error
+    });
 
 // Manual test mode: bypass web server entirely
 if (args.Contains("--manual"))
