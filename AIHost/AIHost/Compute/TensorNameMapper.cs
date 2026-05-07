@@ -30,19 +30,37 @@ public class TensorNameMapper
             Console.WriteLine("[Arch] Combined QKV weight detected (Phi/Falcon-style)");
     }
 
+    // ── Attention layout ─────────────────────────────────────────────────────
+
+    /// <summary>True when the model stores Q, K, V in a single fused weight.</summary>
+    public bool HasCombinedQKV => HasAny("attn_qkv.weight", "attention.wqkv.weight");
+
     // ── Layer weight names ────────────────────────────────────────────────────
 
     public string AttnNorm(int layer)        => Try($"blk.{layer}.attn_norm.weight",
                                                     $"blk.{layer}.ln1.weight");
 
-    public string AttnQ(int layer)           => Try($"blk.{layer}.attn_q.weight",
-                                                    $"blk.{layer}.attn_q_proj.weight");
+    /// <summary>
+    /// Combined QKV weight for architectures that don't have separate Q/K/V.
+    /// Shape (GGUF column-major): [n_embd, (n_q_heads + 2*n_kv_heads) * head_dim]
+    /// </summary>
+    public string AttnQKV(int layer)         => Try($"blk.{layer}.attn_qkv.weight",
+                                                    $"blk.{layer}.attention.wqkv.weight");
 
-    public string AttnK(int layer)           => Try($"blk.{layer}.attn_k.weight",
-                                                    $"blk.{layer}.attn_k_proj.weight");
+    public string AttnQ(int layer)           => HasCombinedQKV
+                                                ? AttnQKV(layer)  // caller must handle split
+                                                : Try($"blk.{layer}.attn_q.weight",
+                                                      $"blk.{layer}.attn_q_proj.weight");
 
-    public string AttnV(int layer)           => Try($"blk.{layer}.attn_v.weight",
-                                                    $"blk.{layer}.attn_v_proj.weight");
+    public string AttnK(int layer)           => HasCombinedQKV
+                                                ? AttnQKV(layer)
+                                                : Try($"blk.{layer}.attn_k.weight",
+                                                      $"blk.{layer}.attn_k_proj.weight");
+
+    public string AttnV(int layer)           => HasCombinedQKV
+                                                ? AttnQKV(layer)
+                                                : Try($"blk.{layer}.attn_v.weight",
+                                                      $"blk.{layer}.attn_v_proj.weight");
 
     public string AttnOutput(int layer)      => Try($"blk.{layer}.attn_output.weight",
                                                     $"blk.{layer}.attn_out_proj.weight",

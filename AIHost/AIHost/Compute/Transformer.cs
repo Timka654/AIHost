@@ -38,6 +38,7 @@ public class Transformer : IDisposable
     // Default 0 (single-GPU). Device 1 handling global layers 11-21 sets this to 11.
     private int _layerOffset = 0;
     private int _localLayerCount;
+    private int _numKVHeads;
     private TensorNameMapper? _nameMapper; // set after weights are loaded
 
     public int LayerCount => _numLayers;
@@ -78,6 +79,7 @@ public class Transformer : IDisposable
         var ropeDimCount = ArchInt("rope.dimension_count", _dModel / _numHeads);
         var rmsEps       = ArchFlt("attention.layer_norm_rms_epsilon", 1e-5f);
         var kvHeads      = ArchInt("attention.head_count_kv", 4);
+        _numKVHeads      = kvHeads;
         _localLayerCount = _numLayers;
         _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} ctx={Ctx} ffn={Ffn} rope={Rope}",
             _numLayers, _dModel, _numHeads, kvHeads, ContextLength, ffnLength, ropeFreqBase);
@@ -298,18 +300,29 @@ public class Transformer : IDisposable
         // Determine which global layer index this name belongs to
         int refLayer = _layerOffset;  // first layer on this device
 
-        var names = new[]
-        {
-            _nameMapper.AttnNorm(refLayer),
-            _nameMapper.AttnQ(refLayer),
-            _nameMapper.AttnK(refLayer),
-            _nameMapper.AttnV(refLayer),
-            _nameMapper.AttnOutput(refLayer),
-            _nameMapper.FfnNorm(refLayer),
-            _nameMapper.FfnGate(refLayer),
-            _nameMapper.FfnUp(refLayer),
-            _nameMapper.FfnDown(refLayer),
-        };
+        var names = _nameMapper.HasCombinedQKV
+            ? new[]
+            {
+                _nameMapper.AttnNorm(refLayer),
+                _nameMapper.AttnQKV(refLayer),
+                _nameMapper.AttnOutput(refLayer),
+                _nameMapper.FfnNorm(refLayer),
+                _nameMapper.FfnGate(refLayer),
+                _nameMapper.FfnUp(refLayer),
+                _nameMapper.FfnDown(refLayer),
+            }
+            : new[]
+            {
+                _nameMapper.AttnNorm(refLayer),
+                _nameMapper.AttnQ(refLayer),
+                _nameMapper.AttnK(refLayer),
+                _nameMapper.AttnV(refLayer),
+                _nameMapper.AttnOutput(refLayer),
+                _nameMapper.FfnNorm(refLayer),
+                _nameMapper.FfnGate(refLayer),
+                _nameMapper.FfnUp(refLayer),
+                _nameMapper.FfnDown(refLayer),
+            };
 
         // Determine prefix length: everything up to and including the second dot
         // e.g. "blk.0." from "blk.0.attn_q.weight"
@@ -373,9 +386,13 @@ public class Transformer : IDisposable
 
     private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null)
     {
-        // layerIdx is LOCAL (0-based for this device); mapper uses global index.
-        int g = layerIdx + _layerOffset;
+        int g  = layerIdx + _layerOffset;
         var nm = _nameMapper!;
+
+        // Architectures with combined QKV (Qwen3.5/Phi/Falcon) need special handling:
+        // compute qkv = xnorm @ W_qkv, then split into Q/K/V before calling TransformerLayer.
+        if (nm.HasCombinedQKV)
+            return ApplyLayerCombinedQKV(x, g, layerIdx, position, kvCache, nm);
         int seqLen = x.Shape[0];
 
         // Batch mode (one fence wait per layer): fast for generation (seqLen=1, tiny matrices).
@@ -445,6 +462,84 @@ public class Transformer : IDisposable
     }
 
     /// <summary>
+    /// Layer forward pass for models with combined QKV weight (Qwen3.5, Phi, Falcon).
+    /// Computes qkv = xnorm @ W_qkv, then splits into Q/K/V before attention.
+    /// headDim is derived from the QKV weight shape to handle models where
+    /// n_embd != n_heads * head_dim (typical in GQA models).
+    /// </summary>
+    private Tensor ApplyLayerCombinedQKV(Tensor x, int g, int layerIdx, uint position,
+                                          KVCache? kvCache, TensorNameMapper nm)
+    {
+
+        // Attention: xnorm → QKV → split
+        var xNorm = _ops.Clone(x, "attn_norm_in");
+        var (wAN, sAN) = TempF32(nm.AttnNorm(g));
+        _ops.LayerNorm(xNorm, wAN);
+        if (!sAN) wAN.Dispose();
+
+        var (wQKV, sQKV) = TempF32(nm.AttnQKV(g));
+        var qkv = _ops.MatMulWeights(xNorm, wQKV, "qkv");
+        if (!sQKV) wQKV.Dispose();
+        xNorm.Dispose();
+
+        // Derive head_dim from the QKV weight output dimension.
+        // qkv.Shape[1] = (n_heads + 2*n_kv_heads) * head_dim
+        int kvHeads  = _weightCache[nm.AttnK(g)].Shape[1] > 0  // fallback: use cached KV weight shape
+                        ? 0 : 0; // placeholder — compute below
+        int totalQKV = qkv.Shape[1];
+        int nKvH    = _numKVHeads;
+        int headDim = totalQKV / (_numHeads + 2 * nKvH);
+        int qDim    = _numHeads * headDim;
+        int kvDim   = nKvH      * headDim;
+
+        var Q = _ops.SliceCols(qkv,            0, qDim, "Q");
+        var K = _ops.SliceCols(qkv,         qDim, kvDim, "K");
+        var V = _ops.SliceCols(qkv, qDim + kvDim, kvDim, "V");
+        qkv.Dispose();
+
+        _ops.ApplyRoPEFull(Q, position, _numHeads, headDim);
+        _ops.ApplyRoPEFull(K, position, nKvH,      headDim);
+
+        Tensor attnOut;
+        if (kvCache != null)
+        {
+            kvCache.Add(layerIdx, K, V);
+            var (cachedK, cachedV) = kvCache.Get(layerIdx);
+            attnOut = _ops.MultiHeadAttention(Q, cachedK!, cachedV!, _numHeads, position, "attn_out");
+            _ops.DeferExternal(Q);
+        }
+        else
+        {
+            attnOut = _ops.MultiHeadAttention(Q, K, V, _numHeads, position, "attn_out");
+            _ops.DeferExternal(Q); _ops.DeferExternal(K); _ops.DeferExternal(V);
+        }
+
+        var (wAO, sAO) = TempF32(nm.AttnOutput(g));
+        var attnProj = _ops.MatMulWeights(attnOut, wAO, "attn_proj");
+        if (!sAO) wAO.Dispose();
+        attnOut.Dispose();
+
+        var x1 = _ops.Add(x, attnProj, "x_after_attn");
+        attnProj.Dispose();
+
+        // FFN
+        var x1Norm = _ops.Clone(x1, "ffn_norm_in");
+        var (wFN, sFN) = TempF32(nm.FfnNorm(g));
+        _ops.LayerNorm(x1Norm, wFN);
+        if (!sFN) wFN.Dispose();
+
+        var (wG, sG) = TempF32(nm.FfnGate(g));
+        var (wU, sU) = TempF32(nm.FfnUp(g));
+        var (wD, sD) = TempF32(nm.FfnDown(g));
+        var ffnOut = _ops.FeedForward(x1Norm, wG, wU, wD, "ffn_out");
+        if (!sG) wG.Dispose(); if (!sU) wU.Dispose(); if (!sD) wD.Dispose();
+        x1Norm.Dispose();
+        var output = _ops.Add(x1, ffnOut, "layer_out");
+        x1.Dispose(); ffnOut.Dispose(); x.Dispose();
+        return output;
+    }
+
+    /// <summary>
     /// Returns an F32 tensor from the named cached weight.
     /// Uses a pre-allocated scratch buffer if available (no vkAllocateMemory); otherwise
     /// allocates a new tensor. Caller must NOT dispose scratch tensors (owned by Transformer).
@@ -472,9 +567,14 @@ public class Transformer : IDisposable
     {
         var nm = _nameMapper!;
         CacheWeight(nm.AttnNorm(globalLayer));
-        CacheWeight(nm.AttnQ(globalLayer));
-        CacheWeight(nm.AttnK(globalLayer));
-        CacheWeight(nm.AttnV(globalLayer));
+        if (nm.HasCombinedQKV)
+            CacheWeight(nm.AttnQKV(globalLayer));   // single fused QKV weight
+        else
+        {
+            CacheWeight(nm.AttnQ(globalLayer));
+            CacheWeight(nm.AttnK(globalLayer));
+            CacheWeight(nm.AttnV(globalLayer));
+        }
         CacheWeight(nm.AttnOutput(globalLayer));
         CacheWeight(nm.FfnNorm(globalLayer));
         CacheWeight(nm.FfnGate(globalLayer));
