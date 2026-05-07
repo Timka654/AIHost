@@ -47,6 +47,17 @@ public class ROCmComputeKernel : IComputeKernel
     {
         if (_compiled) return;
 
+        // GLSL source (starts with #version) cannot be compiled by HIPRTC which expects HIP C++.
+        // All compute kernels in AIHost are currently written in GLSL for Vulkan.
+        // To use ROCm provider: either switch to "vulkan" (AMD GPUs support Vulkan via RADV)
+        // or provide HIP C++ kernel equivalents.
+        if (_source.TrimStart().StartsWith("#version", StringComparison.Ordinal))
+            throw new NotSupportedException(
+                "ROCm provider received a GLSL shader — HIPRTC requires HIP C++.\n" +
+                "All AIHost compute kernels are written in GLSL for Vulkan.\n" +
+                "Recommended fix: use compute_provider=\"vulkan\" — AMD GPUs support Vulkan via the RADV driver " +
+                "and performance is comparable to ROCm for this workload.");
+
         // 1. Create HIPRTC program
         HipRtcApi.CheckError(
             HipRtcApi.hiprtcCreateProgram(out IntPtr prog, _source, _entryPoint, 0, null, null),
