@@ -1152,6 +1152,62 @@ public class ComputeOps : IDisposable
 
     #region Embedding
 
+    // Above this size (F32 bytes) dequantizing the whole embedding table is unsafe on
+    // memory-limited GPUs. Use per-row extraction instead.
+    private const long EmbeddingF32SizeThreshold = 512L * 1024 * 1024; // 512 MB
+
+    /// <summary>
+    /// Embedding lookup that dequantizes only the rows needed for the current token IDs.
+    /// For small embedding tables falls back to the standard full-dequant path.
+    /// For large tables (e.g. 248K-vocab 27B models, 5 GB F32) reads only
+    /// seqLen rows from the quantized buffer on CPU, concatenates them into a
+    /// small scratch tensor, dequantizes that on GPU, and returns the result.
+    /// </summary>
+    public Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedTable,
+                                                string? resultName = null)
+    {
+        int dModel    = quantizedTable.Shape[0]; // ne[0] = embedding dim (innermost)
+        int vocabSize = quantizedTable.Shape[1]; // ne[1] = vocab size
+
+        long f32Size  = (long)dModel * vocabSize * sizeof(float);
+        if (f32Size <= EmbeddingF32SizeThreshold)
+        {
+            // Small enough — dequantize full table, then do GPU lookup as usual
+            var fullF32 = Dequantize(quantizedTable);
+            var res     = EmbeddingLookup(tokenIds, fullF32, resultName);
+            fullF32.Dispose();
+            return res;
+        }
+
+        // Large embedding table: extract just the needed rows on CPU.
+        int  seqLen      = tokenIds.Length;
+        long bytesPerRow  = (long)quantizedTable.Buffer.Size / vocabSize;
+
+        // Read one quantized row per token and pack them into a contiguous small buffer
+        var packedBytes = new byte[seqLen * bytesPerRow];
+        for (int i = 0; i < seqLen; i++)
+        {
+            int    tokenId    = tokenIds[i];
+            ulong  byteOffset = (ulong)(tokenId * bytesPerRow);
+            byte[] rowBytes   = quantizedTable.Buffer.ReadRange<byte>(byteOffset, (int)bytesPerRow);
+            Buffer.BlockCopy(rowBytes, 0, packedBytes, (int)(i * bytesPerRow), (int)bytesPerRow);
+        }
+
+        // Upload packed rows as a small quantized tensor shaped [seqLen, dModel].
+        // The data layout is: row_token0 | row_token1 | ... so after dequantization
+        // the result is exactly [seqLen, dModel] in row-major order.
+        var smallBuf = _device.CreateBuffer((ulong)packedBytes.Length, BufferType.Storage, DataType.I8);
+        smallBuf.Write(packedBytes);
+        var smallQuantized = new Tensor(smallBuf, TensorShape.Matrix(seqLen, dModel),
+                                         quantizedTable.DataType, "emb_rows");
+
+        // Dequantize to F32; the resulting layout is [seqLen * dModel] contiguous,
+        // which equals [seqLen, dModel] row-major — exactly the embedding tensor we need.
+        var smallF32 = Dequantize(smallQuantized, resultName);
+        smallQuantized.Dispose();
+        return smallF32;
+    }
+
     /// <summary>
     /// GPU embedding lookup: select rows from table by token IDs.
     /// table: [vocabSize × dModel], tokenIds: [seqLen] → result: [seqLen × dModel]

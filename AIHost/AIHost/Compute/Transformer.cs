@@ -174,12 +174,21 @@ public class Transformer : IDisposable
     }
 
     /// <summary>Token embedding lookup. Returns [seqLen, dModel] on this device's GPU.</summary>
-    public Tensor ForwardEmbedding(int[] tokenIds)
+    public Tensor ForwardEmbedding(int[] tokenIds) => EmbeddingLookupOptimized(tokenIds);
+
+    private Tensor EmbeddingLookupOptimized(int[] tokenIds)
     {
-        var (embF32, embScratch) = TempF32(_nameMapper!.TokenEmbd);
-        var x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
-        if (!embScratch) embF32.Dispose();
-        return x;
+        var embCached = _weightCache[_nameMapper!.TokenEmbd];
+        if (embCached.DataType == DataType.F32)
+        {
+            // F32 table: clone → lookup
+            var f32 = _ops.Clone(embCached);
+            var result = _ops.EmbeddingLookup(tokenIds, f32, "embeddings");
+            f32.Dispose();
+            return result;
+        }
+        // Quantized table: row-extraction path avoids full dequant for large vocab
+        return _ops.EmbeddingLookupFromQuantized(tokenIds, embCached, "embeddings");
     }
 
     /// <summary>
@@ -363,13 +372,9 @@ public class Transformer : IDisposable
         Console.WriteLine($"Forward pass: {tokenIds.Length} tokens at position {startPosition}");
 #endif
 
-        // 1. Token embedding: dequantize table → lookup → free table
-        Tensor x;
-        {
-            var (embF32, embScratch) = TempF32(_nameMapper!.TokenEmbd);
-            x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
-            if (!embScratch) embF32.Dispose();
-        }
+        // 1. Token embedding: use quantized-row extraction for large vocab tables
+        //    (e.g. 248K-vocab 27B models where full F32 dequant = 5 GB).
+        Tensor x = EmbeddingLookupOptimized(tokenIds);
 
         // 2. All transformer layers
         for (int i = 0; i < _numLayers; i++)
