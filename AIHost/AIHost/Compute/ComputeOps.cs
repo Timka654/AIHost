@@ -82,6 +82,69 @@ public class ComputeOps : IDisposable
 
     #region Matrix Operations
 
+    // Max F32 bytes per single GPU allocation for large-weight chunked projection.
+    // Models with huge vocabularies (e.g. Qwen 248K) exceed VRAM with a full dequant.
+    private const long MaxF32AllocationBytes = 1L * 1024 * 1024 * 1024; // 1 GB
+
+    /// <summary>
+    /// MatMulWeights with automatic chunking for tensors whose dequantized F32 size
+    /// exceeds MaxF32AllocationBytes (e.g. lm_head for 248K-vocab models).
+    /// Falls back to standard MatMulWeights when the tensor is small enough.
+    /// Chunking splits the output-vocabulary axis into strips, dequantizes each strip
+    /// separately (staying under the 1 GB single-allocation limit), and assembles the
+    /// full logit tensor at the end.
+    /// </summary>
+    public Tensor MatMulWeightsLarge(Tensor a, Tensor quantized, string? resultName = null)
+    {
+        int M = a.Shape[0], K = a.Shape[1];
+        int N = quantized.Shape[1]; // vocab / output dim
+
+        long fullF32  = (long)quantized.Shape.TotalElements * sizeof(float);
+
+        if (fullF32 <= MaxF32AllocationBytes)
+            return MatMulWeights(a, Dequantize(quantized), resultName); // small enough — direct
+
+        // Chunk along the N (vocabulary) dimension.
+        // Each chunk row is `K` elements; bytes-per-row in the raw quantized buffer =
+        // totalRawBytes / N (since rows are vocab items when ne[1]=N).
+        int chunkRows   = (int)(MaxF32AllocationBytes / ((long)K * sizeof(float)));
+        chunkRows       = Math.Max(256, chunkRows & ~255); // round down to multiple of 256
+        int numChunks   = (N + chunkRows - 1) / chunkRows;
+
+        long bytesPerRow = (long)quantized.Buffer.Size / N;
+
+        var result = Tensor.Create(_device, TensorShape.Matrix(M, N), DataType.F32, resultName ?? "logits");
+
+        for (int c = 0; c < numChunks; c++)
+        {
+            int start  = c * chunkRows;
+            int end    = Math.Min(start + chunkRows, N);
+            int actual = end - start;
+
+            // Read quantized bytes for this vocab slice (CPU → already in mmap'd weight buffer)
+            ulong byteStart = (ulong)(start * bytesPerRow);
+            int   byteCount = (int)(actual * bytesPerRow);
+            var rawBytes = quantized.Buffer.ReadRange<byte>(byteStart, byteCount);
+
+            // Upload chunk as a temporary quantized tensor (same dtype, shape [K, actual])
+            var chunkBuf    = _device.CreateBuffer((ulong)rawBytes.Length, ICompute.BufferType.Storage, DataType.I8);
+            chunkBuf.Write(rawBytes);
+            var chunkTensor = new Tensor(chunkBuf, TensorShape.Matrix(K, actual), quantized.DataType, "w_chunk");
+
+            // Dequantize and matmul
+            var chunkF32    = Dequantize(chunkTensor);
+            chunkTensor.Dispose();
+            var partialLogits = MatMulWeights(a, chunkF32, "partial_logits");
+            chunkF32.Dispose();
+
+            // Scatter partial [M, actual] into result [M, N] at column offset `start`
+            ScatterCols(result, partialLogits, start);
+            partialLogits.Dispose();
+        }
+
+        return result;
+    }
+
     /// <summary>
     /// Matrix multiply where B is a GGUF weight stored in column-major order.
     /// GGUF stores weight[k, n] at data[k + n * K] (ne[0]=K is innermost dim).

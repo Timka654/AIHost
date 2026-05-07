@@ -52,6 +52,8 @@ public class TensorNameMapper
             Console.WriteLine("[Arch] Combined QKV weight — using ApplyLayerCombinedQKV");
         if (HasAny("attn_q.weight") && !HasCombinedQKV)
             Console.WriteLine("[Arch] Separate Q/K/V weights — standard attention path");
+        if (IsHybridSSM)
+            Console.WriteLine("[Arch] Hybrid SSM+Attention model detected — SSM layers will use attention fallback (output may be incorrect for SSM layers)");
     }
 
     // ── Attention layout ─────────────────────────────────────────────────────
@@ -87,10 +89,12 @@ public class TensorNameMapper
                                                       $"blk.{layer}.attn_v_proj.weight");
 
     public string AttnOutput(int layer)      => Try($"blk.{layer}.attn_output.weight",
+                                                    $"blk.{layer}.attn_gate.weight",       // Qwen3.5/qwen35
                                                     $"blk.{layer}.attn_out_proj.weight",
                                                     $"blk.{layer}.attn_o_proj.weight");
 
     public string FfnNorm(int layer)         => Try($"blk.{layer}.ffn_norm.weight",
+                                                    $"blk.{layer}.post_attention_norm.weight", // Qwen3.5
                                                     $"blk.{layer}.ln2.weight");
 
     public string FfnGate(int layer)         => TryFfn(layer, "gate");
@@ -113,6 +117,20 @@ public class TensorNameMapper
 
     public bool HasBias(int layer) =>
         _allTensorNames.Contains($"blk.{layer}.attn_q.bias");
+
+    /// <summary>True if this specific layer has attention weights (vs pure SSM layer).</summary>
+    public bool LayerHasAttention(int layer) =>
+        _allTensorNames.Contains($"blk.{layer}.attn_qkv.weight") ||
+        _allTensorNames.Contains($"blk.{layer}.attn_q.weight")   ||
+        _allTensorNames.Contains($"blk.{layer}.attn_q_proj.weight");
+
+    /// <summary>True if this specific layer has SSM (Mamba/state-space) weights.</summary>
+    public bool LayerHasSSM(int layer) =>
+        _allTensorNames.Contains($"blk.{layer}.ssm_out.weight") ||
+        _allTensorNames.Contains($"blk.{layer}.ssm_a");
+
+    /// <summary>True if this is a hybrid SSM+Attention model (e.g. Jamba, Qwen3.6).</summary>
+    public bool IsHybridSSM => HasAny(".ssm_out.weight", ".ssm_a");
 
     public bool IsMoE(int layer) =>
         _allTensorNames.Contains($"blk.{layer}.ffn_gate_exps.weight") ||

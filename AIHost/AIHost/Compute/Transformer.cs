@@ -202,6 +202,16 @@ public class Transformer : IDisposable
         _ops.LayerNorm(x, normF32);
         if (!normScratch) normF32.Dispose();
 
+        // Use chunked matmul if output.weight would need >1 GB F32 (large-vocab models).
+        var outWeightCached = _weightCache[_nameMapper.OutputWeight];
+        long outF32Bytes    = (long)outWeightCached.Shape.TotalElements * sizeof(float);
+        if (outF32Bytes > 1L * 1024 * 1024 * 1024)
+        {
+            var chunkedLogits = _ops.MatMulWeightsLarge(x, outWeightCached, "logits");
+            x.Dispose();
+            return chunkedLogits;
+        }
+
         var (outF32, outScratch) = TempF32(_nameMapper.OutputWeight);
         var logits = _ops.MatMulWeights(x, outF32, "logits");
         if (!outScratch) outF32.Dispose();
@@ -389,8 +399,15 @@ public class Transformer : IDisposable
         int g  = layerIdx + _layerOffset;
         var nm = _nameMapper!;
 
-        // Architectures with combined QKV (Qwen3.5/Phi/Falcon) need special handling:
-        // compute qkv = xnorm @ W_qkv, then split into Q/K/V before calling TransformerLayer.
+        // Check whether this specific layer actually has its weights cached.
+        // In hybrid SSM+Attention models some layers lack attention weights entirely.
+        bool hasAttn = nm.HasCombinedQKV
+            ? _weightCache.ContainsKey(nm.AttnQKV(g))
+            : _weightCache.ContainsKey(nm.AttnQ(g));
+
+        if (!hasAttn)
+            return ApplyLayerSSMFallback(x, g, nm);  // SSM/MLP-only layer
+
         if (nm.HasCombinedQKV)
             return ApplyLayerCombinedQKV(x, g, layerIdx, position, kvCache, nm);
         int seqLen = x.Shape[0];
@@ -458,6 +475,39 @@ public class Transformer : IDisposable
         Dispose2(wAO, sAO); Dispose2(wFN, sFN); Dispose2(wG, sG); Dispose2(wU, sU);
         Dispose2(wD, sD);
         x.Dispose();
+        return output;
+    }
+
+    /// <summary>
+    /// Fallback for SSM (Mamba-style) layers in hybrid models.
+    /// Full Mamba state-space computation is not yet implemented — applies only the FFN
+    /// component (skips the SSM recurrence). Output quality will be degraded for these layers.
+    /// </summary>
+    private Tensor ApplyLayerSSMFallback(Tensor x, int g, TensorNameMapper nm)
+    {
+        // Skip the SSM computation entirely — just pass x through with FFN if available.
+        // If this layer has no FFN either, return x as-is (identity layer).
+        string ffnGateName = nm.FfnGate(g);
+        if (!_weightCache.ContainsKey(ffnGateName))
+        {
+            _logger.LogTrace("[SSM] Layer {Layer} skipped (no FFN weights, pure SSM)", g);
+            return x;  // identity — preserves residual stream
+        }
+
+        var x1Norm = _ops.Clone(x, "ssm_ffn_norm_in");
+        var (wFN, sFN) = TempF32(nm.FfnNorm(g));
+        _ops.LayerNorm(x1Norm, wFN);
+        if (!sFN) wFN.Dispose();
+
+        var (wG, sG) = TempF32(nm.FfnGate(g));
+        var (wU, sU) = TempF32(nm.FfnUp(g));
+        var (wD, sD) = TempF32(nm.FfnDown(g));
+        var ffnOut = _ops.FeedForward(x1Norm, wG, wU, wD, "ssm_ffn");
+        if (!sG) wG.Dispose(); if (!sU) wU.Dispose(); if (!sD) wD.Dispose();
+        x1Norm.Dispose();
+
+        var output = _ops.Add(x, ffnOut, "ssm_layer_out");
+        ffnOut.Dispose(); x.Dispose();
         return output;
     }
 
@@ -566,20 +616,32 @@ public class Transformer : IDisposable
     private void CacheLayerWeights(int globalLayer)
     {
         var nm = _nameMapper!;
-        CacheWeight(nm.AttnNorm(globalLayer));
+
+        // Attention weights — use TryCacheWeight so layers without attention weights are skipped.
+        // LayerHasAttention is best-effort; TryCacheWeight is the safety net.
+        TryCacheWeight(nm.AttnNorm(globalLayer));
         if (nm.HasCombinedQKV)
-            CacheWeight(nm.AttnQKV(globalLayer));   // single fused QKV weight
+            TryCacheWeight(nm.AttnQKV(globalLayer));
         else
         {
-            CacheWeight(nm.AttnQ(globalLayer));
-            CacheWeight(nm.AttnK(globalLayer));
-            CacheWeight(nm.AttnV(globalLayer));
+            TryCacheWeight(nm.AttnQ(globalLayer));
+            TryCacheWeight(nm.AttnK(globalLayer));
+            TryCacheWeight(nm.AttnV(globalLayer));
         }
-        CacheWeight(nm.AttnOutput(globalLayer));
-        CacheWeight(nm.FfnNorm(globalLayer));
-        CacheWeight(nm.FfnGate(globalLayer));
-        CacheWeight(nm.FfnUp(globalLayer));
-        CacheWeight(nm.FfnDown(globalLayer));
+        TryCacheWeight(nm.AttnOutput(globalLayer));
+
+        // FFN weights — present in most layers
+        TryCacheWeight(nm.FfnNorm(globalLayer));
+        TryCacheWeight(nm.FfnGate(globalLayer));
+        TryCacheWeight(nm.FfnUp(globalLayer));
+        TryCacheWeight(nm.FfnDown(globalLayer));
+    }
+
+    /// <summary>Cache a weight only if it exists in the GGUF file (skips optional/absent tensors).</summary>
+    private void TryCacheWeight(string name)
+    {
+        if (_model.Tensors.Any(t => t.Name == name))
+            CacheWeight(name);
     }
 
     /// <summary>
