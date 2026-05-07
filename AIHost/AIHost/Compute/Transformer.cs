@@ -37,8 +37,8 @@ public class Transformer : IDisposable
     // For multi-GPU: offset added to local layer index when looking up weight names.
     // Default 0 (single-GPU). Device 1 handling global layers 11-21 sets this to 11.
     private int _layerOffset = 0;
-    // How many layers this instance handles (all layers by default).
     private int _localLayerCount;
+    private TensorNameMapper? _nameMapper; // set after weights are loaded
 
     public int LayerCount => _numLayers;
     public int LocalLayerCount => _localLayerCount;
@@ -82,31 +82,22 @@ public class Transformer : IDisposable
     public void LoadWeights()
     {
         _logger.LogInformation("Loading model weights...");
+        _nameMapper = new TensorNameMapper(_model);
 
-        CacheWeight("token_embd.weight");
-        CacheWeight("output_norm.weight");
-        CacheWeight("output.weight");
+        CacheWeight(_nameMapper.TokenEmbd);
+        CacheWeight(_nameMapper.OutputNorm);
+        CacheWeight(_nameMapper.OutputWeight);
 
         for (int i = 0; i < _numLayers; i++)
         {
-            string p = $"blk.{i}";
-            CacheWeight($"{p}.attn_norm.weight");
-            CacheWeight($"{p}.attn_q.weight");
-            CacheWeight($"{p}.attn_k.weight");
-            CacheWeight($"{p}.attn_v.weight");
-            CacheWeight($"{p}.attn_output.weight");
-            CacheWeight($"{p}.ffn_norm.weight");
-            CacheWeight($"{p}.ffn_gate.weight");
-            CacheWeight($"{p}.ffn_up.weight");
-            CacheWeight($"{p}.ffn_down.weight");
-
+            CacheLayerWeights(i);
             if ((i + 1) % 5 == 0 || i == _numLayers - 1)
                 _logger.LogDebug("Uploaded layer {Current}/{Total}", i + 1, _numLayers);
         }
 
         _logger.LogInformation("Weights loaded: {Count} tensors, quantized in VRAM", _weightCache.Count);
 
-        AllocateScratchWeights("blk.0");
+        AllocateScratchWeights(_numLayers > 0 ? _nameMapper.AttnNorm(0) : null);
         TryAllocateScratchHead();
         _logger.LogDebug("F32 scratch buffers allocated: {Count} tensors", _scratchF32.Count);
         RunCpuReferenceLayer0();
@@ -128,26 +119,17 @@ public class Transformer : IDisposable
             globalFirstLayer, globalLastLayer - 1,
             withEmbedding ? " + embedding" : "", withHead ? " + head" : "");
 
-        if (withEmbedding) CacheWeight("token_embd.weight");
-        if (withHead)      { CacheWeight("output_norm.weight"); CacheWeight("output.weight"); }
+        _nameMapper ??= new TensorNameMapper(_model);
+
+        if (withEmbedding) CacheWeight(_nameMapper.TokenEmbd);
+        if (withHead)      { CacheWeight(_nameMapper.OutputNorm); CacheWeight(_nameMapper.OutputWeight); }
 
         for (int i = globalFirstLayer; i < globalLastLayer; i++)
-        {
-            string p = $"blk.{i}";
-            CacheWeight($"{p}.attn_norm.weight");
-            CacheWeight($"{p}.attn_q.weight");
-            CacheWeight($"{p}.attn_k.weight");
-            CacheWeight($"{p}.attn_v.weight");
-            CacheWeight($"{p}.attn_output.weight");
-            CacheWeight($"{p}.ffn_norm.weight");
-            CacheWeight($"{p}.ffn_gate.weight");
-            CacheWeight($"{p}.ffn_up.weight");
-            CacheWeight($"{p}.ffn_down.weight");
-        }
+            CacheLayerWeights(i);
 
         _logger.LogInformation("[MultiGPU] Loaded {Count} tensors for device", _weightCache.Count);
         if (_localLayerCount > 0)
-            TryAllocateScratch($"blk.{globalFirstLayer}");
+            TryAllocateScratch(_nameMapper!.AttnNorm(globalFirstLayer));
         if (withHead)
             TryAllocateScratchHead();
     }
@@ -184,7 +166,7 @@ public class Transformer : IDisposable
     /// <summary>Token embedding lookup. Returns [seqLen, dModel] on this device's GPU.</summary>
     public Tensor ForwardEmbedding(int[] tokenIds)
     {
-        var (embF32, embScratch) = TempF32("token_embd.weight");
+        var (embF32, embScratch) = TempF32(_nameMapper!.TokenEmbd);
         var x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
         if (!embScratch) embF32.Dispose();
         return x;
@@ -206,11 +188,11 @@ public class Transformer : IDisposable
     /// </summary>
     public Tensor ForwardHead(Tensor x)
     {
-        var (normF32, normScratch) = TempF32("output_norm.weight");
+        var (normF32, normScratch) = TempF32(_nameMapper!.OutputNorm);
         _ops.LayerNorm(x, normF32);
         if (!normScratch) normF32.Dispose();
 
-        var (outF32, outScratch) = TempF32("output.weight");
+        var (outF32, outScratch) = TempF32(_nameMapper.OutputWeight);
         var logits = _ops.MatMulWeights(x, outF32, "logits");
         if (!outScratch) outF32.Dispose();
         x.Dispose();
@@ -295,29 +277,46 @@ public class Transformer : IDisposable
         catch (Exception ex) { _logger.LogTrace(ex, "[CPURef] FAILED"); }
     }
 
-    private void AllocateScratchWeights(string layerPrefix)
+    /// <summary>
+    /// Pre-allocate shared F32 scratch buffers using the actual tensor names for the
+    /// reference layer (layer 0 or first layer of this device).
+    /// Passing a sample name (e.g. attn_norm name for the first layer) lets us strip
+    /// the layer-specific prefix so the same scratch slot is reused across all layers.
+    /// </summary>
+    private void AllocateScratchWeights(string? firstLayerAttnNormName)
     {
+        if (firstLayerAttnNormName == null || _nameMapper == null) return;
+
+        // Determine which global layer index this name belongs to
+        int refLayer = _layerOffset;  // first layer on this device
+
         var names = new[]
         {
-            $"{layerPrefix}.attn_norm.weight",
-            $"{layerPrefix}.attn_q.weight",
-            $"{layerPrefix}.attn_k.weight",
-            $"{layerPrefix}.attn_v.weight",
-            $"{layerPrefix}.attn_output.weight",
-            $"{layerPrefix}.ffn_norm.weight",
-            $"{layerPrefix}.ffn_gate.weight",
-            $"{layerPrefix}.ffn_up.weight",
-            $"{layerPrefix}.ffn_down.weight",
+            _nameMapper.AttnNorm(refLayer),
+            _nameMapper.AttnQ(refLayer),
+            _nameMapper.AttnK(refLayer),
+            _nameMapper.AttnV(refLayer),
+            _nameMapper.AttnOutput(refLayer),
+            _nameMapper.FfnNorm(refLayer),
+            _nameMapper.FfnGate(refLayer),
+            _nameMapper.FfnUp(refLayer),
+            _nameMapper.FfnDown(refLayer),
         };
+
+        // Determine prefix length: everything up to and including the second dot
+        // e.g. "blk.0." from "blk.0.attn_q.weight"
+        string sample = names[0]; // e.g. "blk.0.attn_norm.weight"
+        int secondDot = sample.IndexOf('.', sample.IndexOf('.') + 1);
+        int prefixLen  = secondDot >= 0 ? secondDot + 1 : 0; // length of "blk.0."
 
         foreach (var name in names)
         {
-            var cached = _weightCache[name];
-            if (cached.DataType == DataType.F32) continue; // No scratch needed
+            if (!_weightCache.TryGetValue(name, out var cached)) continue;
+            if (cached.DataType == DataType.F32) continue;
 
             var scratch = Tensor.Create(_ops.Device, cached.Shape, DataType.F32, name + "_scratch");
-            // Strip layer prefix so all layers share the same scratch key (e.g. "attn_q.weight")
-            var key = name[(layerPrefix.Length + 1)..];
+            // Key strips per-layer prefix so all layers share the same slot
+            var key = prefixLen > 0 ? name[prefixLen..] : name;
             _scratchF32[key] = scratch;
         }
     }
@@ -327,7 +326,7 @@ public class Transformer : IDisposable
     /// </summary>
     public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null)
     {
-        if (!_weightCache.ContainsKey("token_embd.weight"))
+        if (_nameMapper == null)
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
 #if DEEP_DEBUG
         Console.WriteLine($"Forward pass: {tokenIds.Length} tokens at position {startPosition}");
@@ -336,7 +335,7 @@ public class Transformer : IDisposable
         // 1. Token embedding: dequantize table → lookup → free table
         Tensor x;
         {
-            var (embF32, embScratch) = TempF32("token_embd.weight");
+            var (embF32, embScratch) = TempF32(_nameMapper!.TokenEmbd);
             x = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
             if (!embScratch) embF32.Dispose();
         }
@@ -347,22 +346,15 @@ public class Transformer : IDisposable
 
         // 3. Final layer norm
         {
-            var (normF32, normScratch) = TempF32("output_norm.weight");
+            var (normF32, normScratch) = TempF32(_nameMapper!.OutputNorm);
             _ops.LayerNorm(x, normF32);
             if (!normScratch) normF32.Dispose();
         }
 
-        // 4. Vocab projection (GGUF column-major weight)
+        // 4. Vocab projection
         Tensor logits;
         {
-            // Debug: print x_normed for last token (compare with llama-cpp embed output)
-            if (tokenIds.Length <= 3)
-            {
-                var xd = x.ReadData();
-                int last = x.Shape[0] - 1;
-                _logger.LogTrace("[XNorm] seqLen={SeqLen} last tok x_normed[:3]=[{X0:F5},{X1:F5},{X2:F5}] maxAbs={MaxAbs:F4}", x.Shape[0], xd[last*2048], xd[last*2048+1], xd[last*2048+2], xd.Max(Math.Abs));
-            }
-            var (outF32, outScratch) = TempF32("output.weight");
+            var (outF32, outScratch) = TempF32(_nameMapper.OutputWeight);
             logits = _ops.MatMulWeights(x, outF32, "logits");
             if (!outScratch) outF32.Dispose();
         }
@@ -373,8 +365,9 @@ public class Transformer : IDisposable
 
     private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null)
     {
-        // layerIdx is LOCAL (0-based for this device); weight names use global index.
-        string p = $"blk.{layerIdx + _layerOffset}";
+        // layerIdx is LOCAL (0-based for this device); mapper uses global index.
+        int g = layerIdx + _layerOffset;
+        var nm = _nameMapper!;
         int seqLen = x.Shape[0];
 
         // Batch mode (one fence wait per layer): fast for generation (seqLen=1, tiny matrices).
@@ -397,15 +390,15 @@ public class Transformer : IDisposable
                 return (t2, s);
             }
 
-            var (wAttnNorm, _) = Wb($"{p}.attn_norm.weight");
-            var (wQ,        _) = Wb($"{p}.attn_q.weight");
-            var (wK,        _) = Wb($"{p}.attn_k.weight");
-            var (wV,        _) = Wb($"{p}.attn_v.weight");
-            var (wAttnOut,  _) = Wb($"{p}.attn_output.weight");
-            var (wFfnNorm,  _) = Wb($"{p}.ffn_norm.weight");
-            var (wGate,     _) = Wb($"{p}.ffn_gate.weight");
-            var (wUp,       _) = Wb($"{p}.ffn_up.weight");
-            var (wDown,     _) = Wb($"{p}.ffn_down.weight");
+            var (wAttnNorm, _) = Wb(nm.AttnNorm(g));
+            var (wQ,        _) = Wb(nm.AttnQ(g));
+            var (wK,        _) = Wb(nm.AttnK(g));
+            var (wV,        _) = Wb(nm.AttnV(g));
+            var (wAttnOut,  _) = Wb(nm.AttnOutput(g));
+            var (wFfnNorm,  _) = Wb(nm.FfnNorm(g));
+            var (wGate,     _) = Wb(nm.FfnGate(g));
+            var (wUp,       _) = Wb(nm.FfnUp(g));
+            var (wDown,     _) = Wb(nm.FfnDown(g));
             // Single barrier after all independent weight dequants — GPU can run them in parallel.
             _ops.InsertBarrier();
 
@@ -420,15 +413,15 @@ public class Transformer : IDisposable
         }
 
         // Prefill: per-op flush (dequantize → immediate flush → use → dispose).
-        var (wAN, sAN) = TempF32($"{p}.attn_norm.weight");
-        var (wQ2, sQ)  = TempF32($"{p}.attn_q.weight");
-        var (wK2, sK)  = TempF32($"{p}.attn_k.weight");
-        var (wV2, sV)  = TempF32($"{p}.attn_v.weight");
-        var (wAO, sAO) = TempF32($"{p}.attn_output.weight");
-        var (wFN, sFN) = TempF32($"{p}.ffn_norm.weight");
-        var (wG,  sG)  = TempF32($"{p}.ffn_gate.weight");
-        var (wU,  sU)  = TempF32($"{p}.ffn_up.weight");
-        var (wD,  sD)  = TempF32($"{p}.ffn_down.weight");
+        var (wAN, sAN) = TempF32(nm.AttnNorm(g));
+        var (wQ2, sQ)  = TempF32(nm.AttnQ(g));
+        var (wK2, sK)  = TempF32(nm.AttnK(g));
+        var (wV2, sV)  = TempF32(nm.AttnV(g));
+        var (wAO, sAO) = TempF32(nm.AttnOutput(g));
+        var (wFN, sFN) = TempF32(nm.FfnNorm(g));
+        var (wG,  sG)  = TempF32(nm.FfnGate(g));
+        var (wU,  sU)  = TempF32(nm.FfnUp(g));
+        var (wD,  sD)  = TempF32(nm.FfnDown(g));
 
         var output = _ops.TransformerLayer(
             x, wAN, wQ2, wK2, wV2, wAO,
@@ -465,6 +458,20 @@ public class Transformer : IDisposable
         }
 
         return (_ops.Dequantize(cached), false);
+    }
+
+    private void CacheLayerWeights(int globalLayer)
+    {
+        var nm = _nameMapper!;
+        CacheWeight(nm.AttnNorm(globalLayer));
+        CacheWeight(nm.AttnQ(globalLayer));
+        CacheWeight(nm.AttnK(globalLayer));
+        CacheWeight(nm.AttnV(globalLayer));
+        CacheWeight(nm.AttnOutput(globalLayer));
+        CacheWeight(nm.FfnNorm(globalLayer));
+        CacheWeight(nm.FfnGate(globalLayer));
+        CacheWeight(nm.FfnUp(globalLayer));
+        CacheWeight(nm.FfnDown(globalLayer));
     }
 
     /// <summary>
