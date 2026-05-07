@@ -196,12 +196,25 @@ public class ModelManager : IDisposable
         if (!File.Exists(modelPath))
             throw new FileNotFoundException($"Model file not found: {modelPath}");
 
-        // Determine single-GPU device (skipped when multi-GPU devices[] is configured)
+        // Determine compute device.
+        // devices[] with 1 entry = single-GPU with explicit provider/index (e.g. ROCm).
+        // devices[] with 2+ entries = multi-GPU split.
         bool isMultiGPUConfig = config.Devices is { Length: > 1 };
+        bool isSingleDeviceExplicit = config.Devices is { Length: 1 };
         IComputeDevice device = _device;
         IComputeDevice? perModelDevice = null;
 
-        if (!isMultiGPUConfig && (config.ComputeProvider != null || config.DeviceIndex != null))
+        if (isSingleDeviceExplicit)
+        {
+            // devices:[{index, provider}] with one entry — use that device for single-GPU
+            var d0       = config.Devices![0];
+            var provider = d0.Provider ?? config.ComputeProvider ?? "vulkan";
+            _logger.LogInformation("Creating single device from devices[0]: {Provider}[{Index}] for model {Model}",
+                provider, d0.Index, modelName);
+            perModelDevice = CreateComputeDevice(provider, d0.Index);
+            device = perModelDevice;
+        }
+        else if (!isMultiGPUConfig && (config.ComputeProvider != null || config.DeviceIndex != null))
         {
             var provider    = config.ComputeProvider ?? "vulkan";
             var deviceIndex = config.DeviceIndex ?? 0;
@@ -210,11 +223,16 @@ public class ModelManager : IDisposable
             device = perModelDevice;
         }
 
+        string activeProvider = isSingleDeviceExplicit
+            ? (config.Devices![0].Provider ?? config.ComputeProvider ?? "vulkan")
+            : (config.ComputeProvider ?? "(global)");
+        string activeDevice = isSingleDeviceExplicit
+            ? config.Devices![0].Index.ToString()
+            : (config.DeviceIndex?.ToString() ?? "(global)");
+
         _logger.LogInformation(
             "Loading model {Model} | provider={Provider} device={Device} keep_alive={KeepAlive}m batch={Batch} mmap={Mmap} mlock={Mlock}",
-            modelName,
-            config.ComputeProvider ?? "(global)",
-            config.DeviceIndex?.ToString() ?? "(global)",
+            modelName, activeProvider, activeDevice,
             config.KeepAliveMinutes?.ToString() ?? "(global)",
             config.BatchSize?.ToString() ?? "8",
             config.EnableMmap, config.EnableMlock);
