@@ -345,7 +345,10 @@ public class InferenceEngine : IInferenceEngine
 public class KVCache : IDisposable
 {
     private readonly ComputeOps _ops;
-    private readonly List<(Tensor key, Tensor value)> _cache = new();
+    // Dictionary keyed by ABSOLUTE layer index so sparse hybrid models
+    // (SSM+Attention) with non-contiguous attention layers work correctly.
+    // A List assumed 0,1,2,… which broke when SSM layers were skipped.
+    private readonly Dictionary<int, (Tensor key, Tensor value)> _cache = new();
     private bool _disposed;
 
     public int SequenceLength { get; private set; }
@@ -357,46 +360,36 @@ public class KVCache : IDisposable
 
     public void Add(int layer, Tensor key, Tensor value)
     {
-        if (layer >= _cache.Count)
+        if (!_cache.ContainsKey(layer))
         {
-            // First time for this layer - take ownership of tensors
-            _cache.Add((key, value));
-            SequenceLength = key.Shape.Dimensions[0]; // seq_len is first dimension
+            // First time for this layer — take ownership of tensors
+            _cache[layer] = (key, value);
+            SequenceLength = key.Shape.Dimensions[0];
         }
         else
         {
-            // Concatenate with existing cache along seq_len axis (axis 0)
             var (oldKey, oldValue) = _cache[layer];
-            
-            var newKey = _ops.Concat(oldKey, key, axis: 0, $"kv_cache_k_layer{layer}");
+
+            var newKey   = _ops.Concat(oldKey,   key,   axis: 0, $"kv_cache_k_layer{layer}");
             var newValue = _ops.Concat(oldValue, value, axis: 0, $"kv_cache_v_layer{layer}");
 
-            // ALL FOUR tensors must be deferred: the Concat dispatches in the current batch
-            // reference oldKey, oldValue, key, and value through descriptor ring slots.
-            // Calling Dispose() before Flush() would destroy the Vulkan buffers while they
-            // are still referenced in the recorded command buffer → VK_ERROR_DEVICE_LOST.
+            // Defer all four: Concat still references them in the GPU command buffer.
             _ops.DeferExternal(oldKey);
             _ops.DeferExternal(oldValue);
             _ops.DeferExternal(key);
             _ops.DeferExternal(value);
 
             _cache[layer] = (newKey, newValue);
-            SequenceLength = newKey.Shape.Dimensions[0]; // seq_len is first dimension
+            SequenceLength = newKey.Shape.Dimensions[0];
         }
     }
 
     public (Tensor? key, Tensor? value) Get(int layer)
-    {
-        if (layer < _cache.Count)
-        {
-            return _cache[layer];
-        }
-        return (null, null);
-    }
+        => _cache.TryGetValue(layer, out var kv) ? kv : (null, null);
 
     public void Clear()
     {
-        foreach (var (key, value) in _cache)
+        foreach (var (_, (key, value)) in _cache)
         {
             key.Dispose();
             value.Dispose();

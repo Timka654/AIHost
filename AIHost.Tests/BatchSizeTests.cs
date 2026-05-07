@@ -93,6 +93,12 @@ internal class MockComputeBuffer : IComputeBuffer
     public IntPtr GetPointer() => IntPtr.Zero;
     public void Write<T>(T[] data) where T : unmanaged { }
     public T[] Read<T>() where T : unmanaged => Array.Empty<T>();
+
+    /// <summary>
+    /// Read a contiguous slice without transferring the full buffer.
+    /// </summary>
+    public T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged => Array.Empty<T>();
+
     public void Dispose() { }
 }
 
