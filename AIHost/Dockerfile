@@ -36,9 +36,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vulkan-tools \
     mesa-vulkan-drivers \
     mesa-opencl-icd \
-    # Немного обновили имя пакета (в новых Debian libgl1 надежнее старого libgl1-mesa-glx)
     libgl1 \
     libglib2.0-0 \
+    # libshaderc1 provides libshaderc_shared.so.1 required by Silk.NET.Shaderc
+    # for runtime GLSL → SPIR-V compilation of Vulkan compute kernels.
+    libshaderc1 \
     nvidia-cuda-toolkit \
     pciutils \
     lshw \
