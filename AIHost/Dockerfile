@@ -38,9 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     mesa-opencl-icd \
     libgl1 \
     libglib2.0-0 \
-    # libshaderc-dev: installs libshaderc_shared.so.1 AND the unversioned .so symlink
-    # that Silk.NET.Shaderc requires for GLSL→SPIR-V kernel compilation.
+    # Shader compilation: prefer libshaderc-dev (Silk.NET.Shaderc native lib + symlink).
+    # glslang-tools is the CLI fallback used when libshaderc cannot be loaded.
     libshaderc-dev \
+    glslang-tools \
     nvidia-cuda-toolkit \
     pciutils \
     lshw \

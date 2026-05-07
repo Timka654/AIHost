@@ -179,8 +179,116 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
 
     private byte[] CompileGLSLToSPIRV(string glslSource, string entryPoint)
     {
+        // Try Silk.NET.Shaderc first (requires libshaderc_shared at runtime).
+        // If the native library isn't present, fall back to glslangValidator CLI which
+        // is available via the glslang-tools / vulkan-tools package on all major distros.
+        try
+        {
+            return CompileWithShaderc(glslSource, entryPoint);
+        }
+        catch (Exception ex) when (ex is System.IO.FileNotFoundException or DllNotFoundException
+                                        or System.IO.IOException)
+        {
+            Console.WriteLine($"[Shaderc] Native library unavailable ({ex.GetType().Name}), " +
+                              "falling back to glslangValidator CLI...");
+            return CompileWithGlslangValidator(glslSource, entryPoint);
+        }
+    }
+
+    private static byte[] CompileWithGlslangValidator(string glslSource, string entryPoint)
+    {
+        // glslangValidator is in glslang-tools or vulkan-tools (Linux) / Vulkan SDK (Windows).
+        string glslangExe = System.OperatingSystem.IsWindows()
+            ? "glslangValidator.exe"
+            : "glslangValidator";
+
+        // Also try glslc (from shaderc, often available in vulkan-tools)
+        foreach (var compiler in new[] { glslangExe, "glslc" })
+        {
+            try
+            {
+                return compiler == "glslc"
+                    ? CompileWithGlslc(glslSource, compiler)
+                    : CompileWithGlslangCli(glslSource, compiler, entryPoint);
+            }
+            catch (Exception ex) when (ex is not InvalidOperationException)
+            {
+                Console.WriteLine($"[Shaderc] {compiler} not found: {ex.Message}");
+            }
+        }
+
+        throw new InvalidOperationException(
+            "No GLSL compiler available. Install one of:\n" +
+            "  • libshaderc-dev  (Debian/Ubuntu)\n" +
+            "  • glslang-tools   (Debian/Ubuntu: apt install glslang-tools)\n" +
+            "  • vulkan-tools    (includes glslc)\n" +
+            "  • Vulkan SDK      (https://vulkan.lunarg.com/)");
+    }
+
+    private static byte[] CompileWithGlslangCli(string glslSource, string exe, string entryPoint)
+    {
+        var tmp = Path.GetTempFileName();
+        var glslFile = tmp + ".comp";
+        var spvFile  = tmp + ".spv";
+        File.WriteAllText(glslFile, glslSource);
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe,
+                $"-V -S comp --entry-point {entryPoint} \"{glslFile}\" -o \"{spvFile}\"")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false
+            };
+            using var proc = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException($"Could not start {exe}");
+            proc.WaitForExit(30_000);
+            if (proc.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"glslangValidator error: {proc.StandardError.ReadToEnd()}");
+            return File.ReadAllBytes(spvFile);
+        }
+        finally
+        {
+            File.Delete(glslFile);
+            if (File.Exists(spvFile)) File.Delete(spvFile);
+        }
+    }
+
+    private static byte[] CompileWithGlslc(string glslSource, string exe)
+    {
+        var tmp     = Path.GetTempFileName();
+        var glslFile = tmp + ".comp";
+        var spvFile  = tmp + ".spv";
+        File.WriteAllText(glslFile, glslSource);
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe,
+                $"-fshader-stage=compute \"{glslFile}\" -o \"{spvFile}\"")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+                UseShellExecute        = false
+            };
+            using var proc = System.Diagnostics.Process.Start(psi)
+                ?? throw new InvalidOperationException($"Could not start {exe}");
+            proc.WaitForExit(30_000);
+            if (proc.ExitCode != 0)
+                throw new InvalidOperationException(
+                    $"glslc error: {proc.StandardError.ReadToEnd()}");
+            return File.ReadAllBytes(spvFile);
+        }
+        finally
+        {
+            File.Delete(glslFile);
+            if (File.Exists(spvFile)) File.Delete(spvFile);
+        }
+    }
+
+    private byte[] CompileWithShaderc(string glslSource, string entryPoint)
+    {
         var shaderc = Shaderc.GetApi();
-        
+
         var compiler = shaderc.CompilerInitialize();
         if (compiler == null)
             throw new InvalidOperationException("Failed to initialize shaderc compiler");
@@ -229,7 +337,7 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         shaderc.CompilerRelease(compiler);
 
         return spirvBytes;
-    }
+    }  // end CompileWithShaderc
 
     /// <summary>
     /// Write current buffer arguments into the next ring slot and advance the index.
