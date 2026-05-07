@@ -51,25 +51,33 @@ public class Transformer : IDisposable
         _model = model;
 
         var metadata = model.Metadata;
-        _numLayers = metadata.GetValue<int>(GGUFMetadata.KeyBlockCount, 22);
-        _dModel = metadata.GetValue<int>(GGUFMetadata.KeyEmbeddingLength, 2048);
-        _numHeads = metadata.GetValue<int>(GGUFMetadata.KeyAttentionHeadCount, 32);
-        ContextLength = metadata.GetValue<int>(GGUFMetadata.KeyContextLength, 0);
 
-        int GetInt(string key, int def) {
-            if (metadata.TryGetValue<int>(key, out var vi)) return vi;
-            if (metadata.TryGetValue<uint>(key, out var vu)) return (int)vu;
+        // All architecture-specific keys use GetArchValue which tries {arch}.* then llama.*
+        int ArchInt(string suffix, int def) {
+            var v = metadata.GetArchValue<object>(suffix);
+            if (v is int i)   return i;
+            if (v is uint u)  return (int)u;
+            if (v is long l)  return (int)l;
+            if (v is ulong ul) return (int)ul;
             return def;
         }
-        float GetFlt(string key, float def) {
-            if (metadata.TryGetValue<float>(key, out var vf)) return vf;
+        float ArchFlt(string suffix, float def) {
+            var v = metadata.GetArchValue<object>(suffix);
+            if (v is float f)  return f;
+            if (v is double d) return (float)d;
             return def;
         }
-        var ropeFreqBase = GetFlt(GGUFMetadata.KeyRopeFreqBase, 10000.0f);
-        var ffnLength    = GetInt("llama.feed_forward_length", 0);
-        var ropeDimCount = GetInt("llama.rope.dimension_count", _dModel / _numHeads);
-        var rmsEps       = GetFlt("llama.attention.layer_norm_rms_epsilon", 1e-5f);
-        var kvHeads      = GetInt("llama.attention.head_count_kv", 4);
+
+        _numLayers    = ArchInt("block_count", 22);
+        _dModel       = ArchInt("embedding_length", 2048);
+        _numHeads     = ArchInt("attention.head_count", 32);
+        ContextLength = ArchInt("context_length", 0);
+
+        var ropeFreqBase = ArchFlt("rope.freq_base", 10000.0f);
+        var ffnLength    = ArchInt("feed_forward_length", 0);
+        var ropeDimCount = ArchInt("rope.dimension_count", _dModel / _numHeads);
+        var rmsEps       = ArchFlt("attention.layer_norm_rms_epsilon", 1e-5f);
+        var kvHeads      = ArchInt("attention.head_count_kv", 4);
         _localLayerCount = _numLayers;
         _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} ctx={Ctx} ffn={Ffn} rope={Rope}",
             _numLayers, _dModel, _numHeads, kvHeads, ContextLength, ffnLength, ropeFreqBase);
