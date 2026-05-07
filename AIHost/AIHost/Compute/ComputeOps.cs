@@ -87,6 +87,45 @@ public class ComputeOps : IDisposable
     private const long MaxF32AllocationBytes = 1L * 1024 * 1024 * 1024; // 1 GB
 
     /// <summary>
+    /// Transposed weight matmul: C[M,J] = A[M,K] @ B^T
+    /// where B is F32 stored GGUF column-major [J,K]: B[j,k]=data[j+k*J].
+    /// Used when the weight is stored as its transpose (e.g. Qwen3.5 attn_gate).
+    /// </summary>
+    public Tensor MatMulWeightsT(Tensor a, Tensor b, string? resultName = null)
+    {
+        if (a.Shape.Rank != 2 || b.Shape.Rank != 2)
+            throw new ArgumentException("MatMulWeightsT requires 2D tensors");
+
+        int M = a.Shape[0];
+        int K = a.Shape[1];
+        int J = b.Shape[0]; // output cols = b rows (transposed)
+
+        if (K != b.Shape[1])
+            throw new ArgumentException(
+                $"MatMulWeightsT: A.cols={K} must equal B.cols={b.Shape[1]} (B stored transposed)");
+
+        var result = Tensor.Create(_device, TensorShape.Matrix(M, J), DataType.F32, resultName);
+
+        uint[] paramsData = { (uint)M, (uint)K, (uint)J };
+        var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)),
+                                                 BufferType.Storage, DataType.I32);
+        paramsBuffer.Write(paramsData);
+
+        var kernel = GetOrCreateKernel("matmul_weights_t_f32", ComputeShaders.MatMulWeightsTF32);
+        kernel.SetArgument(0, a.Buffer);
+        kernel.SetArgument(1, b.Buffer);
+        kernel.SetArgument(2, result.Buffer);
+        kernel.SetArgument(3, paramsBuffer);
+
+        uint[] globalWorkSize = { (uint)((J + 15) / 16), (uint)((M + 15) / 16) };
+        _queue.Dispatch(kernel, globalWorkSize, null);
+        MaybeFlush();
+
+        Defer(paramsBuffer);
+        return result;
+    }
+
+    /// <summary>
     /// MatMulWeights with automatic chunking for tensors whose dequantized F32 size
     /// exceeds MaxF32AllocationBytes (e.g. lm_head for 248K-vocab models).
     /// Falls back to standard MatMulWeights when the tensor is small enough.

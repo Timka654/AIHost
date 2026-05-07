@@ -533,25 +533,45 @@ public class Transformer : IDisposable
         if (!sAN) wAN.Dispose();
 
         var (wQKV, sQKV) = TempF32(nm.AttnQKV(g));
-        Console.WriteLine($"[LayerDbg] g={g} x={x.Shape[0]}×{x.Shape[1]} xNorm={xNorm.Shape[0]}×{xNorm.Shape[1]} wQKV={wQKV.Shape[0]}×{wQKV.Shape[1]}");
         var qkv = _ops.MatMulWeights(xNorm, wQKV, "qkv");
         if (!sQKV) wQKV.Dispose();
-        xNorm.Dispose();
 
-        // Derive head_dim from the QKV weight output dimension.
-        // qkv.Shape[1] = (n_heads + 2*n_kv_heads) * head_dim
-        int kvHeads  = _weightCache[nm.AttnK(g)].Shape[1] > 0  // fallback: use cached KV weight shape
-                        ? 0 : 0; // placeholder — compute below
+        // Derive QKV split dimensions.
+        // For gated attention (e.g. Qwen3.5), the output projection weight W_gate is stored
+        // as its transpose [d_model, Q_dim]. Its shape[1] = Q_dim = n_heads × head_dim.
+        // This gives a more reliable head_dim than deriving from kv_heads metadata
+        // (which can be wrong for newer models).
         int totalQKV = qkv.Shape[1];
-        int nKvH    = _numKVHeads;
-        int headDim = totalQKV / (_numHeads + 2 * nKvH);
-        int qDim    = _numHeads * headDim;
-        int kvDim   = nKvH      * headDim;
+
+        // Check if the output projection weight tells us Q_dim directly
+        var wAOkey = nm.AttnOutput(g);
+        bool isGatedAttn = _weightCache.TryGetValue(wAOkey, out var wAOcached) &&
+                           wAOcached.Shape[0] == x.Shape[1] && // Shape[0] = d_model (input from x)
+                           wAOcached.Shape[1] != x.Shape[1];   // Shape[1] = Q_dim ≠ d_model → gated
+
+        int qDim, kvDim, headDim, nKvH;
+        if (isGatedAttn && wAOcached != null)
+        {
+            // Shape[1] of W_gate = Q_dim = n_heads × head_dim
+            qDim    = wAOcached.Shape[1];
+            headDim = qDim / _numHeads;
+            kvDim   = (totalQKV - qDim) / 2;
+            nKvH    = kvDim / headDim;
+            Console.WriteLine($"[LayerDbg] g={g} gatedAttn headDim={headDim} qDim={qDim} kvDim={kvDim} nKvH={nKvH}");
+        }
+        else
+        {
+            nKvH    = _numKVHeads;
+            headDim = totalQKV / (_numHeads + 2 * nKvH);
+            qDim    = _numHeads * headDim;
+            kvDim   = nKvH * headDim;
+        }
 
         var Q = _ops.SliceCols(qkv,            0, qDim, "Q");
         var K = _ops.SliceCols(qkv,         qDim, kvDim, "K");
         var V = _ops.SliceCols(qkv, qDim + kvDim, kvDim, "V");
         qkv.Dispose();
+        xNorm.Dispose();
 
         _ops.ApplyRoPEFull(Q, position, _numHeads, headDim);
         _ops.ApplyRoPEFull(K, position, nKvH,      headDim);
@@ -570,8 +590,15 @@ public class Transformer : IDisposable
             _ops.DeferExternal(Q); _ops.DeferExternal(K); _ops.DeferExternal(V);
         }
 
-        var (wAO, sAO) = TempF32(nm.AttnOutput(g));
-        var attnProj = _ops.MatMulWeights(attnOut, wAO, "attn_proj");
+        // Output projection: standard or transposed (gated attention).
+        // Gated: W_gate stored as [d_model, Q_dim] → use MatMulWeightsT so
+        //   attnOut[M, Q_dim] @ W_gate^T[Q_dim, d_model] → [M, d_model]
+        var (wAO, sAO) = TempF32(wAOkey);
+        Tensor attnProj;
+        if (isGatedAttn)
+            attnProj = _ops.MatMulWeightsT(attnOut, wAO, "attn_proj");
+        else
+            attnProj = _ops.MatMulWeights(attnOut, wAO, "attn_proj");
         if (!sAO) wAO.Dispose();
         attnOut.Dispose();
 
