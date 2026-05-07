@@ -442,10 +442,17 @@ public class ManagementController : ControllerBase
                 finish_reason = "stop"
             });
         }
+        catch (ArgumentException ex) when (ex.Message.Contains("not found in configuration") ||
+                                            ex.Message.Contains("not found in GGUF"))
+        {
+            _logger.LogError(ex, "Model/tensor not found for DirectChat: {Model}", request.ModelName);
+            return NotFound(new { error = $"Model or tensor not found: {ex.Message}", stack = ex.ToString() });
+        }
         catch (ArgumentException ex)
         {
-            _logger.LogError(ex, "Model config not found for DirectChat: {Model}", request.ModelName);
-            return NotFound(new { error = $"Model config '{request.ModelName}' not found.", detail = ex.Message, stack = ex.ToString() });
+            // Shape mismatches, invalid arguments, etc. — these are inference bugs, not 404
+            _logger.LogError(ex, "Inference argument error for model {Model}: {Msg}", request.ModelName, ex.Message);
+            return StatusCode(500, new { error = ex.Message, type = ex.GetType().FullName, stack = ex.ToString() });
         }
         catch (FileNotFoundException ex)
         {

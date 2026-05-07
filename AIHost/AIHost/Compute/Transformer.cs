@@ -533,6 +533,7 @@ public class Transformer : IDisposable
         if (!sAN) wAN.Dispose();
 
         var (wQKV, sQKV) = TempF32(nm.AttnQKV(g));
+        Console.WriteLine($"[LayerDbg] g={g} x={x.Shape[0]}×{x.Shape[1]} xNorm={xNorm.Shape[0]}×{xNorm.Shape[1]} wQKV={wQKV.Shape[0]}×{wQKV.Shape[1]}");
         var qkv = _ops.MatMulWeights(xNorm, wQKV, "qkv");
         if (!sQKV) wQKV.Dispose();
         xNorm.Dispose();
