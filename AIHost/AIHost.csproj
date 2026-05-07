@@ -24,4 +24,18 @@
 		<PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.23.0" />
 	</ItemGroup>
 
+	<!-- Generate BuildInfo.cs with UTC build timestamp before every compile. -->
+	<Target Name="GenerateBuildInfo" BeforeTargets="BeforeCompile">
+		<PropertyGroup>
+			<_BuildTs>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm"))z UTC</_BuildTs>
+		</PropertyGroup>
+		<WriteLinesToFile
+			File="$(IntermediateOutputPath)BuildInfo.g.cs"
+			Lines="// Auto-generated — do not edit.%0Anamespace AIHost%3B%0Ainternal static class BuildInfo%0A{%0A    public const string Date = %22$(_BuildTs)%22%3B%0A}"
+			Overwrite="true" />
+		<ItemGroup>
+			<Compile Include="$(IntermediateOutputPath)BuildInfo.g.cs" />
+		</ItemGroup>
+	</Target>
+
 </Project>

@@ -10,6 +10,9 @@ using AIHost.Services;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
+// ── Build info ───────────────────────────────────────────────────────────────
+Console.WriteLine($"AIHost build: {BuildInfo.Date}");
+
 // ── Silk.NET.Shaderc native library resolver ─────────────────────────────────
 // Silk.NET.Shaderc tries to load "shaderc_shared" or "libshaderc_shared" at runtime
 // for GLSL→SPIR-V compilation. On Linux the installed library may only exist as
