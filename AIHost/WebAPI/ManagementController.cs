@@ -159,14 +159,18 @@ public class ManagementController : ControllerBase
     private readonly ModelManager _modelManager;
     private readonly RequestLogger _requestLogger;
     private readonly DownloadManager _downloadManager;
+    private readonly InMemoryLoggerProvider _inMemoryLoggerProvider;
     private readonly ILogger<ManagementController> _logger;
 
     public ManagementController(ModelManager modelManager, RequestLogger requestLogger,
-                                 DownloadManager downloadManager, ILogger<ManagementController> logger)
+                                 DownloadManager downloadManager,
+                                 InMemoryLoggerProvider inMemoryLoggerProvider,
+                                 ILogger<ManagementController> logger)
     {
         _modelManager = modelManager;
         _requestLogger = requestLogger;
         _downloadManager = downloadManager;
+        _inMemoryLoggerProvider = inMemoryLoggerProvider;
         _logger = logger;
     }
 
@@ -281,6 +285,57 @@ public class ManagementController : ControllerBase
     {
         _requestLogger.Clear();
         return Ok(new { message = "Logs cleared" });
+    }
+
+    /// <summary>
+    /// Get in-memory debug logs (from ILogger infrastructure).
+    /// Optional ?category= substring filter (e.g. "Transformer" or "Inference").
+    /// </summary>
+    [HttpGet("debug-logs")]
+    public IActionResult GetInMemoryLogs([FromQuery] string? category = null)
+    {
+        try
+        {
+            LogEntry[] entries;
+            if (!string.IsNullOrEmpty(category))
+                entries = _inMemoryLoggerProvider.GetEntries(category);
+            else
+                entries = _inMemoryLoggerProvider.GetAllEntries();
+
+            return Ok(new
+            {
+                total = entries.Length,
+                entries = entries.Select(e => new
+                {
+                    timestamp = e.Timestamp,
+                    level = e.Level.ToString(),
+                    category = e.Category,
+                    message = e.Message,
+                    exception = e.Exception
+                })
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get debug logs: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Clear in-memory debug logs.
+    /// </summary>
+    [HttpDelete("debug-logs")]
+    public IActionResult ClearInMemoryLogs()
+    {
+        try
+        {
+            _inMemoryLoggerProvider.ClearAll();
+            return Ok(new { message = "Debug logs cleared" });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to clear debug logs: {ex.Message}" });
+        }
     }
 
     /// <summary>

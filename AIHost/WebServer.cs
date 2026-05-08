@@ -157,7 +157,12 @@ builder.WebHost.ConfigureKestrel(options =>
 // Configure logging level from server config
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
+// Add in-memory logger for debugging via /manage/logs endpoint
+var inMemoryLoggerProvider = new InMemoryLoggerProvider(maxEntries: 10000);
+builder.Logging.AddProvider(inMemoryLoggerProvider);
+builder.Services.AddSingleton(inMemoryLoggerProvider);
 var minLogLevel = serverConfig.LogLevel.ToLowerInvariant() switch
+
 {
     "trace"   => Microsoft.Extensions.Logging.LogLevel.Trace,
     "debug"   => Microsoft.Extensions.Logging.LogLevel.Debug,

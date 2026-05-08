@@ -1,6 +1,9 @@
 using AIHost.Compute;
+using AIHost.GGUF;
+using AIHost.ICompute;
 using AIHost.ICompute.Vulkan;
 using AIHost.Inference;
+using AIHost.Tokenizer;
 using Xunit;
 
 namespace AIHost.Tests;
@@ -54,6 +57,17 @@ public class MultiGPUTests : IDisposable
         Console.WriteLine($"Selected device: {device.DeviceName}");
     }
 
+    /// <summary>Helper to build a MultiGPUInferenceEngine from device indices.</summary>
+    private MultiGPUInferenceEngine BuildEngine(int[] deviceIndices)
+    {
+        var devices = deviceIndices.Select(i => (IComputeDevice)new VulkanComputeDevice(i)).ToArray();
+        // Factory: creates one GGUFModel per device (each binds to its own device)
+        IGGUFModel ModelFactory(IComputeDevice d) => new GGUFModel(_modelPath, d);
+        var multiTransformer = new MultiGPUTransformer(devices, ModelFactory);
+        var tokenizer = BPETokenizer.FromGGUF(multiTransformer.PrimaryModel.Reader);
+        return new MultiGPUInferenceEngine(multiTransformer, tokenizer);
+    }
+
     [Fact]
     public void MultiGPUInferenceEngine_InitializeWithSingleGPU_Success()
     {
@@ -72,7 +86,7 @@ public class MultiGPUTests : IDisposable
         }
 
         // Act
-        using var engine = new MultiGPUInferenceEngine(new[] { 0 }, _modelPath);
+        using var engine = BuildEngine(new[] { 0 });
 
         // Assert
         Assert.Equal(1, engine.DeviceCount);
@@ -96,7 +110,7 @@ public class MultiGPUTests : IDisposable
             return;
         }
 
-        using var engine = new MultiGPUInferenceEngine(new[] { 0 }, _modelPath);
+        using var engine = BuildEngine(new[] { 0 });
         var config = new GenerationConfig
         {
             MaxNewTokens = 10,
@@ -132,7 +146,7 @@ public class MultiGPUTests : IDisposable
         }
 
         // Act - initialize with first two GPUs
-        using var engine = new MultiGPUInferenceEngine(new[] { 0, 1 }, _modelPath);
+        using var engine = BuildEngine(new[] { 0, 1 });
 
         // Assert
         Assert.Equal(2, engine.DeviceCount);
