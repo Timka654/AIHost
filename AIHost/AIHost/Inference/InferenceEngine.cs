@@ -175,8 +175,8 @@ public class InferenceEngine : IInferenceEngine
             int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
             generatedCount++;
-            onToken?.Invoke(nextToken);
 
+            // Check stop BEFORE sending to client so stop tokens never appear in output
             if (stopSingleTokens.Contains(nextToken))
             {
                 _logger.LogDebug("[Inference] Stop token {T} at {N}, total {Ms}ms", nextToken, generatedCount, sw.ElapsedMilliseconds);
@@ -191,6 +191,8 @@ public class InferenceEngine : IInferenceEngine
                 _logger.LogDebug("[Inference] Stop sequence matched at {N}, total {Ms}ms", generatedCount, sw.ElapsedMilliseconds);
                 break;
             }
+
+            onToken?.Invoke(nextToken);  // only called for non-stop tokens
         }
 
         if (generatedCount == config.MaxNewTokens)

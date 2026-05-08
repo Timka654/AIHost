@@ -181,6 +181,10 @@ public class OllamaController : ControllerBase
             var promptTokens = tokenizer.Encode(prompt).Length;
 
             using var __ = model.TrackRequest();
+
+            if (request.Stream)
+                return await StreamChat(model, prompt, config, request.Model, loadDuration, promptTokens, sw);
+
             var evalSw = Stopwatch.StartNew();
             var fullOutput = model.Engine.Generate(prompt, config, HttpContext.RequestAborted);
             var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000L;
@@ -220,6 +224,67 @@ public class OllamaController : ControllerBase
             _logger.LogError(ex, "Request failed [{Type}]: {Message}", ex.GetType().FullName, ex.Message);
             return BadRequest(new { error = ex.Message, type = ex.GetType().FullName, detail = ex.InnerException?.Message, stack = ex.ToString() });
         }
+    }
+
+    /// <summary>
+    /// Streaming variant of /api/chat. Each chunk:
+    ///   {"model":"…","created_at":"…","message":{"role":"assistant","content":"TOKEN"},"done":false}
+    /// Final chunk has "done":true and timing fields.
+    /// </summary>
+    private async Task<IActionResult> StreamChat(
+        Config.ModelInstance model, string prompt, GenerationConfig config,
+        string modelName, long loadDuration, int promptTokens, Stopwatch sw)
+    {
+        Response.ContentType = "application/x-ndjson";
+        Response.Headers["Cache-Control"] = "no-cache";
+        Response.Headers["X-Accel-Buffering"] = "no";
+
+        var evalSw = Stopwatch.StartNew();
+        int evalCount = 0;
+        var ct = HttpContext.RequestAborted;
+        var createdAt = DateTime.UtcNow.ToString("o");
+
+        try
+        {
+            model.Engine.GenerateStreaming(prompt, config, token =>
+            {
+                if (ct.IsCancellationRequested) return;
+                evalCount++;
+                var chunk = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    model = modelName,
+                    created_at = createdAt,
+                    message = new { role = "assistant", content = token },
+                    done = false
+                });
+                Response.WriteAsync(chunk + "\n", ct).GetAwaiter().GetResult();
+                Response.Body.FlushAsync(ct).GetAwaiter().GetResult();
+            }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("StreamChat cancelled for model {Model}", modelName);
+            return new EmptyResult();
+        }
+
+        var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000L;
+        var tps = evalCount / (evalSw.Elapsed.TotalSeconds > 0 ? evalSw.Elapsed.TotalSeconds : 1);
+        _modelManager.UpdateModelStats(modelName, prompt, tps);
+
+        var final = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            model = modelName,
+            created_at = createdAt,
+            message = new { role = "assistant", content = "" },
+            done = true,
+            total_duration = sw.ElapsedMilliseconds * 1_000_000L,
+            load_duration = loadDuration,
+            prompt_eval_count = promptTokens,
+            eval_count = evalCount,
+            eval_duration = evalDuration
+        });
+        await Response.WriteAsync(final + "\n");
+        return new EmptyResult();
     }
 
     /// <summary>
