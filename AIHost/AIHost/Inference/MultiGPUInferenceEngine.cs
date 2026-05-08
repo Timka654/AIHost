@@ -119,6 +119,25 @@ public class MultiGPUInferenceEngine : IInferenceEngine
             onToken?.Invoke(next);
 
             if (next == eosToken) { _logger.LogDebug("[MultiGPU] EOS at {N}", generated); break; }
+
+            // Check stop sequences
+            if (config.StopSequences.Count > 0)
+            {
+                var generatedText = _tokenizer.Decode(tokens.Skip(tokens.Count - generated - 1).ToArray());
+                foreach (var stop in config.StopSequences)
+                {
+                    if (generatedText.Contains(stop))
+                    {
+                        _logger.LogDebug("[MultiGPU] Stop sequence '{Stop}' at {N}", stop, generated);
+                        // Remove the stop sequence from tokens
+                        int[] stopTokenIds = _tokenizer.Encode(stop, addBos: false, addEos: false);
+                        int stopTokenCount = stopTokenIds.Length;
+                        if (stopTokenCount > 0 && tokens.Count >= stopTokenCount)
+                            tokens.RemoveRange(tokens.Count - stopTokenCount, stopTokenCount);
+                        return tokens;
+                    }
+                }
+            }
         }
 
         return tokens;
@@ -132,6 +151,22 @@ public class MultiGPUInferenceEngine : IInferenceEngine
             foreach (int t in prev)
                 if (t >= 0 && t < logits.Length)
                     logits[t] = logits[t] > 0 ? logits[t] / cfg.RepetitionPenalty : logits[t] * cfg.RepetitionPenalty;
+
+        if (cfg.FrequencyPenalty > 0f)
+        {
+            var freq = prev.GroupBy(t => t).ToDictionary(g => g.Key, g => g.Count());
+            foreach (var (token, count) in freq)
+                if (token >= 0 && token < logits.Length)
+                    logits[token] -= cfg.FrequencyPenalty * count;
+        }
+
+        if (cfg.PresencePenalty > 0f)
+        {
+            var seen = new HashSet<int>(prev);
+            foreach (int token in seen)
+                if (token >= 0 && token < logits.Length)
+                    logits[token] -= cfg.PresencePenalty;
+        }
 
         if (Math.Abs(cfg.Temperature - 1f) > 0.001f)
             for (int i = 0; i < logits.Length; i++) logits[i] /= cfg.Temperature;

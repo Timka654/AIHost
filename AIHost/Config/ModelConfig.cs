@@ -218,6 +218,22 @@ public class GenerationParameters
     /// </summary>
     [JsonPropertyName("stop")]
     public List<string> Stop { get; set; } = new();
+
+    /// <summary>
+    /// Frequency penalty: positive values penalize tokens that have already appeared,
+    /// reducing repetition. Applied as: logit -= freq_penalty * count(token).
+    /// Typical range: 0.0 to 1.0. 0 = disabled.
+    /// </summary>
+    [JsonPropertyName("frequency_penalty")]
+    public float FrequencyPenalty { get; set; } = 0.0f;
+
+    /// <summary>
+    /// Presence penalty: penalizes tokens that have appeared at least once,
+    /// encouraging the model to talk about new topics. Applied as: logit -= presence_penalty * (count > 0 ? 1 : 0).
+    /// Typical range: 0.0 to 1.0. 0 = disabled.
+    /// </summary>
+    [JsonPropertyName("presence_penalty")]
+    public float PresencePenalty { get; set; } = 0.0f;
 }
 
 /// <summary>

@@ -478,6 +478,8 @@ public class ManagementController : ControllerBase
                 TopK                = request.TopK ?? modelConfig?.Parameters.TopK ?? 40,
                 TopP                = request.TopP ?? modelConfig?.Parameters.TopP ?? 0.9f,
                 RepetitionPenalty   = modelConfig?.Parameters.RepetitionPenalty ?? 1.1f,
+                FrequencyPenalty    = modelConfig?.Parameters.FrequencyPenalty ?? 0.0f,
+                PresencePenalty     = modelConfig?.Parameters.PresencePenalty ?? 0.0f,
                 Seed                = modelConfig?.Parameters.Seed ?? -1,
                 UseKVCache          = modelConfig?.Parameters.UseKVCache ?? true,
                 StopSequences       = modelConfig?.Parameters.Stop.ToList() ?? []

@@ -22,6 +22,23 @@ public class GenerationConfig
     public int MaxPromptTokens { get; set; } = 0;
     /// <summary>Stop generation when any of these strings appears at the end of generated text.</summary>
     public List<string> StopSequences { get; set; } = [];
+    /// <summary>
+    /// Frequency penalty: positive values penalize tokens that have already appeared,
+    /// reducing repetition. Applied as: logit -= freq_penalty * count(token).
+    /// Typical range: 0.0 to 1.0. 0 = disabled.
+    /// </summary>
+    public float FrequencyPenalty { get; set; } = 0.0f;
+    /// <summary>
+    /// Presence penalty: penalizes tokens that have appeared at least once,
+    /// encouraging the model to talk about new topics. Applied as: logit -= presence_penalty * (count > 0 ? 1 : 0).
+    /// Typical range: 0.0 to 1.0. 0 = disabled.
+    /// </summary>
+    public float PresencePenalty { get; set; } = 0.0f;
+    /// <summary>
+    /// N-gram repetition penalty size: if > 0, penalizes repeating n-grams of this length.
+    /// E.g. 3 means "don't repeat the same 3-token sequence". Higher = more aggressive.
+    /// </summary>
+    public int RepeatLastN { get; set; } = 64;
 }
 
 /// <summary>
@@ -222,6 +239,18 @@ public class InferenceEngine : IInferenceEngine
             logits = ApplyRepetitionPenalty(logits, generatedTokens, config.RepetitionPenalty);
         }
 
+        // Apply frequency penalty (logit -= freq_penalty * count(token))
+        if (config.FrequencyPenalty > 0.0f)
+        {
+            logits = ApplyFrequencyPenalty(logits, generatedTokens, config.FrequencyPenalty);
+        }
+
+        // Apply presence penalty (logit -= presence_penalty if token has appeared)
+        if (config.PresencePenalty > 0.0f)
+        {
+            logits = ApplyPresencePenalty(logits, generatedTokens, config.PresencePenalty);
+        }
+
         // Apply temperature
         if (Math.Abs(config.Temperature - 1.0f) > 0.001f)
         {
@@ -345,6 +374,60 @@ public class InferenceEngine : IInferenceEngine
                     penalized[tokenId] /= penalty;
                 else
                     penalized[tokenId] *= penalty;
+            }
+        }
+
+        return penalized;
+    }
+
+    /// <summary>
+    /// Frequency penalty: reduces logits for tokens that have appeared many times.
+    /// logit -= freq_penalty * count(token)
+    /// </summary>
+    private float[] ApplyFrequencyPenalty(float[] logits, List<int> tokens, float freqPenalty)
+    {
+        if (freqPenalty <= 0.0f || tokens.Count == 0)
+            return logits;
+
+        float[] penalized = (float[])logits.Clone();
+        
+        // Count token frequencies
+        var counts = new Dictionary<int, int>();
+        foreach (int tokenId in tokens)
+        {
+            if (tokenId >= 0 && tokenId < penalized.Length)
+            {
+                counts.TryGetValue(tokenId, out int c);
+                counts[tokenId] = c + 1;
+            }
+        }
+
+        // Apply penalty proportional to frequency
+        foreach (var (tokenId, count) in counts)
+        {
+            penalized[tokenId] -= freqPenalty * count;
+        }
+
+        return penalized;
+    }
+
+    /// <summary>
+    /// Presence penalty: reduces logits for tokens that have appeared at least once.
+    /// logit -= presence_penalty if token has appeared
+    /// </summary>
+    private float[] ApplyPresencePenalty(float[] logits, List<int> tokens, float presencePenalty)
+    {
+        if (presencePenalty <= 0.0f || tokens.Count == 0)
+            return logits;
+
+        float[] penalized = (float[])logits.Clone();
+        var seen = new HashSet<int>(tokens);
+
+        foreach (int tokenId in seen)
+        {
+            if (tokenId >= 0 && tokenId < penalized.Length)
+            {
+                penalized[tokenId] -= presencePenalty;
             }
         }
 
