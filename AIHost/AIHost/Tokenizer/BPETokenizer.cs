@@ -57,7 +57,10 @@ public class BPETokenizer
     }
 
     /// <summary>
-    /// Encode text to token IDs (simplified greedy matching)
+    /// Encode text to token IDs (simplified greedy matching).
+    /// Handles special tokens (e.g. <|system|>, <|im_start|>, </s>)
+    /// by direct vocab lookup BEFORE SentencePiece normalisation, so they are
+    /// never corrupted by the ▁ prefix.
     /// </summary>
     public int[] Encode(string text, bool addBos = true, bool addEos = false)
     {
@@ -66,48 +69,97 @@ public class BPETokenizer
         if (addBos)
             tokens.Add(_bosToken);
 
-        // SentencePiece convention: spaces are represented as ▁ prefix on tokens.
-        // Prepend ▁ and replace all spaces so greedy matching finds real vocab entries.
-        string normalized = "▁" + text.Replace(" ", "▁");
-
-        // Simple greedy tokenization: try longest match first
-        int pos = 0;
-        while (pos < normalized.Length)
+        // ---- Phase 1: extract known special tokens (angle-bracket tokens) ----
+        // Split the text into segments: special tokens (exact vocab matches) and
+        // plain text that needs SentencePiece BPE tokenisation.
+        var segments = new List<(string text, bool isSpecial)>();
+        int scanPos = 0;
+        while (scanPos < text.Length)
         {
-            int bestMatchLen = 0;
-            int bestTokenId = _unknownToken;
-
-            // Try to find longest matching token
-            for (int len = Math.Min(normalized.Length - pos, 50); len > 0; len--)
+            // Look for the next '<' character
+            int angleStart = text.IndexOf('<', scanPos);
+            if (angleStart < 0)
             {
-                string substr = normalized.Substring(pos, len);
-                if (_tokenToId.TryGetValue(substr, out int tokenId))
-                {
-                    bestMatchLen = len;
-                    bestTokenId = tokenId;
-                    break;
-                }
+                // No more special tokens — rest is plain text
+                segments.Add((text[scanPos..], false));
+                break;
             }
 
-            if (bestMatchLen > 0)
+            // Plain text before the '<'
+            if (angleStart > scanPos)
+                segments.Add((text[scanPos..angleStart], false));
+
+            // Find the closing '>'
+            int angleEnd = text.IndexOf('>', angleStart + 1);
+            if (angleEnd < 0)
             {
-                tokens.Add(bestTokenId);
-                pos += bestMatchLen;
+                // Unclosed '<' — treat as plain text
+                segments.Add((text[scanPos..], false));
+                break;
+            }
+
+            // Candidate special token (including the angle brackets)
+            string candidate = text[angleStart..(angleEnd + 1)];
+
+            // Check if it exists in the vocabulary
+            if (_tokenToId.ContainsKey(candidate))
+            {
+                segments.Add((candidate, true));
+                scanPos = angleEnd + 1;
             }
             else
             {
-                // Fallback: try to find single byte token
-                char c = normalized[pos];
-                string charStr = c.ToString();
-                if (_tokenToId.TryGetValue(charStr, out int charTokenId))
+                // Not a known special token — treat '<' as plain text
+                segments.Add(("<", false));
+                scanPos = angleStart + 1;
+            }
+        }
+
+        // ---- Phase 2: tokenise each segment ----
+        foreach (var (segment, isSpecial) in segments)
+        {
+            if (isSpecial)
+            {
+                // Direct lookup — no SentencePiece normalisation
+                tokens.Add(_tokenToId[segment]);
+            }
+            else
+            {
+                // SentencePiece BPE tokenisation with ▁ prefix
+                string normalized = "▁" + segment.Replace(" ", "▁");
+                int pos = 0;
+                while (pos < normalized.Length)
                 {
-                    tokens.Add(charTokenId);
+                    int bestMatchLen = 0;
+                    int bestTokenId = _unknownToken;
+
+                    for (int len = Math.Min(normalized.Length - pos, 50); len > 0; len--)
+                    {
+                        string substr = normalized.Substring(pos, len);
+                        if (_tokenToId.TryGetValue(substr, out int tokenId))
+                        {
+                            bestMatchLen = len;
+                            bestTokenId = tokenId;
+                            break;
+                        }
+                    }
+
+                    if (bestMatchLen > 0)
+                    {
+                        tokens.Add(bestTokenId);
+                        pos += bestMatchLen;
+                    }
+                    else
+                    {
+                        char c = normalized[pos];
+                        string charStr = c.ToString();
+                        if (_tokenToId.TryGetValue(charStr, out int charTokenId))
+                            tokens.Add(charTokenId);
+                        else
+                            tokens.Add(_unknownToken);
+                        pos++;
+                    }
                 }
-                else
-                {
-                    tokens.Add(_unknownToken);
-                }
-                pos++;
             }
         }
 
