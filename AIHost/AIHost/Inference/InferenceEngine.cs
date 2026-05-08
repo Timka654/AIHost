@@ -90,7 +90,12 @@ public class InferenceEngine : IInferenceEngine
         if (config.Seed >= 0)
             _random = new Random(config.Seed);
 
-        var tokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
+        // Don't add BOS when the prompt already starts with a chat-template special token
+        // (e.g. Qwen's <|im_start|>). Adding BOS=1 before special tokens is wrong.
+        bool needsBos = !(prompt.StartsWith("<|im_start|>", StringComparison.Ordinal) ||
+                          prompt.StartsWith("<|system|>",   StringComparison.Ordinal) ||
+                          prompt.StartsWith("<s>",          StringComparison.Ordinal));
+        var tokens = _tokenizer.Encode(prompt, addBos: needsBos, addEos: false).ToList();
 
         if (config.MaxPromptTokens > 0 && tokens.Count > config.MaxPromptTokens)
         {

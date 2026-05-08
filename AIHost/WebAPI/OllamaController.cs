@@ -363,51 +363,65 @@ public class OllamaController : ControllerBase
 
     private string BuildPrompt(ModelInstance model, string? system, string prompt, bool raw)
     {
-        if (raw)
-            return prompt;
+        if (raw) return prompt;
 
-        var parts = new List<string>();
-
-        // Add system messages
+        // Re-use chat template logic by building a synthetic message list
+        var messages = new List<OllamaMessage>();
         if (!string.IsNullOrEmpty(system))
-            parts.Add($"System: {system}");
-        
-        foreach (var sysMsg in model.SystemMessages)
-            parts.Add($"System: {sysMsg}");
-
-        // Add user prompt
-        parts.Add($"User: {prompt}");
-        parts.Add("Assistant:");
-
-        return string.Join("\n\n", parts);
+            messages.Add(new OllamaMessage { Role = "system", Content = system });
+        messages.Add(new OllamaMessage { Role = "user", Content = prompt });
+        return BuildChatPrompt(model, messages);
     }
 
     private string BuildChatPrompt(ModelInstance model, List<OllamaMessage> messages)
     {
-        // TinyLlama / LLaMA chat template used by most instruct models:
-        // <|system|>\n{system}\n</s>\n<|user|>\n{user}\n</s>\n<|assistant|>\n
+        var tokenizer = model.Engine.Tokenizer;
         var sb = new System.Text.StringBuilder();
 
-        // Collect system text: model-level messages + any system role in conversation
         var systemParts = new List<string>(model.SystemMessages);
         foreach (var msg in messages)
             if (msg.Role == "system") systemParts.Add(msg.Content);
 
-        if (systemParts.Count > 0)
+        // Detect template style by checking for Qwen/<im_start> tokens in vocabulary.
+        // Qwen2/Qwen3/ChatML: uses <|im_start|> / <|im_end|>
+        // TinyLlama/LLaMA:   uses <|system|> / <|user|> / <|assistant|> / </s>
+        bool isQwenStyle = tokenizer.GetTokenId("<|im_start|>") >= 0;
+
+        if (isQwenStyle)
         {
-            sb.Append("<|system|>\n");
-            sb.Append(string.Join("\n", systemParts));
-            sb.Append("\n</s>\n");
+            // ChatML / Qwen template
+            if (systemParts.Count > 0)
+            {
+                sb.Append("<|im_start|>system\n");
+                sb.Append(string.Join("\n", systemParts));
+                sb.Append("<|im_end|>\n");
+            }
+            foreach (var msg in messages)
+            {
+                if (msg.Role == "system") continue;
+                var role = msg.Role == "assistant" ? "assistant" : "user";
+                sb.Append($"<|im_start|>{role}\n{msg.Content}<|im_end|>\n");
+            }
+            sb.Append("<|im_start|>assistant\n");
+        }
+        else
+        {
+            // TinyLlama / LLaMA-style template
+            if (systemParts.Count > 0)
+            {
+                sb.Append("<|system|>\n");
+                sb.Append(string.Join("\n", systemParts));
+                sb.Append("\n</s>\n");
+            }
+            foreach (var msg in messages)
+            {
+                if (msg.Role == "system") continue;
+                var tag = msg.Role == "assistant" ? "<|assistant|>" : "<|user|>";
+                sb.Append($"{tag}\n{msg.Content}\n</s>\n");
+            }
+            sb.Append("<|assistant|>\n");
         }
 
-        foreach (var msg in messages)
-        {
-            if (msg.Role == "system") continue; // already handled above
-            var tag = msg.Role == "assistant" ? "<|assistant|>" : "<|user|>";
-            sb.Append($"{tag}\n{msg.Content}\n</s>\n");
-        }
-
-        sb.Append("<|assistant|>\n");
         return sb.ToString();
     }
 

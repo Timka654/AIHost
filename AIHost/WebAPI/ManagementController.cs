@@ -171,6 +171,15 @@ public class ManagementController : ControllerBase
     }
 
     /// <summary>
+    /// Get build version
+    /// </summary>
+    [HttpGet("build_version")]
+    public IActionResult GetBuildVersion()
+    {
+        return Ok(BuildInfo.Date);
+    }
+
+    /// <summary>
     /// Get all loaded models with statistics
     /// </summary>
     [HttpGet("models")]
@@ -419,16 +428,19 @@ public class ManagementController : ControllerBase
                 StopSequences       = modelConfig?.Parameters.Stop.ToList() ?? []
             };
 
+            // Apply chat template so instruction-tuned models receive properly formatted input.
+            var formattedPrompt = BuildDirectChatPrompt(model, request);
+
             if (request.Stream)
             {
                 using var _ = model.TrackRequest();
-                return await DirectChatStream(request, model, config);
+                return await DirectChatStream(request, model, config, formattedPrompt);
             }
 
             using var __ = model.TrackRequest();
             var ct = HttpContext.RequestAborted;
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var response = model.Engine.Generate(request.Message, config, ct);
+            var response = model.Engine.Generate(formattedPrompt, config, ct);
             sw.Stop();
 
             var tokenCount = response.Length;
@@ -480,18 +492,47 @@ public class ManagementController : ControllerBase
         }
     }
 
+    /// <summary>Applies the model's chat template to the DirectChat message.</summary>
+    private static string BuildDirectChatPrompt(AIHost.Config.ModelInstance model, ChatRequest request)
+    {
+        var tokenizer = model.Engine.Tokenizer;
+        bool isQwen   = tokenizer.GetTokenId("<|im_start|>") >= 0;
+        var sb = new System.Text.StringBuilder();
+
+        var systemText = request.SystemMessage
+                      ?? (model.SystemMessages.Count > 0 ? string.Join("\n", model.SystemMessages) : null);
+
+        if (isQwen)
+        {
+            if (!string.IsNullOrEmpty(systemText))
+                sb.Append($"<|im_start|>system\n{systemText}<|im_end|>\n");
+            sb.Append($"<|im_start|>user\n{request.Message}<|im_end|>\n");
+            sb.Append("<|im_start|>assistant\n");
+        }
+        else
+        {
+            if (!string.IsNullOrEmpty(systemText))
+                sb.Append($"<|system|>\n{systemText}\n</s>\n");
+            sb.Append($"<|user|>\n{request.Message}\n</s>\n");
+            sb.Append("<|assistant|>\n");
+        }
+        return sb.ToString();
+    }
+
     /// <summary>
     /// Streaming variant of DirectChat — sends NDJSON chunks as each token arrives.
     /// Each chunk: {"token":"...", "done":false}
     /// Final chunk: {"response":"...", "tokens":N, "tps":X, "done":true}
     /// </summary>
     private async Task<IActionResult> DirectChatStream(ChatRequest request,
-        AIHost.Config.ModelInstance model, AIHost.Inference.GenerationConfig config)
+        AIHost.Config.ModelInstance model, AIHost.Inference.GenerationConfig config,
+        string? formattedPrompt = null)
     {
         Response.ContentType = "application/x-ndjson";
         Response.Headers["Cache-Control"] = "no-cache";
         Response.Headers["X-Accel-Buffering"] = "no"; // disable nginx buffering
 
+        var prompt = formattedPrompt ?? request.Message;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var fullResponse = new System.Text.StringBuilder();
         int tokenCount = 0;
@@ -499,7 +540,7 @@ public class ManagementController : ControllerBase
         var ct = HttpContext.RequestAborted;
         try
         {
-            model.Engine.GenerateStreaming(request.Message, config, async token =>
+            model.Engine.GenerateStreaming(prompt, config, async token =>
             {
                 if (ct.IsCancellationRequested) return;
                 fullResponse.Append(token);
