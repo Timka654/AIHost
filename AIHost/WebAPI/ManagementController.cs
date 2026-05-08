@@ -579,7 +579,7 @@ public class ManagementController : ControllerBase
     /// <summary>
     /// Streaming variant of DirectChat — sends NDJSON chunks as each token arrives.
     /// Each chunk: {"token":"...", "done":false}
-    /// Final chunk: {"response":"...", "tokens":N, "tps":X, "done":true}
+    /// Final chunk: {"tokens":N, "tps":X, "done":true}  (no "response" field to avoid duplication)
     /// </summary>
     private async Task<IActionResult> DirectChatStream(ChatRequest request,
         AIHost.Config.ModelInstance model, AIHost.Inference.GenerationConfig config,
@@ -591,7 +591,6 @@ public class ManagementController : ControllerBase
 
         var prompt = formattedPrompt ?? request.Message;
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var fullResponse = new System.Text.StringBuilder();
         int tokenCount = 0;
 
         var ct = HttpContext.RequestAborted;
@@ -600,7 +599,6 @@ public class ManagementController : ControllerBase
             model.Engine.GenerateStreaming(prompt, config, async token =>
             {
                 if (ct.IsCancellationRequested) return;
-                fullResponse.Append(token);
                 tokenCount++;
                 var chunk = System.Text.Json.JsonSerializer.Serialize(new { token, done = false });
                 await Response.WriteAsync(chunk + "\n", ct);
@@ -626,7 +624,6 @@ public class ManagementController : ControllerBase
 
         var final = System.Text.Json.JsonSerializer.Serialize(new
         {
-            response = fullResponse.ToString(),
             tokens = tokenCount,
             tps = Math.Round(tps, 2),
             done = true

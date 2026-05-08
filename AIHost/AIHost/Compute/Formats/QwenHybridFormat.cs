@@ -67,6 +67,9 @@ public class QwenHybridFormat : ITransformerFormat
         xNorm.Dispose();
 
         // 3. Gated Q detection via attn_gate.weight presence
+        // For Qwen3.6-27B, Type B layers (3,7,11,...) have attn_q.weight [dModel, 2*qDim]
+        // where the first half is q_proj and second half is q_gate, even without
+        // a separate attn_gate.weight. Always split if qTotalDim > expected qDim.
         int kvDim = K.Shape[1];
         int qTotalDim = rawQ.Shape[1];
         bool isGatedQ = transformer.HasWeight($"blk.{g}.attn_gate.weight");
@@ -74,9 +77,22 @@ public class QwenHybridFormat : ITransformerFormat
         int nQH, qEffectiveDim;
         Tensor gatedQ;
 
-        if (isGatedQ)
+        // Determine qDim: use attn_output weight shape[0] as authoritative qDim if available
+        int qDim;
+        if (transformer.HasWeight($"blk.{g}.attn_output.weight"))
         {
-            int qDim = qTotalDim / 2;
+            var wOShape = transformer._weightCache[$"blk.{g}.attn_output.weight"].Shape;
+            // attn_output.weight is [qDim, dModel] for Type B layers
+            qDim = wOShape[0];
+        }
+        else
+        {
+            qDim = qTotalDim;
+        }
+
+        if (isGatedQ || qTotalDim > qDim)
+        {
+            // Split: first qDim elements are q_proj, next qDim are q_gate
             var qProj = ops.SliceCols(rawQ, 0, qDim, "q_proj");
             var qGate = ops.SliceCols(rawQ, qDim, qDim, "q_gate");
             rawQ.Dispose();

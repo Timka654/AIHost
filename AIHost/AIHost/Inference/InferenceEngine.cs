@@ -56,6 +56,10 @@ public class InferenceEngine : IInferenceEngine
     private readonly int _batchSize;
     private readonly ILogger<InferenceEngine> _logger = AppLogger.Create<InferenceEngine>();
 
+    // Serializes GPU access: Vulkan command queues are NOT thread-safe.
+    // Without this, concurrent requests cause vkQueueSubmit ErrorDeviceLost.
+    private readonly SemaphoreSlim _gpuLock = new(1, 1);
+
     public BPETokenizer Tokenizer => _tokenizer;
     public int BatchSize => _batchSize;
     public int ContextLength => _model.ContextLength;
@@ -75,17 +79,33 @@ public class InferenceEngine : IInferenceEngine
     public string Generate(string prompt, GenerationConfig config,
                             CancellationToken cancellationToken = default)
     {
-        var tokens = PrepareAndRun(prompt, config, onToken: null, cancellationToken);
-        return _tokenizer.Decode(tokens.ToArray());
+        _gpuLock.Wait(cancellationToken);
+        try
+        {
+            var tokens = PrepareAndRun(prompt, config, onToken: null, cancellationToken);
+            return _tokenizer.Decode(tokens.ToArray());
+        }
+        finally
+        {
+            _gpuLock.Release();
+        }
     }
 
     public void GenerateStreaming(string prompt, GenerationConfig config,
                                    Action<string> onTokenGenerated,
                                    CancellationToken cancellationToken = default)
     {
-        PrepareAndRun(prompt, config,
-            onToken: tokenId => onTokenGenerated(_tokenizer.GetToken(tokenId)),
-            cancellationToken);
+        _gpuLock.Wait(cancellationToken);
+        try
+        {
+            PrepareAndRun(prompt, config,
+                onToken: tokenId => onTokenGenerated(_tokenizer.GetToken(tokenId)),
+                cancellationToken);
+        }
+        finally
+        {
+            _gpuLock.Release();
+        }
     }
 
     /// <summary>

@@ -116,17 +116,19 @@ public class MultiGPUInferenceEngine : IInferenceEngine
             int next = Sample(lastLogits, tokens, config);
             tokens.Add(next);
             generated++;
-            onToken?.Invoke(next);
 
+            // Check stop BEFORE sending to client so stop tokens never appear in output
             if (next == eosToken) { _logger.LogDebug("[MultiGPU] EOS at {N}", generated); break; }
 
-            // Check stop sequences
+            // Check stop sequences (suffix match on recently generated text only)
             if (config.StopSequences.Count > 0)
             {
-                var generatedText = _tokenizer.Decode(tokens.Skip(tokens.Count - generated - 1).ToArray());
+                // Only check the last N tokens to avoid matching stop sequences from the prompt
+                int checkLen = Math.Min(generated, 20);
+                var recentText = _tokenizer.Decode(tokens.Skip(tokens.Count - checkLen).ToArray());
                 foreach (var stop in config.StopSequences)
                 {
-                    if (generatedText.Contains(stop))
+                    if (recentText.EndsWith(stop, StringComparison.Ordinal))
                     {
                         _logger.LogDebug("[MultiGPU] Stop sequence '{Stop}' at {N}", stop, generated);
                         // Remove the stop sequence from tokens
@@ -138,6 +140,8 @@ public class MultiGPUInferenceEngine : IInferenceEngine
                     }
                 }
             }
+
+            onToken?.Invoke(next);  // only called for non-stop tokens
         }
 
         return tokens;
