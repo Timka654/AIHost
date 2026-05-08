@@ -122,8 +122,9 @@ public class MultiGPUInferenceEngine : IInferenceEngine
                                          Action<int>? onToken,
                                          CancellationToken cancellationToken = default)
     {
-        // Create local KV cache for this generation
+        // Create local KV cache and SSM state for this generation
         using var kvCache = config.UseKVCache ? _model.CreateKVCache() : null;
+        using var ssmState = config.UseKVCache ? new SSMState() : null;
 
         if (config.Seed >= 0)
         {
@@ -168,7 +169,7 @@ public class MultiGPUInferenceEngine : IInferenceEngine
                         : tokens.ToArray();
 
                     var iterSw = System.Diagnostics.Stopwatch.StartNew();
-                    var logitsTensor = _model.Forward(inputTokens, startPos, kvCache);
+                    var logitsTensor = _model.Forward(inputTokens, startPos, kvCache, ssmState);
                     int lastRow = logitsTensor.Shape[0] - 1;
                     lastLogits = logitsTensor.ReadRow(lastRow);
                     logitsTensor.Dispose();

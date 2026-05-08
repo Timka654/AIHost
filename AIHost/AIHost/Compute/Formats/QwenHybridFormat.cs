@@ -109,11 +109,11 @@ public class QwenHybridFormat : ITransformerFormat
             qEffectiveDim = qTotalDim;
         }
 
-        // 4. QK normalization
+        // 4. QK normalization (skip if weight not present in model)
         var qNormW = transformer.GetOrBuildTiledNorm($"blk.{g}.attn_q_norm.weight", headDim, qEffectiveDim);
         var kNormW = transformer.GetOrBuildTiledNorm($"blk.{g}.attn_k_norm.weight", headDim, kvDim);
-        ops.LayerNorm(gatedQ, qNormW);
-        ops.LayerNorm(K, kNormW);
+        if (qNormW != null) ops.LayerNorm(gatedQ, qNormW);
+        if (kNormW != null) ops.LayerNorm(K, kNormW);
 
         // 5. RoPE
         int nKVH = kvDim / headDim;
@@ -198,35 +198,65 @@ public class QwenHybridFormat : ITransformerFormat
 
         int totalQKV = qkv.Shape[1];
 
-        // Check if the output projection weight tells us Q_dim directly
-        var wAOkey = nm.AttnOutput(g);
-        bool isGatedAttn = transformer.HasWeight(wAOkey) &&
-                           transformer._weightCache[wAOkey].Shape[0] == x.Shape[1] &&
-                           transformer._weightCache[wAOkey].Shape[1] != x.Shape[1];
+        // For Qwen3.6 Type A (combined QKV + SSM):
+        //   attn_qkv.weight shape: [dModel, totalQKV] = [5120, 10240]
+        //   Structure: Q_proj[6144] + K[1024] + V[1024] + Q_gate[2048]
+        //   Where Q_gate has 8 heads (2048 = 8 * 256) and is tiled 3x to match
+        //   24 Q heads (6144 = 24 * 256).
+        //   attn_output.weight does NOT exist for Type A layers.
+        //   Instead, ssm_out.weight [6144, 5120] serves as the attention output projection.
+        //
+        // Key dimensions (from GGUF metadata):
+        //   headDim = attention.key_length = 256
+        //   qDim = ssm.inner_size = 6144 = nHeads(24) * headDim(256)
+        //   kvDim = nKVHeads(4) * headDim(256) = 1024
+        //   qGateDim = totalQKV - qDim - 2*kvDim = 10240 - 6144 - 2048 = 2048 = 8 * headDim
+        int headDim = 256;  // from attention.key_length metadata
+        int qDim = transformer._numHeads * headDim;       // 24 * 256 = 6144
+        int kvDim = transformer._numKVHeads * headDim;    // 4 * 256 = 1024
+        int nKvH = transformer._numKVHeads;               // 4
 
-        int qDim, kvDim, headDim, nKvH;
-        if (isGatedAttn)
-        {
-            qDim = transformer._weightCache[wAOkey].Shape[1];
-            headDim = qDim / transformer._numHeads;
-            kvDim = (totalQKV - qDim) / 2;
-            nKvH = kvDim / headDim;
-            if (g == 0) Console.WriteLine($"[Attn] headDim={headDim} qDim={qDim} kvDim={kvDim} nKvH={nKvH}");
-        }
-        else
-        {
-            nKvH = transformer._numKVHeads;
-            headDim = totalQKV / (transformer._numHeads + 2 * nKvH);
-            qDim = transformer._numHeads * headDim;
-            kvDim = nKvH * headDim;
-        }
+        // Check if there's a Q gate section in attn_qkv.weight
+        int expectedBase = qDim + 2 * kvDim;  // 6144 + 2048 = 8192
+        bool hasQGate = totalQKV > expectedBase;
+        int qGateDim = hasQGate ? totalQKV - expectedBase : 0;  // 2048 for Qwen3.6
 
+        if (g == 0)
+            Console.WriteLine($"[Attn] TypeA layer {g}: totalQKV={totalQKV} qDim={qDim} kvDim={kvDim} qGateDim={qGateDim} headDim={headDim} nKvH={nKvH}");
+
+        // Split QKV: Q_proj[0:qDim], K[qDim:qDim+kvDim], V[qDim+kvDim:qDim+2*kvDim]
         var Q = ops.SliceCols(qkv, 0, qDim, "Q");
         var K = ops.SliceCols(qkv, qDim, kvDim, "K");
         var V = ops.SliceCols(qkv, qDim + kvDim, kvDim, "V");
+
+        // Apply gated Q if Q gate section exists
+        Tensor gatedQ;
+        if (hasQGate)
+        {
+            // Q gate is in the last qGateDim columns of attn_qkv.weight
+            // qGate has shape [seqLen, 2048] (8 gate heads × 256)
+            // Q has shape [seqLen, 6144] (24 heads × 256)
+            // Tile qGate 3x to match Q: [seqLen, 2048] → [seqLen, 6144]
+            var qGate = ops.SliceCols(qkv, qDim + 2 * kvDim, qGateDim, "q_gate");
+            ops.SiLU(qGate);
+            
+            // Tile qGate to match Q dimension: repeat 3 times along columns
+            // qGate: [seqLen, 2048] → concat 3x → [seqLen, 6144]
+            var qGateTiled = ops.Concat(qGate, qGate, 1, "q_gate_tiled_2x");
+            qGateTiled = ops.Concat(qGateTiled, qGate, 1, "q_gate_tiled_3x");
+            qGate.Dispose();
+            
+            gatedQ = ops.Multiply(Q, qGateTiled, "gated_q");
+            Q.Dispose();
+            qGateTiled.Dispose();
+        }
+        else
+        {
+            gatedQ = Q;
+        }
         qkv.Dispose();
 
-        ops.ApplyRoPEFull(Q, position, transformer._numHeads, headDim, transformer._ropeFreqBase);
+        ops.ApplyRoPEFull(gatedQ, position, transformer._numHeads, headDim, transformer._ropeFreqBase);
         ops.ApplyRoPEFull(K, position, nKvH, headDim, transformer._ropeFreqBase);
 
         Tensor attnOut;
@@ -234,29 +264,44 @@ public class QwenHybridFormat : ITransformerFormat
         {
             kvCache.Add(layerIdx, K, V);
             var (cachedK, cachedV) = kvCache.Get(layerIdx);
-            attnOut = ops.MultiHeadAttention(Q, cachedK!, cachedV!, transformer._numHeads, position, "attn_out");
-            ops.DeferExternal(Q);
+            attnOut = ops.MultiHeadAttention(gatedQ, cachedK!, cachedV!, transformer._numHeads, position, "attn_out");
+            ops.DeferExternal(gatedQ);
         }
         else
         {
-            attnOut = ops.MultiHeadAttention(Q, K, V, transformer._numHeads, position, "attn_out");
-            ops.DeferExternal(Q); ops.DeferExternal(K); ops.DeferExternal(V);
+            attnOut = ops.MultiHeadAttention(gatedQ, K, V, transformer._numHeads, position, "attn_out");
+            ops.DeferExternal(gatedQ); ops.DeferExternal(K); ops.DeferExternal(V);
         }
 
-        // Output projection
-        var (wAO, sAO) = transformer.TempF32(wAOkey);
+        // Output projection: use ssm_out.weight [qDim, dModel] = [6144, 5120]
+        // This weight serves dual purpose: SSM output projection AND attention output projection.
+        string wAOkey = $"blk.{g}.ssm_out.weight";
+        if (!transformer.HasWeight(wAOkey))
+        {
+            // Fallback: try attn_output.weight (for models that have it)
+            wAOkey = nm.AttnOutput(g);
+        }
+        var (wAO, sAO) = transformer.TempF32Named(wAOkey);
         Tensor attnProj;
-        if (isGatedAttn)
+        // ssm_out.weight shape: [qDim, dModel] = [6144, 5120]
+        // attnOut shape: [seqLen, qDim] = [seqLen, 6144]
+        // Use MatMulWeights: [seqLen, 6144] × [6144, 5120] → [seqLen, 5120]
+        if (wAO.Shape[0] == attnOut.Shape[1])
+        {
+            attnProj = ops.MatMulWeights(attnOut, wAO, "attn_proj");
+        }
+        else if (wAO.Shape[1] == attnOut.Shape[1])
         {
             attnProj = ops.MatMulWeightsT(attnOut, wAO, "attn_proj");
-            attnOut.Dispose();
         }
         else
         {
-            attnProj = ops.MatMulWeights(attnOut, wAO, "attn_proj");
-            attnOut.Dispose();
+            throw new InvalidOperationException(
+                $"TypeA Layer {g}: cannot project attnOut [{attnOut.Shape[0]}×{attnOut.Shape[1]}] " +
+                $"with W_o [{wAO.Shape[0]}×{wAO.Shape[1]}]");
         }
         if (!sAO) wAO.Dispose();
+        attnOut.Dispose();
         xNorm.Dispose();
 
         var x1 = ops.Add(x, attnProj, "x_after_attn");

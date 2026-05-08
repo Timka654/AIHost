@@ -268,13 +268,18 @@ public class TransformerBase : IDisposable
     /// Creates a tiled version of a [head_dim] norm weight to cover [total_dim].
     /// Caches result in _scratchF32 to avoid re-allocation every token.
     /// </summary>
-    protected internal Tensor GetOrBuildTiledNorm(string weightName, int headDim, int totalDim)
+    /// <summary>
+    /// Creates a tiled version of a [head_dim] norm weight to cover [total_dim].
+    /// If the weight is not found, returns null — caller should skip normalization.
+    /// Caches result in _scratchF32 to avoid re-allocation every token.
+    /// </summary>
+    protected internal Tensor? GetOrBuildTiledNorm(string weightName, int headDim, int totalDim)
     {
         string key = $"_tiled_{weightName}";
         if (_scratchF32.TryGetValue(key, out var cached)) return cached;
 
         if (!_weightCache.TryGetValue(weightName, out var srcW))
-            return Tensor.Create(_ops.Device, new TensorShape(totalDim), DataType.F32, key);
+            return null; // weight not present — skip normalization
 
         var srcF32 = _ops.Dequantize(srcW);
         var srcData = srcF32.ReadData();
@@ -447,7 +452,11 @@ public class TransformerBase : IDisposable
         bool layerHasSeparate = _model.Tensors.Any(t => t.Name == $"blk.{globalLayer}.attn_q.weight");
 
         if (layerHasCombined)
+        {
             TryCacheWeight($"blk.{globalLayer}.attn_qkv.weight");
+            // Qwen3.6 Type A: attn_gate.weight [dModel, qDim] for gated Q
+            TryCacheWeight($"blk.{globalLayer}.attn_gate.weight");
+        }
         else if (layerHasSeparate)
         {
             TryCacheWeight($"blk.{globalLayer}.attn_q.weight");
@@ -456,10 +465,17 @@ public class TransformerBase : IDisposable
             TryCacheWeight($"blk.{globalLayer}.attn_q_norm.weight");
             TryCacheWeight($"blk.{globalLayer}.attn_k_norm.weight");
             TryCacheWeight($"blk.{globalLayer}.attn_output.weight");
+            // Qwen3.6 Type B: attn_gate.weight may be present for gated Q
+            TryCacheWeight($"blk.{globalLayer}.attn_gate.weight");
         }
 
         if (layerHasCombined)
+        {
+            // For Qwen3.6 Type A, attn_output.weight does NOT exist.
+            // ssm_out.weight [qDim, dModel] serves as attention output projection.
+            // Try attn_output.weight first (for models that have it), then fall through.
             TryCacheWeight(nm.AttnOutput(globalLayer));
+        }
 
         TryCacheWeight(nm.FfnNorm(globalLayer));
         TryCacheWeight($"blk.{globalLayer}.post_attention_norm.weight");

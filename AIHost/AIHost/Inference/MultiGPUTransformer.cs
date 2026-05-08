@@ -125,7 +125,8 @@ public class MultiGPUTransformer : IDisposable
     /// Full forward pass across all GPUs.
     /// Returns logits tensor on the last device — caller disposes.
     /// </summary>
-    public Tensor Forward(int[] tokenIds, uint startPosition, MultiDeviceKVCache? kvCache = null)
+    public Tensor Forward(int[] tokenIds, uint startPosition, MultiDeviceKVCache? kvCache = null,
+                           SSMState? ssmState = null)
     {
         // 1. Embedding on device 0
         Tensor x = _transformers[0].ForwardEmbedding(tokenIds);
@@ -136,7 +137,7 @@ public class MultiGPUTransformer : IDisposable
             if (d > 0)
                 x = TransferTensor(x, _transformers[d].Ops);
 
-            x = _transformers[d].ForwardLayers(x, startPosition, kvCache?.ForDevice(d));
+            x = _transformers[d].ForwardLayers(x, startPosition, kvCache?.ForDevice(d), ssmState);
         }
 
         // 3. Head always on device 0: transfer back if we ended up on another device
