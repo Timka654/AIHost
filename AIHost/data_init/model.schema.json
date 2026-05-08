@@ -100,6 +100,12 @@
       "description": "Allow fallback to shared GPU memory (slower)",
       "default": false
     },
+    "max_concurrency": {
+      "type": "integer",
+      "description": "Maximum concurrent inference requests (1 = serialized, 2+ = parallel)",
+      "minimum": 1,
+      "default": 1
+    },
     "devices": {
       "type": "array",
       "description": "Multi-GPU configuration (2+ devices)",

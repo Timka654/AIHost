@@ -14,6 +14,22 @@ public abstract class ComputeProviderBase : IComputeDevice
     public abstract IComputeCommandQueue CreateCommandQueue();
     public abstract void Synchronize();
     public abstract void Dispose();
+
+    /// <summary>
+    /// По умолчанию возвращает информацию только из трекера аллокаций.
+    /// Провайдеры, поддерживающие нативный запрос памяти (Vulkan), переопределяют этот метод.
+    /// </summary>
+    public virtual DeviceMemoryInfo GetMemoryInfo()
+    {
+        return new DeviceMemoryInfo
+        {
+            TotalBytes = 0,
+            AvailableBytes = 0,
+            UsedBytes = 0,
+            TrackedAllocatedBytes = ComputeBufferBase.TotalAllocatedBytes,
+            SupportsNativeQuery = false
+        };
+    }
 }
 
 /// <summary>
@@ -21,6 +37,65 @@ public abstract class ComputeProviderBase : IComputeDevice
 /// </summary>
 public abstract class ComputeBufferBase : IComputeBuffer
 {
+    // ── Статические поля для трекинга (backing fields для Interlocked) ──
+    private static long _totalAllocatedBytes;
+    private static long _peakAllocatedBytes;
+    private static long _totalBufferCount;
+    private static long _activeBufferCount;
+    private static long _allocationCount;
+    private static long _freeCount;
+
+    /// <summary>Глобальный трекер выделенной памяти через все буферы (в байтах).</summary>
+    public static long TotalAllocatedBytes => Interlocked.Read(ref _totalAllocatedBytes);
+
+    /// <summary>Пиковое значение выделенной памяти (для статистики).</summary>
+    public static long PeakAllocatedBytes => Interlocked.Read(ref _peakAllocatedBytes);
+
+    /// <summary>Общее количество созданных буферов.</summary>
+    public static long TotalBufferCount => Interlocked.Read(ref _totalBufferCount);
+
+    /// <summary>Количество активных (не освобожденных) буферов.</summary>
+    public static long ActiveBufferCount => Interlocked.Read(ref _activeBufferCount);
+
+    /// <summary>Счетчик аллокаций (для отладки утечек).</summary>
+    public static long AllocationCount => Interlocked.Read(ref _allocationCount);
+
+    /// <summary>Счетчик освобождений.</summary>
+    public static long FreeCount => Interlocked.Read(ref _freeCount);
+
+    /// <summary>
+    /// Уведомить трекер о выделении памяти.
+    /// Вызывается из конструкторов конкретных буферов.
+    /// </summary>
+    protected static void TrackAllocate(ulong size)
+    {
+        Interlocked.Add(ref _totalAllocatedBytes, (long)size);
+        Interlocked.Increment(ref _totalBufferCount);
+        Interlocked.Increment(ref _activeBufferCount);
+        Interlocked.Increment(ref _allocationCount);
+
+        // Обновляем пик
+        long current = Interlocked.Read(ref _totalAllocatedBytes);
+        long peak;
+        do
+        {
+            peak = Interlocked.Read(ref _peakAllocatedBytes);
+            if (current <= peak) break;
+        }
+        while (Interlocked.CompareExchange(ref _peakAllocatedBytes, current, peak) != peak);
+    }
+
+    /// <summary>
+    /// Уведомить трекер об освобождении памяти.
+    /// Вызывается из Dispose() конкретных буферов.
+    /// </summary>
+    protected static void TrackFree(ulong size)
+    {
+        Interlocked.Add(ref _totalAllocatedBytes, -(long)size);
+        Interlocked.Decrement(ref _activeBufferCount);
+        Interlocked.Increment(ref _freeCount);
+    }
+
     public abstract ulong Size { get; }
     public abstract BufferType Type { get; }
     public abstract DataType ElementType { get; }

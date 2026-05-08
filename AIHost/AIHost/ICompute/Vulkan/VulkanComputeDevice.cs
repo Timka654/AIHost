@@ -243,6 +243,51 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
         _disposed = true;
     }
 
+    public override DeviceMemoryInfo GetMemoryInfo()
+    {
+        PhysicalDeviceMemoryProperties memProps;
+        _vk.GetPhysicalDeviceMemoryProperties(_physicalDevice, &memProps);
+
+        ulong totalHeapSize = 0;
+        ulong usedEstimate = 0;
+
+        // Суммируем все heap'ы, которые являются DEVICE_LOCAL (VRAM)
+        for (uint i = 0; i < memProps.MemoryHeapCount; i++)
+        {
+            var heap = memProps.MemoryHeaps[(int)i];
+            // Проверяем, есть ли хотя бы один memory type в этом heap'е с DEVICE_LOCAL
+            bool hasDeviceLocal = false;
+            for (uint j = 0; j < memProps.MemoryTypeCount; j++)
+            {
+                if ((memProps.MemoryTypes[(int)j].HeapIndex == i) &&
+                    (memProps.MemoryTypes[(int)j].PropertyFlags & MemoryPropertyFlags.DeviceLocalBit) != 0)
+                {
+                    hasDeviceLocal = true;
+                    break;
+                }
+            }
+
+            if (hasDeviceLocal)
+            {
+                totalHeapSize += heap.Size;
+            }
+        }
+
+        // Используем трекер аллокаций как оценку used
+        usedEstimate = (ulong)ComputeBufferBase.TotalAllocatedBytes;
+        if (usedEstimate > totalHeapSize)
+            usedEstimate = totalHeapSize;
+
+        return new DeviceMemoryInfo
+        {
+            TotalBytes = (long)totalHeapSize,
+            AvailableBytes = (long)(totalHeapSize - usedEstimate),
+            UsedBytes = (long)usedEstimate,
+            TrackedAllocatedBytes = ComputeBufferBase.TotalAllocatedBytes,
+            SupportsNativeQuery = true
+        };
+    }
+
     internal Vk VkApi => _vk;
     internal Device Device => _device;
     internal PhysicalDevice PhysicalDevice => _physicalDevice;

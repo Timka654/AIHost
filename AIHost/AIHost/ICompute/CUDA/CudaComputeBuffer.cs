@@ -5,7 +5,7 @@ namespace AIHost.ICompute.CUDA;
 /// <summary>
 /// CUDA compute buffer implementation
 /// </summary>
-public unsafe class CudaComputeBuffer : IComputeBuffer
+public unsafe class CudaComputeBuffer : ComputeBufferBase
 {
     private IntPtr _devicePtr;
     private readonly ulong _size;
@@ -13,9 +13,9 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
     private readonly DataType _elementType;
     private bool _disposed;
 
-    public ulong Size => _size;
-    public BufferType Type => _bufferType;
-    public DataType ElementType => _elementType;
+    public override ulong Size => _size;
+    public override BufferType Type => _bufferType;
+    public override DataType ElementType => _elementType;
 
     public CudaComputeBuffer(ulong size, BufferType type, DataType elementType)
     {
@@ -25,9 +25,10 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
 
         var error = CudaApi.Malloc(out _devicePtr, size);
         CudaApi.CheckError(error, "cudaMalloc");
+        TrackAllocate(size);
     }
 
-    public IntPtr GetPointer()
+    public override IntPtr GetPointer()
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(CudaComputeBuffer));
@@ -52,7 +53,7 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
         CudaApi.CheckError(error, "cudaMemcpy (Device->Host)");
     }
 
-    public void Write<T>(T[] data) where T : unmanaged
+    public override void Write<T>(T[] data)
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(CudaComputeBuffer));
@@ -64,14 +65,14 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
         }
     }
 
-    public T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
+    public override T[] ReadRange<T>(ulong byteOffset, int elementCount)
     {
         int elementSize = Marshal.SizeOf<T>();
         int start = (int)(byteOffset / (ulong)elementSize);
         return Read<T>().Skip(start).Take(elementCount).ToArray();
     }
 
-    public T[] Read<T>() where T : unmanaged
+    public override T[] Read<T>()
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(CudaComputeBuffer));
@@ -88,7 +89,7 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
         return result;
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (_disposed) return;
 
@@ -98,6 +99,7 @@ public unsafe class CudaComputeBuffer : IComputeBuffer
             _devicePtr = IntPtr.Zero;
         }
 
+        TrackFree(_size);
         _disposed = true;
     }
 }

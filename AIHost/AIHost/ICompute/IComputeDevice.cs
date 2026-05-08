@@ -1,6 +1,27 @@
 namespace AIHost.ICompute;
 
 /// <summary>
+/// Информация о памяти устройства (VRAM)
+/// </summary>
+public class DeviceMemoryInfo
+{
+    /// <summary>Общий объем памяти устройства в байтах (VRAM).</summary>
+    public long TotalBytes { get; set; }
+
+    /// <summary>Доступный объем памяти устройства в байтах.</summary>
+    public long AvailableBytes { get; set; }
+
+    /// <summary>Используемый объем памяти устройства в байтах.</summary>
+    public long UsedBytes { get; set; }
+
+    /// <summary>Общий объем выделенной памяти через ComputeBufferBase в байтах.</summary>
+    public long TrackedAllocatedBytes { get; set; }
+
+    /// <summary>Поддерживается ли прямое чтение статистики памяти (через API провайдера).</summary>
+    public bool SupportsNativeQuery { get; set; }
+}
+
+/// <summary>
 /// Фабрика, которая создает буферы и ядра, а также управляет очередями команд.
 /// </summary>
 public interface IComputeDevice : IDisposable
@@ -43,4 +64,9 @@ public interface IComputeDevice : IDisposable
     /// Синхронизировать очередь команд
     /// </summary>
     void Synchronize();
+
+    /// <summary>
+    /// Получить информацию о памяти устройства (VRAM).
+    /// </summary>
+    DeviceMemoryInfo GetMemoryInfo();
 }

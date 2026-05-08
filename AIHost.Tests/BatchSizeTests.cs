@@ -78,6 +78,8 @@ internal class MockComputeDevice : IComputeDevice
     public IComputeCommandQueue CreateCommandQueue()
         => new MockComputeCommandQueue();
     
+    public DeviceMemoryInfo GetMemoryInfo()
+        => new DeviceMemoryInfo { TotalBytes = 0, AvailableBytes = 0, UsedBytes = 0, TrackedAllocatedBytes = 0, SupportsNativeQuery = false };
     public void Synchronize() { }
     public void Dispose() { }
 }

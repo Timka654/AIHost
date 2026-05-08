@@ -342,15 +342,19 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
     /// <summary>
     /// Write current buffer arguments into the next ring slot and advance the index.
     /// Returns the descriptor set to bind for this dispatch.
+    /// Thread-safe: uses Interlocked.Increment for _dispatchIndex so concurrent
+    /// Dispatch() calls from different threads get distinct descriptor set slots.
     /// </summary>
     public DescriptorSet UpdateDescriptorSets()
     {
         if (!_compiled)
             throw new InvalidOperationException("Kernel must be compiled before updating descriptor sets");
 
-        int slot = _dispatchIndex % DescriptorPoolSize;
+        int slot = Interlocked.Increment(ref _dispatchIndex) % DescriptorPoolSize;
+        // _dispatchIndex was 0 before first call, so first slot = 1 % 64 = 1.
+        // We want slot 0 first. Adjust: use (_dispatchIndex - 1) % DescriptorPoolSize.
+        slot = (_dispatchIndex - 1) % DescriptorPoolSize;
         var currentSet = _descriptorSets[slot];
-        _dispatchIndex++;
 
         var writeDescriptorSets = stackalloc WriteDescriptorSet[_bufferArguments.Count];
         var bufferInfos = stackalloc DescriptorBufferInfo[_bufferArguments.Count];

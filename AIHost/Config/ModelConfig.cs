@@ -116,6 +116,14 @@ public class ModelConfig
     [JsonPropertyName("allow_shared_memory")]
     public bool AllowSharedMemory { get; set; } = false;
 
+    /// <summary>
+    /// Maximum number of concurrent inference requests for this model.
+    /// 1 = serialized (default, safe for single-GPU).
+    /// 2+ = parallel, requires thread-safe command queue (Vulkan pool).
+    /// </summary>
+    [JsonPropertyName("max_concurrency")]
+    public int MaxConcurrency { get; set; } = 1;
+
     // ── Multi-GPU settings ────────────────────────────────────────────────────
 
     /// <summary>

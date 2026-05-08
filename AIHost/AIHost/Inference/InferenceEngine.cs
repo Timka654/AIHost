@@ -58,19 +58,22 @@ public class InferenceEngine : IInferenceEngine
 
     // Serializes GPU access: Vulkan command queues are NOT thread-safe.
     // Without this, concurrent requests cause vkQueueSubmit ErrorDeviceLost.
-    private readonly SemaphoreSlim _gpuLock = new(1, 1);
+    // maxConcurrency controls how many threads may enter the GPU at once.
+    // 1 = fully serialized (safe for single-GPU), 2+ = parallel (requires thread-safe command queue).
+    private readonly SemaphoreSlim _gpuLock;
 
     public BPETokenizer Tokenizer => _tokenizer;
     public int BatchSize => _batchSize;
     public int ContextLength => _model.ContextLength;
 
-    public InferenceEngine(TransformerBase model, BPETokenizer tokenizer, ComputeOps ops, int batchSize = 8)
+    public InferenceEngine(TransformerBase model, BPETokenizer tokenizer, ComputeOps ops, int batchSize = 8, int maxConcurrency = 1)
     {
         _model = model;
         _tokenizer = tokenizer;
         _ops = ops;
         _random = new Random();
         _batchSize = Math.Max(1, batchSize); // Ensure at least 1
+        _gpuLock = new SemaphoreSlim(Math.Max(1, maxConcurrency), Math.Max(1, maxConcurrency));
     }
 
     /// <summary>
@@ -482,6 +485,7 @@ public class InferenceEngine : IInferenceEngine
         if (_disposed) return;
         _kvCache?.Dispose();
         _ssmState?.Dispose();
+        _gpuLock.Dispose();
         _disposed = true;
     }
 }

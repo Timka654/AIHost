@@ -18,6 +18,7 @@
   "enable_mmap": true,
   "enable_mlock": false,
   "allow_shared_memory": false,
+  "max_concurrency": 1,
   "parameters": {
     "temperature": 0.7,
     "top_k": 40,

@@ -264,7 +264,7 @@ public class ModelManager : IDisposable
                     requireDeviceLocal: !config.AllowSharedMemory),
                 layerSplit: layerSplit);
 
-            engine = new MultiGPUInferenceEngine(xfm, BPETokenizer.FromGGUF(xfm.PrimaryModel.Reader), batchSize);
+            engine = new MultiGPUInferenceEngine(xfm, BPETokenizer.FromGGUF(xfm.PrimaryModel.Reader), batchSize, config.MaxConcurrency);
         }
         else
         {
@@ -276,7 +276,7 @@ public class ModelManager : IDisposable
             var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
             var transformer = TransformerFactory.Create(device, ggufModel);
             transformer.LoadWeights();
-            engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize);
+            engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize, config.MaxConcurrency);
         }
 
         var systemMessages = await LoadSystemMessagesAsync(config);

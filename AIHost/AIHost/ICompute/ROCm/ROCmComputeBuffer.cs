@@ -3,27 +3,27 @@ namespace AIHost.ICompute.ROCm;
 /// <summary>
 /// ROCm/HIP GPU memory buffer
 /// </summary>
-public unsafe class ROCmComputeBuffer : IComputeBuffer
+public unsafe class ROCmComputeBuffer : ComputeBufferBase
 {
     private IntPtr _devicePtr;
     private bool _disposed;
 
-    public ulong Size { get; }
-    public BufferType Type { get; }
-    public DataType DataType { get; }
-    public DataType ElementType => DataType;
+    public override ulong Size { get; }
+    public override BufferType Type { get; }
+    public override DataType ElementType { get; }
 
     public ROCmComputeBuffer(ulong size, BufferType type, DataType dataType)
     {
         Size = size;
         Type = type;
-        DataType = dataType;
+        ElementType = dataType;
 
         // Allocate device memory
         HipApi.CheckError(HipApi.hipMalloc(out _devicePtr, size), "hipMalloc");
+        TrackAllocate(size);
     }
 
-    public void Write<T>(T[] data) where T : unmanaged
+    public override void Write<T>(T[] data)
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(ROCmComputeBuffer));
@@ -40,7 +40,7 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
         }
     }
 
-    public T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
+    public override T[] ReadRange<T>(ulong byteOffset, int elementCount)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(ROCmComputeBuffer));
         var result = new T[elementCount];
@@ -55,7 +55,7 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
         return result;
     }
 
-    public T[] Read<T>() where T : unmanaged
+    public override T[] Read<T>()
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(ROCmComputeBuffer));
@@ -73,12 +73,12 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
         return result;
     }
 
-    public nint GetPointer()
+    public override IntPtr GetPointer()
     {
         return _devicePtr;
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         if (_disposed) return;
 
@@ -88,6 +88,7 @@ public unsafe class ROCmComputeBuffer : IComputeBuffer
             _devicePtr = IntPtr.Zero;
         }
 
+        TrackFree(Size);
         _disposed = true;
     }
 }

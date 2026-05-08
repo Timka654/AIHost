@@ -15,6 +15,7 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     private readonly MultiGPUTransformer _model;
     private readonly BPETokenizer _tokenizer;
     private readonly int _batchSize;
+    private readonly SemaphoreSlim _gpuLock;
     private Random _random;
     private MultiDeviceKVCache? _kvCache;
     private bool _disposed;
@@ -31,11 +32,16 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     public MultiGPUInferenceEngine(
         MultiGPUTransformer model,
         BPETokenizer        tokenizer,
-        int                 batchSize = 8)
+        int                 batchSize = 8,
+        int                 maxConcurrency = 1)
     {
         _model     = model;
         _tokenizer = tokenizer;
         _batchSize = Math.Max(1, batchSize);
+        // Multi-GPU всегда использует maxConcurrency=1, так как каждый запрос
+        // уже последовательно проходит через все GPU. Параллельные запросы
+        // на одном наборе GPU вызывают vkQueueSubmit ErrorDeviceLost.
+        _gpuLock   = new SemaphoreSlim(1, 1);
         _random    = new Random();
     }
 
@@ -44,17 +50,35 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     public string Generate(string prompt, GenerationConfig config,
                             CancellationToken cancellationToken = default)
     {
-        var promptTokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
-        var allTokens = Run(prompt, config, onToken: null, cancellationToken);
-        // Return only newly generated tokens (skip prompt tokens)
-        var newTokens = allTokens.Skip(promptTokens.Count).ToArray();
-        return _tokenizer.Decode(newTokens);
+        _gpuLock.Wait(cancellationToken);
+        try
+        {
+            var promptTokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
+            var allTokens = Run(prompt, config, onToken: null, cancellationToken);
+            // Return only newly generated tokens (skip prompt tokens)
+            var newTokens = allTokens.Skip(promptTokens.Count).ToArray();
+            return _tokenizer.Decode(newTokens);
+        }
+        finally
+        {
+            _gpuLock.Release();
+        }
     }
 
     public void GenerateStreaming(string prompt, GenerationConfig config,
                                    Action<string> onToken,
                                    CancellationToken cancellationToken = default)
-        => Run(prompt, config, id => onToken(_tokenizer.GetToken(id)), cancellationToken);
+    {
+        _gpuLock.Wait(cancellationToken);
+        try
+        {
+            Run(prompt, config, id => onToken(_tokenizer.GetToken(id)), cancellationToken);
+        }
+        finally
+        {
+            _gpuLock.Release();
+        }
+    }
 
     // ── Core loop ────────────────────────────────────────────────────────────
 
@@ -226,6 +250,7 @@ public class MultiGPUInferenceEngine : IInferenceEngine
         if (_disposed) return;
         _kvCache?.Dispose();
         _model.Dispose();
+        _gpuLock.Dispose();
         _disposed = true;
     }
 }

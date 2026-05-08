@@ -3,7 +3,8 @@ using Silk.NET.Vulkan;
 namespace AIHost.ICompute.Vulkan;
 
 /// <summary>
-/// Очередь команд для Vulkan
+/// Очередь команд для Vulkan с пулом command buffers для поддержки
+/// параллельных контекстов (thread-safe через слоты).
 /// </summary>
 internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 {
@@ -11,16 +12,31 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
     private readonly Device _device;
     private readonly Queue _queue;
     private readonly CommandPool _commandPool;
-    private CommandBuffer _commandBuffer;
-    private Fence _fence;
-    private bool _isRecording;
+
+    /// <summary>Пул command buffers + fences для параллельного доступа.</summary>
+    private readonly CommandBuffer[] _commandBuffers;
+    private readonly Fence[] _fences;
+    private readonly int _poolSize;
+
+    /// <summary>Thread-local slot index — каждый поток использует свой слот.</summary>
+    [ThreadStatic]
+    private static int? t_slotIndex;
+
+    /// <summary>Глобальный счётчик для распределения слотов между потоками.</summary>
+    private static int s_nextSlot;
+
+    /// <summary>Флаг, что текущий поток начал запись.</summary>
+    [ThreadStatic]
+    private static bool t_isRecording;
+
     private bool _disposed;
 
-    internal VulkanComputeCommandQueue(Vk vk, Device device, Queue queue, uint queueFamilyIndex)
+    internal VulkanComputeCommandQueue(Vk vk, Device device, Queue queue, uint queueFamilyIndex, int poolSize = 4)
     {
         _vk = vk;
         _device = device;
         _queue = queue;
+        _poolSize = Math.Max(1, poolSize);
 
         // Создание command pool
         var poolInfo = new CommandPoolCreateInfo
@@ -33,38 +49,64 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (_vk.CreateCommandPool(device, &poolInfo, null, out _commandPool) != Result.Success)
             throw new InvalidOperationException("Failed to create command pool");
 
-        // Выделение command buffer
+        // Выделение пула command buffers
+        _commandBuffers = new CommandBuffer[_poolSize];
+        _fences = new Fence[_poolSize];
+
         var allocInfo = new CommandBufferAllocateInfo
         {
             SType = StructureType.CommandBufferAllocateInfo,
             CommandPool = _commandPool,
             Level = CommandBufferLevel.Primary,
-            CommandBufferCount = 1
+            CommandBufferCount = (uint)_poolSize
         };
 
-        CommandBuffer cmdBuffer;
-        if (_vk.AllocateCommandBuffers(device, &allocInfo, &cmdBuffer) != Result.Success)
-            throw new InvalidOperationException("Failed to allocate command buffer");
-        
-        _commandBuffer = cmdBuffer;
-
-        // Создание fence для синхронизации
-        var fenceInfo = new FenceCreateInfo
+        fixed (CommandBuffer* pCmdBuffers = _commandBuffers)
         {
-            SType = StructureType.FenceCreateInfo,
-            Flags = FenceCreateFlags.SignaledBit
-        };
+            if (_vk.AllocateCommandBuffers(device, &allocInfo, pCmdBuffers) != Result.Success)
+                throw new InvalidOperationException("Failed to allocate command buffers");
+        }
 
-        if (_vk.CreateFence(device, &fenceInfo, null, out _fence) != Result.Success)
-            throw new InvalidOperationException("Failed to create fence");
+        // Создание fences для каждого слота
+        for (int i = 0; i < _poolSize; i++)
+        {
+            var fenceInfo = new FenceCreateInfo
+            {
+                SType = StructureType.FenceCreateInfo,
+                Flags = FenceCreateFlags.SignaledBit
+            };
+
+            if (_vk.CreateFence(device, &fenceInfo, null, out _fences[i]) != Result.Success)
+                throw new InvalidOperationException($"Failed to create fence for slot {i}");
+        }
     }
 
-    private void BeginRecording()
+    /// <summary>Получить или назначить слот для текущего потока.</summary>
+    private int GetSlot()
     {
-        if (_isRecording) return;
+        if (t_slotIndex.HasValue)
+            return t_slotIndex.Value;
 
-        // Reset command buffer before each recording
-        _vk.ResetCommandBuffer(_commandBuffer, CommandBufferResetFlags.None);
+        int slot = Interlocked.Increment(ref s_nextSlot) % _poolSize;
+        t_slotIndex = slot;
+        return slot;
+    }
+
+    /// <summary>Начать запись в command buffer текущего слота.</summary>
+    private CommandBuffer BeginSlotRecording()
+    {
+        int slot = GetSlot();
+        var cb = _commandBuffers[slot];
+
+        // Ожидаем завершения предыдущей работы на этом слоте
+        fixed (Fence* pFence = &_fences[slot])
+        {
+            _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
+            _vk.ResetFences(_device, 1, pFence);
+        }
+
+        // Reset command buffer
+        _vk.ResetCommandBuffer(cb, CommandBufferResetFlags.None);
 
         var beginInfo = new CommandBufferBeginInfo
         {
@@ -72,10 +114,11 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
             Flags = CommandBufferUsageFlags.OneTimeSubmitBit
         };
 
-        if (_vk.BeginCommandBuffer(_commandBuffer, &beginInfo) != Result.Success)
+        if (_vk.BeginCommandBuffer(cb, &beginInfo) != Result.Success)
             throw new InvalidOperationException("Failed to begin command buffer");
 
-        _isRecording = true;
+        t_isRecording = true;
+        return cb;
     }
 
     public override void WriteBuffer(IComputeBuffer buffer, ulong offset, byte[] data)
@@ -83,10 +126,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (buffer is not VulkanComputeBuffer vkBuffer)
             throw new ArgumentException("Buffer must be a VulkanComputeBuffer");
 
-        BeginRecording();
-
-        // TODO: Реализовать копирование через staging buffer
-        // Для упрощения используем прямую запись в mapped memory
+        // Прямая запись в mapped memory — не требует command buffer
         unsafe
         {
             var ptr = vkBuffer.GetPointer();
@@ -102,9 +142,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (buffer is not VulkanComputeBuffer vkBuffer)
             throw new ArgumentException("Buffer must be a VulkanComputeBuffer");
 
-        BeginRecording();
-
-        // TODO: Реализовать копирование через staging buffer
+        // Прямое чтение из mapped memory — не требует command buffer
         unsafe
         {
             var ptr = vkBuffer.GetPointer();
@@ -120,19 +158,22 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (kernel is not VulkanComputeKernel vkKernel)
             throw new ArgumentException("Kernel must be a VulkanComputeKernel");
 
-        BeginRecording();
+        // Получаем command buffer для текущего потока (если ещё не начали)
+        if (!t_isRecording)
+            BeginSlotRecording();
+
+        int slot = GetSlot();
+        var cb = _commandBuffers[slot];
 
         // Allocate a fresh ring-slot descriptor set and update it with current buffer bindings.
-        // Each dispatch in a batch gets its own slot so the GPU sees the correct buffers
-        // when it executes (not the last-written state of a shared set).
         var descriptorSet = vkKernel.UpdateDescriptorSets();
 
         // Bind pipeline
-        _vk.CmdBindPipeline(_commandBuffer, PipelineBindPoint.Compute, vkKernel.Pipeline);
+        _vk.CmdBindPipeline(cb, PipelineBindPoint.Compute, vkKernel.Pipeline);
 
         // Bind the per-dispatch descriptor set
         _vk.CmdBindDescriptorSets(
-            _commandBuffer,
+            cb,
             PipelineBindPoint.Compute,
             vkKernel.PipelineLayout,
             0,
@@ -159,15 +200,18 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
                 : globalWorkSize[2])
             : 1;
 
-        _vk.CmdDispatch(_commandBuffer, groupCountX, groupCountY, groupCountZ);
+        _vk.CmdDispatch(cb, groupCountX, groupCountY, groupCountZ);
     }
 
     public override void InsertMemoryBarrier()
     {
-        BeginRecording();
+        if (!t_isRecording)
+            BeginSlotRecording();
+
+        int slot = GetSlot();
+        var cb = _commandBuffers[slot];
 
         // Compute → Compute barrier: all shader writes become visible to subsequent shaders.
-        // Required when batching multiple dispatches without intermediate Flush().
         var barrier = new MemoryBarrier
         {
             SType = StructureType.MemoryBarrier,
@@ -178,7 +222,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         unsafe
         {
             _vk.CmdPipelineBarrier(
-                _commandBuffer,
+                cb,
                 PipelineStageFlags.ComputeShaderBit,
                 PipelineStageFlags.ComputeShaderBit,
                 DependencyFlags.None,
@@ -190,22 +234,22 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 
     public override void Flush()
     {
-        if (!_isRecording) return;
+        if (!t_isRecording)
+            return; // ничего не записывали
+
+        t_isRecording = false;
+
+        int slot = GetSlot();
+        var cb = _commandBuffers[slot];
+        var fence = _fences[slot];
 
         // Завершение записи команд
-        var endResult = _vk.EndCommandBuffer(_commandBuffer);
+        var endResult = _vk.EndCommandBuffer(cb);
         if (endResult != Result.Success)
             throw new InvalidOperationException($"vkEndCommandBuffer failed: {endResult}");
 
-        _isRecording = false;
-
-        // Ожидание завершения предыдущей команды
-        var fenceLocal = _fence;
-        _vk.WaitForFences(_device, 1, &fenceLocal, true, ulong.MaxValue);
-        _vk.ResetFences(_device, 1, &fenceLocal);
-
         // Отправка команд в очередь
-        var cmdBufferLocal = _commandBuffer;
+        var cmdBufferLocal = cb;
         var submitInfo = new SubmitInfo
         {
             SType = StructureType.SubmitInfo,
@@ -213,24 +257,37 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
             PCommandBuffers = &cmdBufferLocal
         };
 
-        var submitResult = _vk.QueueSubmit(_queue, 1, &submitInfo, _fence);
+        var submitResult = _vk.QueueSubmit(_queue, 1, &submitInfo, fence);
         if (submitResult != Result.Success)
             throw new InvalidOperationException($"vkQueueSubmit failed: {submitResult}");
 
-        // Ожидание завершения
-        _vk.WaitForFences(_device, 1, &fenceLocal, true, ulong.MaxValue);
+        // Ожидаем завершения fence — это гарантирует, что последующий QueueSubmit
+        // на этой же очереди не перезапишет текущий. Без этого ожидания два
+        // параллельных Flush() на одной очереди вызывают ErrorDeviceLost.
+        fixed (Fence* pFence = &_fences[slot])
+        {
+            _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
+        }
     }
 
     public override void Dispose()
     {
         if (_disposed) return;
 
-        var fenceLocal = _fence;
-        _vk.WaitForFences(_device, 1, &fenceLocal, true, ulong.MaxValue);
-        _vk.DestroyFence(_device, _fence, null);
-        
-        var cmdBufferLocal = _commandBuffer;
-        _vk.FreeCommandBuffers(_device, _commandPool, 1, &cmdBufferLocal);
+        // Ожидаем завершения всех fences
+        for (int i = 0; i < _poolSize; i++)
+        {
+            fixed (Fence* pFence = &_fences[i])
+            {
+                _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
+                _vk.DestroyFence(_device, _fences[i], null);
+            }
+        }
+
+        fixed (CommandBuffer* pCmdBuffers = _commandBuffers)
+        {
+            _vk.FreeCommandBuffers(_device, _commandPool, (uint)_poolSize, pCmdBuffers);
+        }
         _vk.DestroyCommandPool(_device, _commandPool, null);
 
         _disposed = true;

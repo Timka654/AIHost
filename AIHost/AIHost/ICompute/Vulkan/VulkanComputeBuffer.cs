@@ -75,6 +75,7 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             void* ptr;
             _vk.MapMemory(device, _memory, 0, size, 0, &ptr);
             _mappedPointer = (IntPtr)ptr;
+            TrackAllocate(req.Size);
             return;
         }
 
@@ -85,6 +86,7 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
         {
             AllocAndBind(req.Size, typeIdx);
             // _mappedPointer stays IntPtr.Zero — Write/Read use staging
+            TrackAllocate(req.Size);
             return;
         }
 
@@ -98,6 +100,7 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
         void* ptr2;
         _vk.MapMemory(device, _memory, 0, size, 0, &ptr2);
         _mappedPointer = (IntPtr)ptr2;
+        TrackAllocate(req.Size);
     }
 
     private void AllocAndBind(ulong allocSize, uint memTypeIdx)
@@ -415,6 +418,11 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
 
         _vk.FreeMemory(_device, _memory, null);
         _vk.DestroyBuffer(_device, _buffer, null);
+
+        // Узнаем реальный размер аллокации через memory requirements
+        MemoryRequirements req;
+        _vk.GetBufferMemoryRequirements(_device, _buffer, &req);
+        TrackFree(req.Size);
 
         _disposed = true;
     }
