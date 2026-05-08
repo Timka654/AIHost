@@ -839,15 +839,12 @@ public class Transformer : IDisposable
         Tensor attnProj;
         if (isGatedAttn)
         {
-            // gate = SiLU(xNorm @ W_gate): xNorm [M,d_model] × W_gate [d_model,Q_dim] → [M,Q_dim]
-            var gate = _ops.MatMulWeights(xNorm, wAO, "attn_gate");
-            _ops.SiLU(gate);
-            // gated = attnOut * gate
-            var gated = _ops.Multiply(attnOut, gate, "attn_gated");
-            gate.Dispose(); attnOut.Dispose();
-            // project: gated @ W_gate.T → [M, d_model]
-            attnProj = _ops.MatMulWeightsT(gated, wAO, "attn_proj");
-            gated.Dispose();
+            // attn_gate.weight [d_model, Q_dim] is stored transposed vs standard W_o.
+            // Standard W_o: maps Q_dim→d_model; stored as [Q_dim, d_model].
+            // Here it's [d_model, Q_dim] → use MatMulWeightsT to get correct projection.
+            // attnOut[M, Q_dim] @ W_gate^T[Q_dim, d_model] → [M, d_model]
+            attnProj = _ops.MatMulWeightsT(attnOut, wAO, "attn_proj");
+            attnOut.Dispose();
         }
         else
         {
