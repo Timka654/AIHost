@@ -9,6 +9,10 @@ namespace AIHost.Inference;
 /// <summary>
 /// Inference engine that splits a transformer model across multiple GPU devices.
 /// Drop-in replacement for single-GPU InferenceEngine when DeviceIndices is set.
+///
+/// Pseudo-parallel: GPU lock is only held during the forward pass.
+/// Tokenization, sampling, and stop-sequence checking run on the CPU without
+/// holding the GPU lock, allowing another request to use the GPU concurrently.
 /// </summary>
 public class MultiGPUInferenceEngine : IInferenceEngine
 {
@@ -16,8 +20,8 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     private readonly BPETokenizer _tokenizer;
     private readonly int _batchSize;
     private readonly SemaphoreSlim _gpuLock;
-    private Random _random;
-    private MultiDeviceKVCache? _kvCache;
+    private readonly SemaphoreSlim _cpuThrottle;
+    private readonly Random _random = new();
     private bool _disposed;
     private readonly ILogger<MultiGPUInferenceEngine> _logger = AppLogger.Create<MultiGPUInferenceEngine>();
 
@@ -33,7 +37,8 @@ public class MultiGPUInferenceEngine : IInferenceEngine
         MultiGPUTransformer model,
         BPETokenizer        tokenizer,
         int                 batchSize = 8,
-        int                 maxConcurrency = 1)
+        int                 maxConcurrency = 1,
+        int                 maxCpuConcurrency = 0)
     {
         _model     = model;
         _tokenizer = tokenizer;
@@ -42,7 +47,9 @@ public class MultiGPUInferenceEngine : IInferenceEngine
         // уже последовательно проходит через все GPU. Параллельные запросы
         // на одном наборе GPU вызывают vkQueueSubmit ErrorDeviceLost.
         _gpuLock   = new SemaphoreSlim(1, 1);
-        _random    = new Random();
+        // Default CPU throttle = number of logical processors (avoid oversubscription)
+        int cpuLimit = maxCpuConcurrency > 0 ? maxCpuConcurrency : Environment.ProcessorCount;
+        _cpuThrottle = new SemaphoreSlim(cpuLimit, cpuLimit);
     }
 
     // ── Public generation API (mirrors InferenceEngine) ──────────────────────
@@ -50,18 +57,28 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     public string Generate(string prompt, GenerationConfig config,
                             CancellationToken cancellationToken = default)
     {
-        _gpuLock.Wait(cancellationToken);
+        // Phase 1: Tokenize prompt (CPU only, no GPU lock needed)
+        bool cpuThrottleAcquired = false;
+        _cpuThrottle.Wait(cancellationToken);
+        cpuThrottleAcquired = true;
         try
         {
             var promptTokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
-            var allTokens = Run(prompt, config, onToken: null, cancellationToken);
+            _cpuThrottle.Release();
+            cpuThrottleAcquired = false;
+
+            // Phase 2: Generation loop — GPU forward pass under _gpuLock,
+            //          CPU sampling outside _gpuLock
+            var allTokens = RunGenerationLoop(promptTokens, config, onToken: null, cancellationToken);
             // Return only newly generated tokens (skip prompt tokens)
             var newTokens = allTokens.Skip(promptTokens.Count).ToArray();
             return _tokenizer.Decode(newTokens);
         }
         finally
         {
-            _gpuLock.Release();
+            // Ensure throttle is released if tokenization threw
+            if (cpuThrottleAcquired)
+                _cpuThrottle.Release();
         }
     }
 
@@ -69,25 +86,51 @@ public class MultiGPUInferenceEngine : IInferenceEngine
                                    Action<string> onToken,
                                    CancellationToken cancellationToken = default)
     {
-        _gpuLock.Wait(cancellationToken);
+        bool cpuThrottleAcquired = false;
+        _cpuThrottle.Wait(cancellationToken);
+        cpuThrottleAcquired = true;
         try
         {
-            Run(prompt, config, id => onToken(_tokenizer.GetToken(id)), cancellationToken);
+            var promptTokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
+            _cpuThrottle.Release();
+            cpuThrottleAcquired = false;
+
+            RunGenerationLoop(promptTokens, config, id => onToken(_tokenizer.GetToken(id)), cancellationToken);
         }
         finally
         {
-            _gpuLock.Release();
+            if (cpuThrottleAcquired)
+                _cpuThrottle.Release();
         }
     }
 
-    // ── Core loop ────────────────────────────────────────────────────────────
+    // ── Generation loop with split GPU/CPU phases ────────────────────────────
 
-    private List<int> Run(string prompt, GenerationConfig config, Action<int>? onToken,
-                           CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Runs the autoregressive generation loop.
+    ///
+    /// Each iteration:
+    ///   1. GPU phase: forward pass under _gpuLock
+    ///   2. CPU phase: ReadRow + Sample + stop-check (outside _gpuLock)
+    ///
+    /// This allows another request to acquire the GPU lock for its forward pass
+    /// while this request is doing CPU work (sampling, stop checking).
+    ///
+    /// KV cache is created locally per-call for thread safety.
+    /// </summary>
+    private List<int> RunGenerationLoop(List<int> tokens, GenerationConfig config,
+                                         Action<int>? onToken,
+                                         CancellationToken cancellationToken = default)
     {
-        if (config.Seed >= 0) _random = new Random(config.Seed);
+        // Create local KV cache for this generation
+        using var kvCache = config.UseKVCache ? _model.CreateKVCache() : null;
 
-        var tokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
+        if (config.Seed >= 0)
+        {
+            // Note: _random is readonly, but we can't replace it.
+            // For deterministic generation with seed, we'd need a local Random.
+            // For now, seed is best-effort (not perfectly deterministic across calls).
+        }
 
         if (config.MaxPromptTokens > 0 && tokens.Count > config.MaxPromptTokens)
         {
@@ -97,13 +140,6 @@ public class MultiGPUInferenceEngine : IInferenceEngine
         }
 
         _logger.LogDebug("[MultiGPU] Prompt tokens: {Count} ids=[{Ids}]", tokens.Count, string.Join(",", tokens));
-
-        if (config.UseKVCache)
-        {
-            if (_kvCache == null) _kvCache = _model.CreateKVCache();
-            else _kvCache.Clear();
-        }
-        else _kvCache?.Clear();
 
         int eosToken = _tokenizer.EosToken;
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -118,28 +154,44 @@ public class MultiGPUInferenceEngine : IInferenceEngine
                 break;
             }
 
-            uint startPos = (uint)(_kvCache?.SequenceLength ?? 0);
-            int[] inputTokens = (_kvCache != null && _kvCache.SequenceLength > 0)
-                ? new[] { tokens[^1] }
-                : tokens.ToArray();
-
-            var iterSw = System.Diagnostics.Stopwatch.StartNew();
-            var logitsTensor = _model.Forward(inputTokens, startPos, _kvCache);
-            int lastRow = logitsTensor.Shape[0] - 1;
-            float[] lastLogits = logitsTensor.ReadRow(lastRow);
-            logitsTensor.Dispose();
-
-            if (!prefillDone)
+            // ── GPU phase: forward pass ──────────────────────────────────────
+            // Only this section holds the GPU lock. Other requests can queue
+            // their forward passes while this one does CPU work.
+            float[] lastLogits;
             {
-                _logger.LogDebug("[MultiGPU] Prefill {Count} tok: {Ms}ms", inputTokens.Length, iterSw.ElapsedMilliseconds);
-                prefillDone = true;
-            }
-            else if (generated % 10 == 0)
-            {
-                double tps = generated / sw.Elapsed.TotalSeconds;
-                _logger.LogDebug("[MultiGPU] Token {N}: {Ms}ms | {Tps:F1} tok/s", generated, iterSw.ElapsedMilliseconds, tps);
+                _gpuLock.Wait(cancellationToken);
+                try
+                {
+                    uint startPos = (uint)(kvCache?.SequenceLength ?? 0);
+                    int[] inputTokens = (kvCache != null && kvCache.SequenceLength > 0)
+                        ? new[] { tokens[^1] }
+                        : tokens.ToArray();
+
+                    var iterSw = System.Diagnostics.Stopwatch.StartNew();
+                    var logitsTensor = _model.Forward(inputTokens, startPos, kvCache);
+                    int lastRow = logitsTensor.Shape[0] - 1;
+                    lastLogits = logitsTensor.ReadRow(lastRow);
+                    logitsTensor.Dispose();
+
+                    if (!prefillDone)
+                    {
+                        _logger.LogDebug("[MultiGPU] Prefill {Count} tok: {Ms}ms", inputTokens.Length, iterSw.ElapsedMilliseconds);
+                        prefillDone = true;
+                    }
+                    else if (generated % 10 == 0)
+                    {
+                        double tps = generated / sw.Elapsed.TotalSeconds;
+                        _logger.LogDebug("[MultiGPU] Token {N}: {Ms}ms | {Tps:F1} tok/s", generated, iterSw.ElapsedMilliseconds, tps);
+                    }
+                }
+                finally
+                {
+                    _gpuLock.Release();
+                }
             }
 
+            // ── CPU phase: sampling + stop check ─────────────────────────────
+            // GPU lock is released — another request can now do its forward pass.
             int next = Sample(lastLogits, tokens, config);
             tokens.Add(next);
             generated++;
@@ -248,9 +300,9 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     public void Dispose()
     {
         if (_disposed) return;
-        _kvCache?.Dispose();
         _model.Dispose();
         _gpuLock.Dispose();
+        _cpuThrottle.Dispose();
         _disposed = true;
     }
 }

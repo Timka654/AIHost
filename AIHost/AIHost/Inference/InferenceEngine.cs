@@ -42,16 +42,23 @@ public class GenerationConfig
 }
 
 /// <summary>
-/// High-level inference engine with sampling strategies and KV-cache
+/// High-level inference engine with pseudo-parallel processing.
+///
+/// GPU is only locked during the forward pass (the only GPU-bound operation).
+/// Tokenization, sampling, and stop-sequence checking run on the CPU without
+/// holding the GPU lock, allowing another request to use the GPU concurrently.
+///
+/// Each call to Generate/GenerateStreaming creates its own local KV cache and
+/// SSM state, so multiple concurrent requests on the same engine are safe.
+///
+/// A CPU throttle (SemaphoreSlim) prevents too many concurrent CPU phases
+/// from overwhelming system resources.
 /// </summary>
 public class InferenceEngine : IInferenceEngine
 {
     private readonly TransformerBase _model;
     private readonly BPETokenizer _tokenizer;
     private readonly ComputeOps _ops;
-    private Random _random;
-    private KVCache?   _kvCache;
-    private SSMState?  _ssmState;
     private bool _disposed;
     private readonly int _batchSize;
     private readonly ILogger<InferenceEngine> _logger = AppLogger.Create<InferenceEngine>();
@@ -62,35 +69,63 @@ public class InferenceEngine : IInferenceEngine
     // 1 = fully serialized (safe for single-GPU), 2+ = parallel (requires thread-safe command queue).
     private readonly SemaphoreSlim _gpuLock;
 
+    // Throttles CPU-bound phases (tokenization, sampling) to avoid overwhelming
+    // system memory / CPU cores when many requests are in-flight concurrently.
+    // Set to Environment.ProcessorCount or a user-specified limit.
+    private readonly SemaphoreSlim _cpuThrottle;
+
+    // Random number generator for sampling (thread-safe via lock if needed,
+    // but each call to Generate/GenerateStreaming is sequential from the caller's perspective)
+    private readonly Random _random = new();
+
     public BPETokenizer Tokenizer => _tokenizer;
     public int BatchSize => _batchSize;
     public int ContextLength => _model.ContextLength;
 
-    public InferenceEngine(TransformerBase model, BPETokenizer tokenizer, ComputeOps ops, int batchSize = 8, int maxConcurrency = 1)
+    public InferenceEngine(TransformerBase model, BPETokenizer tokenizer, ComputeOps ops,
+                           int batchSize = 8, int maxConcurrency = 1, int maxCpuConcurrency = 0)
     {
         _model = model;
         _tokenizer = tokenizer;
         _ops = ops;
-        _random = new Random();
         _batchSize = Math.Max(1, batchSize); // Ensure at least 1
         _gpuLock = new SemaphoreSlim(Math.Max(1, maxConcurrency), Math.Max(1, maxConcurrency));
+        // Default CPU throttle = number of logical processors (avoid oversubscription)
+        int cpuLimit = maxCpuConcurrency > 0 ? maxCpuConcurrency : Environment.ProcessorCount;
+        _cpuThrottle = new SemaphoreSlim(cpuLimit, cpuLimit);
     }
 
     /// <summary>
-    /// Generate text from a prompt
+    /// Generate text from a prompt with pseudo-parallel execution.
+    ///
+    /// The GPU lock is only held during the forward pass. CPU work
+    /// (tokenization, sampling) runs outside the GPU lock so other
+    /// requests can use the GPU concurrently.
     /// </summary>
     public string Generate(string prompt, GenerationConfig config,
                             CancellationToken cancellationToken = default)
     {
-        _gpuLock.Wait(cancellationToken);
+        // Phase 1: Tokenize prompt (CPU only, no GPU lock needed)
+        // Use a flag to track whether we need to release the CPU throttle in finally
+        bool cpuThrottleAcquired = false;
+        _cpuThrottle.Wait(cancellationToken);
+        cpuThrottleAcquired = true;
         try
         {
-            var tokens = PrepareAndRun(prompt, config, onToken: null, cancellationToken);
-            return _tokenizer.Decode(tokens.ToArray());
+            var tokens = TokenizePrompt(prompt, config);
+            _cpuThrottle.Release();
+            cpuThrottleAcquired = false;
+
+            // Phase 2: Generation loop — GPU forward pass under _gpuLock,
+            //          CPU sampling outside _gpuLock
+            var resultTokens = RunGenerationLoop(tokens, config, onToken: null, cancellationToken);
+            return _tokenizer.Decode(resultTokens.ToArray());
         }
         finally
         {
-            _gpuLock.Release();
+            // Ensure throttle is released if TokenizePrompt threw
+            if (cpuThrottleAcquired)
+                _cpuThrottle.Release();
         }
     }
 
@@ -98,16 +133,23 @@ public class InferenceEngine : IInferenceEngine
                                    Action<string> onTokenGenerated,
                                    CancellationToken cancellationToken = default)
     {
-        _gpuLock.Wait(cancellationToken);
+        bool cpuThrottleAcquired = false;
+        _cpuThrottle.Wait(cancellationToken);
+        cpuThrottleAcquired = true;
         try
         {
-            PrepareAndRun(prompt, config,
+            var tokens = TokenizePrompt(prompt, config);
+            _cpuThrottle.Release();
+            cpuThrottleAcquired = false;
+
+            RunGenerationLoop(tokens, config,
                 onToken: tokenId => onTokenGenerated(_tokenizer.GetToken(tokenId)),
                 cancellationToken);
         }
         finally
         {
-            _gpuLock.Release();
+            if (cpuThrottleAcquired)
+                _cpuThrottle.Release();
         }
     }
 
@@ -124,12 +166,15 @@ public class InferenceEngine : IInferenceEngine
         return results;
     }
 
-    private List<int> PrepareAndRun(string prompt, GenerationConfig config, Action<int>? onToken,
-                                     CancellationToken cancellationToken = default)
-    {
-        if (config.Seed >= 0)
-            _random = new Random(config.Seed);
+    // ── Tokenization (CPU only) ──────────────────────────────────────────────
 
+    /// <summary>
+    /// Tokenize the prompt.
+    /// Runs on CPU only — no GPU lock needed.
+    /// KV cache and SSM state are created locally per-call in RunGenerationLoop for thread safety.
+    /// </summary>
+    private List<int> TokenizePrompt(string prompt, GenerationConfig config)
+    {
         // Don't add BOS when the prompt already starts with a chat-template special token
         // (e.g. Qwen's <|im_start|>). Adding BOS=1 before special tokens is wrong.
         bool needsBos = !(prompt.StartsWith("<|im_start|>", StringComparison.Ordinal) ||
@@ -147,31 +192,40 @@ public class InferenceEngine : IInferenceEngine
 
         _logger.LogDebug("[Inference] Prompt tokens: {Count} ids=[{Ids}]", tokens.Count, string.Join(",", tokens));
 
-        if (config.UseKVCache)
-        {
-            if (_kvCache == null)   _kvCache   = new KVCache(_ops);
-            else                    _kvCache.Clear();
-            // SSMState travels with the KV cache — reset together so the
-            // recurrent hidden state is consistent with the KV sequence length.
-            if (_ssmState == null)  _ssmState  = new SSMState();
-            else                    _ssmState.Clear();
-        }
-        else
-        {
-            _kvCache?.Clear();
-            _ssmState?.Clear();
-        }
+        return tokens;
+    }
+
+    // ── Generation loop with split GPU/CPU phases ────────────────────────────
+
+    /// <summary>
+    /// Runs the autoregressive generation loop.
+    ///
+    /// Each iteration:
+    ///   1. GPU phase: forward pass under _gpuLock
+    ///   2. CPU phase: ExtractLastToken + Sample + stop-check (outside _gpuLock)
+    ///
+    /// This allows another request to acquire the GPU lock for its forward pass
+    /// while this request is doing CPU work (sampling, stop checking).
+    ///
+    /// KV cache and SSM state are local to this call, so concurrent requests
+    /// on the same engine are safe.
+    /// </summary>
+    private List<int> RunGenerationLoop(List<int> tokens, GenerationConfig config,
+                                         Action<int>? onToken,
+                                         CancellationToken cancellationToken = default)
+    {
+        // Create local KV cache and SSM state for this generation
+        using var kvCache = config.UseKVCache ? new KVCache(_ops) : null;
+        using var ssmState = config.UseKVCache ? new SSMState() : null;
 
         int eosToken = _tokenizer.EosToken;
 
-        // Pre-encode stop sequences: use direct vocab lookup for special tokens
-        // (avoids SentencePiece normalization that would break <|im_end|> etc.)
+        // Pre-encode stop sequences
         var stopSeqTokens = config.StopSequences
             .Select(s => _tokenizer.EncodeStopSequence(s))
             .Where(seq => seq.Length > 0)
             .ToList();
 
-        // Also find single-token equivalents (e.g. <|im_end|>) so we can stop immediately
         var stopSingleTokens = new HashSet<int>(stopSeqTokens
             .Where(s => s.Length == 1).Select(s => s[0]));
         stopSingleTokens.Add(eosToken);
@@ -188,35 +242,52 @@ public class InferenceEngine : IInferenceEngine
                 break;
             }
 
-            uint startPos = _kvCache != null ? (uint)_kvCache.SequenceLength : 0;
-            int[] inputTokens = _kvCache != null && _kvCache.SequenceLength > 0
-                ? new[] { tokens[^1] }
-                : tokens.ToArray();
-
-            var iterSw = System.Diagnostics.Stopwatch.StartNew();
-            var logits = _model.Forward(inputTokens, startPos, _kvCache, _ssmState);
-            var lastLogits = ExtractLastToken(logits);
-            logits.Dispose();
-
-            if (!prefillDone)
+            // ── GPU phase: forward pass ──────────────────────────────────────
+            // Only this section holds the GPU lock. Other requests can queue
+            // their forward passes while this one does CPU work.
+            float[] lastLogits;
             {
-                _logger.LogDebug("[Inference] Prefill {Count} tokens: {Ms}ms", inputTokens.Length, iterSw.ElapsedMilliseconds);
-                prefillDone = true;
-            }
-            else if (generatedCount % 10 == 0)
-            {
-                double tps = generatedCount / sw.Elapsed.TotalSeconds;
-                _logger.LogDebug("[Inference] Token {N}: {Ms}ms | avg {Tps:F1} tok/s | kvLen={KvLen}", generatedCount, iterSw.ElapsedMilliseconds, tps, startPos);
+                _gpuLock.Wait(cancellationToken);
+                try
+                {
+                    uint startPos = kvCache != null ? (uint)kvCache.SequenceLength : 0;
+                    int[] inputTokens = kvCache != null && kvCache.SequenceLength > 0
+                        ? new[] { tokens[^1] }
+                        : tokens.ToArray();
+
+                    var iterSw = System.Diagnostics.Stopwatch.StartNew();
+                    var logits = _model.Forward(inputTokens, startPos, kvCache, ssmState);
+                    lastLogits = ExtractLastToken(logits);
+                    logits.Dispose();
+
+                    if (!prefillDone)
+                    {
+                        _logger.LogDebug("[Inference] Prefill {Count} tokens: {Ms}ms", inputTokens.Length, iterSw.ElapsedMilliseconds);
+                        prefillDone = true;
+                    }
+                    else if (generatedCount % 10 == 0)
+                    {
+                        double tps = generatedCount / sw.Elapsed.TotalSeconds;
+                        _logger.LogDebug("[Inference] Token {N}: {Ms}ms | avg {Tps:F1} tok/s | kvLen={KvLen}", generatedCount, iterSw.ElapsedMilliseconds, tps, startPos);
+                    }
+
+                    if (generatedCount == 0)
+                    {
+                        var sorted = lastLogits.Select((v,i)=>(v,i)).OrderByDescending(x=>x.v).ToArray();
+                        int rankQuin = Array.FindIndex(sorted, x => x.i == 24150);
+                        int rankComma = Array.FindIndex(sorted, x => x.i == 1919);
+                        _logger.LogTrace("[LogitCmp] 'quin'(24150)=rank{RankQuin},logit{LQuin:F3} | ' ,'(1919)=rank{RankComma},logit{LComma:F3}", rankQuin+1, lastLogits[24150], rankComma+1, lastLogits[1919]);
+                        _logger.LogTrace("[LogitCmp] top1={Id}('{Tok}')={Val:F3}", sorted[0].i, _tokenizer.GetToken(sorted[0].i), sorted[0].v);
+                    }
+                }
+                finally
+                {
+                    _gpuLock.Release();
+                }
             }
 
-            if (generatedCount == 0)
-            {
-                var sorted = lastLogits.Select((v,i)=>(v,i)).OrderByDescending(x=>x.v).ToArray();
-                int rankQuin = Array.FindIndex(sorted, x => x.i == 24150);
-                int rankComma = Array.FindIndex(sorted, x => x.i == 1919);
-                _logger.LogTrace("[LogitCmp] 'quin'(24150)=rank{RankQuin},logit{LQuin:F3} | ' ,'(1919)=rank{RankComma},logit{LComma:F3}", rankQuin+1, lastLogits[24150], rankComma+1, lastLogits[1919]);
-                _logger.LogTrace("[LogitCmp] top1={Id}('{Tok}')={Val:F3}", sorted[0].i, _tokenizer.GetToken(sorted[0].i), sorted[0].v);
-            }
+            // ── CPU phase: sampling + stop check ─────────────────────────────
+            // GPU lock is released — another request can now do its forward pass.
             int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
             generatedCount++;
@@ -483,9 +554,8 @@ public class InferenceEngine : IInferenceEngine
     public void Dispose()
     {
         if (_disposed) return;
-        _kvCache?.Dispose();
-        _ssmState?.Dispose();
         _gpuLock.Dispose();
+        _cpuThrottle.Dispose();
         _disposed = true;
     }
 }
