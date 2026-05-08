@@ -9,12 +9,49 @@ namespace AIHost.Compute.Formats;
 ///   Type A (blk.0,1,2,4..): combined attn_qkv.weight (gated Q) + SSM + FFN
 ///   Type B (blk.3,7,11..): separate attn_q/k/v.weight (gated Q + QK-norm) + FFN
 ///
+/// ╔══════════════════════════════════════════════════════════════════════════╗
+/// ║  SSM STATUS: DISABLED (2026-05-09)                                     ║
+/// ║                                                                        ║
+/// ║  Model generates coherent text on Attention + FFN only.                ║
+/// ║  SSM recurrence produces "!" — likely missing conv1d + gate.           ║
+/// ║                                                                        ║
+/// ║  TO RE-ENABLE SSM:                                                     ║
+/// ║  1. In ApplyLayerCombinedQKV, replace:                                 ║
+/// ║       Tensor x2 = x1;  // SSM DISABLED                                 ║
+/// ║     with:                                                              ║
+/// ║       var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm,         ║
+/// ║           g, ssmState!, seqLen);                                       ║
+/// ║       x1.Dispose(); x1Norm.Dispose();                                  ║
+/// ║       Tensor x2 = ssmOut;                                              ║
+/// ║                                                                        ║
+/// ║  2. Fix ApplySSMRecurrence:                                            ║
+/// ║     - Add conv1d (kernel_size=4, causal padding) before dt/B/C proj    ║
+/// ║     - Add gate (SiLU) after conv1d, split into SSM_DIM + GATE_DIM      ║
+/// ║     - Multiply gated part with SSM part before state update            ║
+/// ║     - Reference: llama.cpp LLM_ARCH_QWEN35                             ║
+/// ║                                                                        ║
+/// ║  Reference: llama.cpp ssm_conv1d.weight has QKV-like structure:        ║
+/// ║    2*key_dim + value_dim where key_dim = ssm_d_state * ssm_n_group     ║
+/// ║    value_dim = ssm_dt_rank * ssm_d_state                               ║
+/// ╚══════════════════════════════════════════════════════════════════════════╝
+///
 /// Key characteristics:
 ///   - Every 4th layer is Type B (separate Q/K/V), rest are Type A (combined QKV)
 ///   - Type A: gated Q (qTotalDim = 2× kvDim), attn_gate.weight present
 ///   - Type B: gated Q (qTotalDim = 2× kvDim), attn_gate.weight present, QK-norm
-///   - SSM recurrence in Type A layers
+///   - SSM recurrence in Type A layers (DISABLED)
 ///   - post_attention_norm.weight used for FFN norm
+///
+/// Key tensors:
+///   ssm_conv1d.weight [4, 10240] — conv1d kernel_size=4, conv_dim=10240 (SSM_DIM=6144 + GATE_DIM=4096)
+///   ssm_alpha.weight [5120, 48] — dt projection
+///   ssm_beta.weight [5120, 48] — B projection
+///   ssm_a [48] — A param (A_NOSCAN = already discretized A_bar)
+///   ssm_dt.bias [48] — dt bias
+///   ssm_norm.weight [128] — per-group RMSNorm weight
+///   ssm_out.weight [6144, 5120] — output projection (for both attention and SSM in Type A)
+///   ssm_gate.weight [4096, 5120] — gate projection for SSM conv1d output
+///   attn_gate.weight [2048, 5120] — gated Q projection (Type A)
 /// </summary>
 public class QwenHybridFormat : ITransformerFormat
 {
@@ -179,6 +216,9 @@ public class QwenHybridFormat : ITransformerFormat
 
     /// <summary>
     /// Type A combined QKV block with SSM recurrence.
+    /// ╔══════════════════════════════════════════════════════════════════════╗
+    /// ║  SSM DISABLED — see class-level docs for re-enable instructions    ║
+    /// ╚══════════════════════════════════════════════════════════════════════╝
     /// </summary>
     private static Tensor ApplyLayerCombinedQKV(TransformerBase transformer, Tensor x, int g, int layerIdx, uint position,
                                           KVCache? kvCache, TensorNameMapper nm,
@@ -313,14 +353,17 @@ public class QwenHybridFormat : ITransformerFormat
         ops.LayerNorm(x1Norm, wFN);
         if (!sFN) wFN.Dispose();
 
-        // SSM branch (parallel to FFN)
-        // Apply SSM for both prefill (seqLen > 1) and single-token generation.
-        // During prefill, we process each token sequentially to update the SSM state.
-        // During generation (seqLen == 1), we use the accumulated state.
-        int seqLen_ = x1.Shape[0];
-        var x2 = ssmState != null && HasSSMWeights(transformer, g)
-            ? ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState)
-            : x1;
+        // ╔══════════════════════════════════════════════════════════════════╗
+        // ║  SSM DISABLED — см. class-level docs для включения             ║
+        // ║  SSM recurrence produces garbage ("!") — missing conv1d+gate   ║
+        // ║  Без SSM модель работает на Attention + FFN (проверено)        ║
+        // ╚══════════════════════════════════════════════════════════════════╝
+        // Для включения SSM раскомментируйте блок ниже и закомментируйте Tensor x2 = x1;
+        Tensor x2 = x1;
+        // --- SSM включение (раскомментировать): ---
+        // var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState!, x1Norm.Shape[0]);
+        // x1.Dispose(); x1Norm.Dispose();
+        // Tensor x2 = ssmOut;
 
         // FFN branch
         var (wG, sG) = transformer.TempF32(nm.FfnGate(g));
@@ -342,116 +385,137 @@ public class QwenHybridFormat : ITransformerFormat
     /// <summary>
     /// SSM recurrence for Type-A Qwen3.6 blocks (Mamba-2 style). Runs fully on CPU.
     ///
-    /// Mamba-2 SSM formulation:
-    ///   dt = softplus(x @ Wdt + bias_dt)
-    ///   B  = x @ Wb
-    ///   C  = x @ Wc
-    ///   A  = exp(dt * log(A_param))   — A_param may be log(A) or raw A
-    ///   h[t] = A * h[t-1] + dt * B * x   (element-wise per state dimension)
-    ///   y[t] = C * h[t]
-    ///   y = RMSNorm(y) * ssm_norm.weight
-    ///   out = y @ ssm_out.weight + residual
+    /// ╔══════════════════════════════════════════════════════════════════════╗
+    /// ║  WARNING: This implementation is INCOMPLETE.                       ║
+    /// ║  Missing: conv1d (kernel_size=4), gate (SiLU), split into         ║
+    /// ║  SSM_DIM + GATE_DIM before state update.                          ║
+    /// ║  Reference: llama.cpp LLM_ARCH_QWEN35                              ║
+    /// ╚══════════════════════════════════════════════════════════════════════╝
+    ///
+    /// Based on llama.cpp reference implementation for Qwen3 architecture.
+    /// Key insight from llama.cpp: ssm_a is LLM_TENSOR_SSM_A_NOSCAN — it is
+    /// ALREADY a discretized A_bar (not log(A)). It is used directly as a decay
+    /// multiplier for the state, without exp(dt * A) transformation.
+    ///
+    /// Mamba-2 SSM formulation (Qwen3.6 specific):
+    ///   1. Conv1d: x [dModel=5120] → conv1d(kernel=4) → [conv_dim=10240]
+    ///      conv_dim = N*D + gate_dim = 48*128 + 4096 = 6144 + 4096 = 10240
+    ///   2. Split: [10240] → ssm_in[6144] + gate[4096]
+    ///   3. ssm_in → SiLU → split into 48 groups of 128
+    ///   4. For each group: dt, B, C projections, state update
+    ///   5. gate → SiLU → split into 32 groups of 128
+    ///   6. y = ssm_out * gate (element-wise per group)
+    ///   7. Per-group RMSNorm
+    ///   8. Output projection: y @ ssm_out.weight → [dModel]
     ///
     /// Weight mapping for Qwen3.6 GGUF:
-    ///   ssm_alpha.weight [dModel, N]  → Wdt (dt projection)
-    ///   ssm_beta.weight  [dModel, N]  → Wb  (B projection)
-    ///   ssm_a            [N]          → log(A) parameter (discrete)
-    ///   ssm_dt.bias      [N]          → bias for dt projection
-    ///   ssm_norm.weight  [D]          → per-group RMSNorm weight
-    ///   ssm_out.weight   [N*D, dModel] → output projection
-    ///
-    /// Note: C projection (Wc) may be absent in some Qwen3.6 variants.
-    /// If absent, C = B (tied B/C).
+    ///   ssm_conv1d.weight [4, conv_dim=10240]  → conv1d weights (kernel=4)
+    ///   ssm_alpha.weight  [dModel, N=48]       → Wdt (dt projection)
+    ///   ssm_beta.weight   [dModel, N=48]       → Wb  (B projection)
+    ///   ssm_a             [N=48]               → A_bar (ALREADY discretized, NOT log(A))
+    ///   ssm_dt.bias       [N=48]               → bias for dt projection
+    ///   ssm_norm.weight   [D=128]              → per-group RMSNorm weight
+    ///   ssm_out.weight    [N*D=6144, dModel=5120] → output projection
     /// </summary>
     private static Tensor ApplySSMRecurrence(TransformerBase transformer, Tensor xResidual, Tensor xNorm,
-                                       int g, SSMState ssmState)
+                                       int g, SSMState ssmState, int seqLen)
     {
-        const int N = 48;  // number of SSM groups
-        const int D = 128; // state dimension per group
+        const int N = 48;       // number of SSM groups
+        const int D = 128;      // state dimension per group
+        const int SSM_DIM = N * D;  // 6144
+        const int CONV_DIM = 10240; // from ssm_conv1d.weight shape[1]
+        const int GATE_DIM = CONV_DIM - SSM_DIM;  // 4096 = 32 * 128
+        const int GATE_GROUPS = GATE_DIM / D;      // 32
         var ops = transformer.Ops;
 
+        int dModel = xNorm.Shape[1];  // 5120
+
         // Load weights
-        var Wdt = transformer._weightCache[$"blk.{g}.ssm_alpha.weight"].ReadF32(); // [dModel, N]
-        var Wb  = transformer._weightCache[$"blk.{g}.ssm_beta.weight"].ReadF32();  // [dModel, N]
-        var ssA = transformer._weightCache[$"blk.{g}.ssm_a"].ReadF32();            // [N] — log(A)
-        var dtBias = transformer._weightCache[$"blk.{g}.ssm_dt.bias"].ReadF32();   // [N]
-        var sNw = transformer._weightCache[$"blk.{g}.ssm_norm.weight"].ReadF32();  // [D]
+        var Wdt = transformer._weightCache[$"blk.{g}.ssm_alpha.weight"].ReadF32();   // [dModel, N]
+        var Wb  = transformer._weightCache[$"blk.{g}.ssm_beta.weight"].ReadF32();    // [dModel, N]
+        var ssA = transformer._weightCache[$"blk.{g}.ssm_a"].ReadF32();              // [N] — ALREADY discretized A_bar
+        var dtBias = transformer._weightCache[$"blk.{g}.ssm_dt.bias"].ReadF32();     // [N]
+        var sNw = transformer._weightCache[$"blk.{g}.ssm_norm.weight"].ReadF32();    // [D]
 
         // Try to load C projection if it exists
         bool hasWc = transformer.HasWeight($"blk.{g}.ssm_gate.weight");
         float[]? Wc = hasWc ? transformer._weightCache[$"blk.{g}.ssm_gate.weight"].ReadF32() : null;
 
-        var x = xNorm.ReadData();
-        int dModel = xNorm.Shape[1];
-
-        // Compute dt, B, C projections
-        var dt = new float[N];
-        var B = new float[N];
-        var C = new float[N];
-        for (int n = 0; n < N; n++)
-        {
-            float dtVal = 0, bVal = 0, cVal = 0;
-            for (int k = 0; k < dModel; k++)
-            {
-                float xk = x[k];
-                dtVal += xk * Wdt[k + n * dModel];
-                bVal  += xk * Wb[k + n * dModel];
-                if (Wc != null)
-                    cVal += xk * Wc[k + n * dModel];
-            }
-            // dt = softplus(x @ Wdt + bias)
-            dt[n] = MathF.Log(1f + MathF.Exp(dtVal + dtBias[n]));
-            B[n] = bVal;
-            C[n] = Wc != null ? cVal : bVal; // tied B/C if no separate C projection
-        }
-
-        // Update SSM state: h[t] = exp(dt * log(A)) * h[t-1] + dt * B * x
-        // In Mamba-2, the state update is per-dimension:
-        // h[t,d] = exp(dt * log(A)) * h[t-1,d] + dt * B * x[d]
-        // But since B is a scalar per group (not per dimension), the input is:
-        // h[t,d] = exp(dt * log(A)) * h[t-1,d] + dt * B * x[d]
-        // where x[d] is the d-th element of the projected input.
-        // However, in our simplified CPU implementation, we use:
-        // h[t,d] = exp(dt * log(A)) * h[t-1,d] + dt * B
-        // This is a simplification that works when B is a scalar per group.
+        var xData = xNorm.ReadData();
         var h = ssmState.GetLayer(g);
-        for (int n = 0; n < N; n++)
+
+        // Process each token in the sequence sequentially (SSM is recurrent)
+        // For each token, we compute dt, B, C, update state, and produce output y
+        var ySeq = new float[seqLen * SSM_DIM];
+
+        for (int t = 0; t < seqLen; t++)
         {
-            // A_param may be log(A) or raw A. Check magnitude to decide.
-            // If ssA[n] is very negative (e.g., -10), it's likely log(A).
-            // If ssA[n] is close to 1, it's raw A.
-            // For Mamba-2, A is typically log(A) with values around -1 to -5.
-            float aVal = ssA[n];
-            // If aVal > 0, it's likely raw A (not log). Apply exp to get decay.
-            // If aVal < 0, it's likely log(A). Decay = exp(dt * exp(aVal)).
-            float logA = aVal < 0 ? aVal : MathF.Log(aVal + 1e-10f);
-            float decay = MathF.Exp(dt[n] * MathF.Exp(logA));
-            
-            float input = dt[n] * B[n];
-            int base_ = n * D;
-            for (int d = 0; d < D; d++)
-                h[base_ + d] = decay * h[base_ + d] + input;
+            int xOffset = t * dModel;
+
+            // Compute dt, B, C projections for this token
+            // dt = softplus(x @ Wdt + dtBias)
+            // B = x @ Wb
+            // C = x @ Wc (or B if Wc not present)
+            var dt = new float[N];
+            var B = new float[N];
+            var C = new float[N];
+            for (int n = 0; n < N; n++)
+            {
+                float dtVal = 0, bVal = 0, cVal = 0;
+                for (int k = 0; k < dModel; k++)
+                {
+                    float xk = xData[xOffset + k];
+                    dtVal += xk * Wdt[k + n * dModel];
+                    bVal  += xk * Wb[k + n * dModel];
+                    if (Wc != null)
+                        cVal += xk * Wc[k + n * dModel];
+                }
+                dt[n] = MathF.Log(1f + MathF.Exp(dtVal + dtBias[n])); // softplus
+                B[n] = bVal;
+                C[n] = Wc != null ? cVal : bVal;
+            }
+
+            // SSM state update: h[n,d] = A_bar[n] * h[n,d] + dt[n] * B[n] * x[d]
+            // A_bar is ALREADY discretized (ssm_a is A_NOSCAN in llama.cpp)
+            // Formula: h[t] = A * h[t-1] + dt * B * x[t]
+            for (int n = 0; n < N; n++)
+            {
+                float aBar = ssA[n];  // Already discretized A_bar, NOT log(A)
+                float bScaled = dt[n] * B[n];
+                int base_ = n * D;
+                for (int d = 0; d < D; d++)
+                    h[base_ + d] = aBar * h[base_ + d] + bScaled * xData[xOffset + d];
+            }
+
+            // Compute output for this token: y[n,d] = C[n] * h[n,d]
+            int yOffset = t * SSM_DIM;
+            for (int n = 0; n < N; n++)
+            {
+                float cn = C[n];
+                int base_ = n * D;
+                for (int d = 0; d < D; d++)
+                    ySeq[yOffset + base_ + d] = cn * h[base_ + d];
+            }
         }
 
-        // Compute output: y[n,d] = C[n] * h[n,d]
-        var y = new float[N * D];
-        for (int n = 0; n < N; n++)
+        // Per-group RMSNorm on the SSM output
+        for (int t = 0; t < seqLen; t++)
         {
-            float cn = C[n];
-            int base_ = n * D;
-            for (int d = 0; d < D; d++)
-                y[base_ + d] = cn * h[base_ + d];
-            
-            // Per-group RMSNorm
-            float sumSq = 0f;
-            for (int d = 0; d < D; d++) sumSq += y[base_ + d] * y[base_ + d];
-            float rms = MathF.Sqrt(sumSq / D + 1e-5f);
-            for (int d = 0; d < D; d++)
-                y[base_ + d] = y[base_ + d] / rms * sNw[d];
+            int yOffset = t * SSM_DIM;
+            for (int n = 0; n < N; n++)
+            {
+                int base_ = n * D;
+                float sumSq = 0f;
+                for (int d = 0; d < D; d++)
+                    sumSq += ySeq[yOffset + base_ + d] * ySeq[yOffset + base_ + d];
+                float rms = MathF.Sqrt(sumSq / D + 1e-5f);
+                for (int d = 0; d < D; d++)
+                    ySeq[yOffset + base_ + d] = ySeq[yOffset + base_ + d] / rms * sNw[d];
+            }
         }
 
-        // Output projection: [1, N*D] @ [N*D, dModel] → [1, dModel]
-        var yMatrix = Tensor.FromData(ops.Device, y, TensorShape.Matrix(1, N * D), "ssm_y");
+        // Output projection: [seqLen, N*D] @ [N*D, dModel] → [seqLen, dModel]
+        var yMatrix = Tensor.FromData(ops.Device, ySeq, TensorShape.Matrix(seqLen, SSM_DIM), "ssm_y");
         var (wOut, sOut) = transformer.TempF32Named($"blk.{g}.ssm_out.weight");
         var ssmProj = ops.MatMulWeights(yMatrix, wOut, "ssm_proj");
         if (!sOut) wOut.Dispose();

@@ -497,6 +497,8 @@ public class TransformerBase : IDisposable
         TryCacheWeight($"blk.{globalLayer}.ssm_dt.bias");
         TryCacheWeight($"blk.{globalLayer}.ssm_norm.weight");
         TryCacheWeight($"blk.{globalLayer}.ssm_out.weight");
+        TryCacheWeight($"blk.{globalLayer}.ssm_conv1d.weight");
+        TryCacheWeight($"blk.{globalLayer}.ssm_gate.weight");
     }
 
     protected void TryCacheWeight(string name)
