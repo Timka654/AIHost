@@ -404,16 +404,21 @@ public class Transformer : IDisposable
         int g  = layerIdx + _layerOffset;
         var nm = _nameMapper!;
 
-        // Check whether this specific layer actually has its weights cached.
-        // In hybrid SSM+Attention models some layers lack attention weights entirely.
-        bool hasAttn = nm.HasCombinedQKV
-            ? _weightCache.ContainsKey(nm.AttnQKV(g))
-            : _weightCache.ContainsKey(nm.AttnQ(g));
+        // Determine per-layer attention type.
+        // Qwen3.6 uses two block types:
+        //   Type A (blk.0,1,2,4..): combined attn_qkv.weight (gated) + SSM + FFN
+        //   Type B (blk.3,7,11..): separate attn_q/k/v.weight (gated-Q + QK-norm) + FFN
+        // Our global HasCombinedQKV=true (from blk.0), so we must check per-layer.
+        bool hasCombinedQKV = _weightCache.ContainsKey($"blk.{g}.attn_qkv.weight");
+        bool hasSeparateQKV  = _weightCache.ContainsKey($"blk.{g}.attn_q.weight");
 
-        if (!hasAttn)
-            return ApplyLayerSSMFallback(x, g, nm);  // SSM/MLP-only layer
+        if (!hasCombinedQKV && !hasSeparateQKV)
+            return ApplyLayerSSMFallback(x, g, nm);  // truly no attention
 
-        if (nm.HasCombinedQKV)
+        if (!hasCombinedQKV && hasSeparateQKV)
+            return ApplyLayerTypeB(x, g, layerIdx, position, kvCache);  // Type B
+
+        if (hasCombinedQKV)
             return ApplyLayerCombinedQKV(x, g, layerIdx, position, kvCache, nm);
         int seqLen = x.Shape[0];
 
@@ -488,6 +493,135 @@ public class Transformer : IDisposable
     /// Full Mamba state-space computation is not yet implemented — applies only the FFN
     /// component (skips the SSM recurrence). Output quality will be degraded for these layers.
     /// </summary>
+    /// <summary>
+    /// Type B attention block (Qwen3.6 blk.3, 7, 11…):
+    ///   separate attn_q/k/v weights, gated-Q (Q has 2× normal dim), QK-norm, standard W_o.
+    ///
+    /// Q [seqLen,12288] is split into q_proj[6144] and q_gate[6144]; gated_q = q_proj * SiLU(q_gate).
+    /// Then standard GQA(gated_q[24h×256], K[4h×256], V[4h×256]) → attn_out[6144] → W_o → [5120].
+    /// QK normalization weights (q_norm/k_norm [256]) applied as per-head LayerNorm approximation.
+    /// Post-attention norm → FFN completes the block.
+    /// </summary>
+    private Tensor ApplyLayerTypeB(Tensor x, int g, int layerIdx, uint position, KVCache? kvCache)
+    {
+        // 1. Pre-attention RMSNorm
+        var xNorm = _ops.Clone(x, "attn_norm_in");
+        { var (wAN, sAN) = TempF32Named($"blk.{g}.attn_norm.weight"); _ops.LayerNorm(xNorm, wAN); if (!sAN) wAN.Dispose(); }
+
+        // 2. Separate Q, K, V projections
+        var (wQ, sQ)   = TempF32Named($"blk.{g}.attn_q.weight");
+        var (wK, sK)   = TempF32Named($"blk.{g}.attn_k.weight");
+        var (wV, sV)   = TempF32Named($"blk.{g}.attn_v.weight");
+        var rawQ = _ops.MatMulWeights(xNorm, wQ, "rawQ");  // [seqLen, 12288]
+        var K    = _ops.MatMulWeights(xNorm, wK, "K");      // [seqLen, 1024]
+        var V    = _ops.MatMulWeights(xNorm, wV, "V");      // [seqLen, 1024]
+        if (!sQ) wQ.Dispose(); if (!sK) wK.Dispose(); if (!sV) wV.Dispose();
+        xNorm.Dispose();
+
+        // 3. Gated Q: split rawQ → q_proj[6144] and q_gate[6144]
+        int qDim = rawQ.Shape[1] / 2;   // 6144
+        var qProj = _ops.SliceCols(rawQ, 0,    qDim, "q_proj");
+        var qGate = _ops.SliceCols(rawQ, qDim, qDim, "q_gate");
+        rawQ.Dispose();
+        _ops.SiLU(qGate);
+        var gatedQ = _ops.Multiply(qProj, qGate, "gated_q");
+        qProj.Dispose(); qGate.Dispose();
+
+        // 4. QK normalization (per-head, weight [head_dim=256])
+        //    Approximate: apply RMSNorm with tiled weight across all heads.
+        int headDim = 256;
+        var qNormW = GetOrBuildTiledNorm($"blk.{g}.attn_q_norm.weight", headDim, gatedQ.Shape[1]);
+        var kNormW = GetOrBuildTiledNorm($"blk.{g}.attn_k_norm.weight", headDim, K.Shape[1]);
+        _ops.LayerNorm(gatedQ, qNormW);
+        _ops.LayerNorm(K,      kNormW);
+
+        // 5. RoPE (n_q_heads=24, n_kv_heads=4, head_dim=256)
+        int nQH = qDim / headDim;       // 24
+        int nKVH = K.Shape[1] / headDim; // 4
+        _ops.ApplyRoPEFull(gatedQ, position, nQH,  headDim);
+        _ops.ApplyRoPEFull(K,      position, nKVH, headDim);
+
+        // 6. GQA
+        Tensor attnOut;
+        if (kvCache != null)
+        {
+            kvCache.Add(layerIdx, K, V);
+            var (cachedK, cachedV) = kvCache.Get(layerIdx);
+            attnOut = _ops.MultiHeadAttention(gatedQ, cachedK!, cachedV!, nQH, position, "attn_out_B");
+            _ops.DeferExternal(gatedQ);
+        }
+        else
+        {
+            attnOut = _ops.MultiHeadAttention(gatedQ, K, V, nQH, position, "attn_out_B");
+            _ops.DeferExternal(gatedQ); _ops.DeferExternal(K); _ops.DeferExternal(V);
+        }
+
+        // 7. Output projection W_o [6144→5120] — stored normally (not transposed)
+        var (wO, sO) = TempF32Named($"blk.{g}.attn_output.weight");
+        var attnProj = _ops.MatMulWeights(attnOut, wO, "attn_proj_B");
+        if (!sO) wO.Dispose();
+        attnOut.Dispose();
+
+        var x1 = _ops.Add(x, attnProj, "x_after_attn_B");
+        attnProj.Dispose();
+
+        // 8. Post-attention norm → FFN
+        var x1Norm = _ops.Clone(x1, "post_attn_norm_in");
+        { var (wPN, sPN) = TempF32Named($"blk.{g}.post_attention_norm.weight"); _ops.LayerNorm(x1Norm, wPN); if (!sPN) wPN.Dispose(); }
+
+        var (wG, sG) = TempF32Named($"blk.{g}.ffn_gate.weight");
+        var (wU, sU) = TempF32Named($"blk.{g}.ffn_up.weight");
+        var (wD, sD) = TempF32Named($"blk.{g}.ffn_down.weight");
+        var ffnOut = _ops.FeedForward(x1Norm, wG, wU, wD, "ffn_B");
+        if (!sG) wG.Dispose(); if (!sU) wU.Dispose(); if (!sD) wD.Dispose();
+        x1Norm.Dispose();
+
+        var output = _ops.Add(x1, ffnOut, "layer_out_B");
+        x1.Dispose(); ffnOut.Dispose(); x.Dispose();
+        return output;
+    }
+
+    // Helper: creates a tiled version of a [head_dim] norm weight to cover [total_dim].
+    // Caches result in _scratchF32 to avoid re-allocation every token.
+    private Tensor GetOrBuildTiledNorm(string weightName, int headDim, int totalDim)
+    {
+        string key = $"_tiled_{weightName}";
+        if (_scratchF32.TryGetValue(key, out var cached)) return cached;
+
+        if (!_weightCache.TryGetValue(weightName, out var srcW)) return Tensor.Create(_ops.Device, new TensorShape(totalDim), DataType.F32, key); // fallback: all-ones
+
+        var srcF32 = _ops.Dequantize(srcW);
+        var srcData = srcF32.ReadData();
+        srcF32.Dispose();
+
+        int tiles = totalDim / headDim;
+        var tiledData = new float[totalDim];
+        for (int t = 0; t < tiles; t++)
+            Array.Copy(srcData, 0, tiledData, t * headDim, headDim);
+
+        var tiled = Tensor.FromData(_ops.Device, tiledData, new TensorShape(totalDim), key);
+        _scratchF32[key] = tiled;
+        return tiled;
+    }
+
+    // Helper: TempF32 by exact name (bypasses the layer-prefix stripping logic).
+    private (Tensor tensor, bool isScratch) TempF32Named(string name)
+    {
+        if (!_weightCache.TryGetValue(name, out var cached))
+            throw new KeyNotFoundException($"Weight '{name}' not in cache");
+        if (cached.DataType == DataType.F32)
+            return (_ops.Clone(cached), false);
+        // Use tiled scratch if available (key = name without "blk.N." prefix)
+        int dot2 = name.IndexOf('.', name.IndexOf('.') + 1);
+        var key  = dot2 >= 0 ? name[(dot2 + 1)..] : name;
+        if (_scratchF32.TryGetValue(key, out var scratch))
+        {
+            _ops.DequantizeInto(cached, scratch);
+            return (scratch, true);
+        }
+        return (_ops.Dequantize(cached), false);
+    }
+
     private Tensor ApplyLayerSSMFallback(Tensor x, int g, TensorNameMapper nm)
     {
         // Skip the SSM computation entirely — just pass x through with FFN if available.
@@ -650,21 +784,34 @@ public class Transformer : IDisposable
     {
         var nm = _nameMapper!;
 
-        // Attention weights — use TryCacheWeight so layers without attention weights are skipped.
-        // LayerHasAttention is best-effort; TryCacheWeight is the safety net.
+        // Attention norm (always present)
         TryCacheWeight(nm.AttnNorm(globalLayer));
-        if (nm.HasCombinedQKV)
-            TryCacheWeight(nm.AttnQKV(globalLayer));
-        else
+
+        // Detect per-layer type: combined QKV (Type A) or separate (Type B)
+        bool layerHasCombined = _model.Tensors.Any(t => t.Name == $"blk.{globalLayer}.attn_qkv.weight");
+        bool layerHasSeparate = _model.Tensors.Any(t => t.Name == $"blk.{globalLayer}.attn_q.weight");
+
+        if (layerHasCombined)
+            TryCacheWeight($"blk.{globalLayer}.attn_qkv.weight");
+        else if (layerHasSeparate)
         {
-            TryCacheWeight(nm.AttnQ(globalLayer));
-            TryCacheWeight(nm.AttnK(globalLayer));
-            TryCacheWeight(nm.AttnV(globalLayer));
+            // Type B: separate Q/K/V + QK norms + standard output projection
+            TryCacheWeight($"blk.{globalLayer}.attn_q.weight");
+            TryCacheWeight($"blk.{globalLayer}.attn_k.weight");
+            TryCacheWeight($"blk.{globalLayer}.attn_v.weight");
+            TryCacheWeight($"blk.{globalLayer}.attn_q_norm.weight");
+            TryCacheWeight($"blk.{globalLayer}.attn_k_norm.weight");
+            TryCacheWeight($"blk.{globalLayer}.attn_output.weight");
         }
-        TryCacheWeight(nm.AttnOutput(globalLayer));
+
+        // For combined QKV (Type A): gate + output
+        if (layerHasCombined)
+            TryCacheWeight(nm.AttnOutput(globalLayer));
 
         // FFN weights — present in most layers
         TryCacheWeight(nm.FfnNorm(globalLayer));
+        // post_attention_norm: used as FFN pre-norm in Type B, as SSM pre-norm in Type A
+        TryCacheWeight($"blk.{globalLayer}.post_attention_norm.weight");
         TryCacheWeight(nm.FfnGate(globalLayer));
         TryCacheWeight(nm.FfnUp(globalLayer));
         TryCacheWeight(nm.FfnDown(globalLayer));
