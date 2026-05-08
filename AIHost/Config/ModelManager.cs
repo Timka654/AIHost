@@ -432,13 +432,23 @@ public class ModelManager : IDisposable
     /// <summary>
     /// Unload a model from memory
     /// </summary>
-    public void UnloadModel(string modelName)
+    public bool UnloadModel(string modelName, bool force = false)
     {
-        if (_loadedModels.TryRemove(modelName, out var instance))
+        if (!_loadedModels.TryGetValue(modelName, out var instance)) return false;
+
+        if (!force && instance.IsActive)
+        {
+            _logger.LogWarning("Skipping unload of {Model} — {N} active request(s) in progress", modelName, instance.ActiveRequests);
+            return false;
+        }
+
+        if (_loadedModels.TryRemove(modelName, out instance))
         {
             instance.Dispose();
             _logger.LogInformation("Unloaded model: {Model}", modelName);
+            return true;
         }
+        return false;
     }
 
     /// <summary>
@@ -587,6 +597,28 @@ public class ModelInstance : IDisposable
     public double AverageTPS { get; private set; }
     public DateTime? LastRequestAt { get; private set; }
     public string? LastPrompt { get; private set; }
+
+    // Active request tracking — prevents auto-unload while inference is running.
+    private int _activeRequests;
+    public int ActiveRequests => _activeRequests;
+    public bool IsActive => _activeRequests > 0;
+
+    /// <summary>
+    /// Call at request start; returns an IDisposable that decrements on dispose.
+    /// Usage: using var _ = model.TrackRequest();
+    /// </summary>
+    public IDisposable TrackRequest()
+    {
+        Interlocked.Increment(ref _activeRequests);
+        return new RequestScope(this);
+    }
+
+    private void ReleaseRequest() => Interlocked.Decrement(ref _activeRequests);
+
+    private sealed class RequestScope(ModelInstance owner) : IDisposable
+    {
+        public void Dispose() => owner.ReleaseRequest();
+    }
 
     /// <summary>
     /// Thread-safe stats update called after each completed request.

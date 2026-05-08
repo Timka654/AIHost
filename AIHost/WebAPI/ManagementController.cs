@@ -420,10 +420,15 @@ public class ManagementController : ControllerBase
             };
 
             if (request.Stream)
+            {
+                using var _ = model.TrackRequest();
                 return await DirectChatStream(request, model, config);
+            }
 
+            using var __ = model.TrackRequest();
+            var ct = HttpContext.RequestAborted;
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var response = model.Engine.Generate(request.Message, config);
+            var response = model.Engine.Generate(request.Message, config, ct);
             sw.Stop();
 
             var tokenCount = response.Length;
@@ -491,16 +496,23 @@ public class ManagementController : ControllerBase
         var fullResponse = new System.Text.StringBuilder();
         int tokenCount = 0;
 
+        var ct = HttpContext.RequestAborted;
         try
         {
             model.Engine.GenerateStreaming(request.Message, config, async token =>
             {
+                if (ct.IsCancellationRequested) return;
                 fullResponse.Append(token);
                 tokenCount++;
                 var chunk = System.Text.Json.JsonSerializer.Serialize(new { token, done = false });
-                await Response.WriteAsync(chunk + "\n");
-                await Response.Body.FlushAsync();
-            });
+                await Response.WriteAsync(chunk + "\n", ct);
+                await Response.Body.FlushAsync(ct);
+            }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Streaming DirectChat cancelled for model {Model}", request.ModelName);
+            return new EmptyResult();
         }
         catch (Exception ex)
         {

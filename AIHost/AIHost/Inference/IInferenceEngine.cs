@@ -11,6 +11,10 @@ public interface IInferenceEngine : IDisposable
     BPETokenizer Tokenizer    { get; }
     int          ContextLength { get; }
 
-    string Generate(string prompt, GenerationConfig config);
-    void   GenerateStreaming(string prompt, GenerationConfig config, Action<string> onTokenGenerated);
+    string Generate(string prompt, GenerationConfig config,
+                    CancellationToken cancellationToken = default);
+
+    void GenerateStreaming(string prompt, GenerationConfig config,
+                           Action<string> onTokenGenerated,
+                           CancellationToken cancellationToken = default);
 }

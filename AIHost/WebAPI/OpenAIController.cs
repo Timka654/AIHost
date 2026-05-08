@@ -39,8 +39,9 @@ public class OpenAIController : ControllerBase
             var config = BuildGenerationConfig(model.Config, request);
 
             // Generate
+            using var __ = model.TrackRequest();
             var sw = Stopwatch.StartNew();
-            var response = model.Engine.Generate(prompt, config);
+            var response = model.Engine.Generate(prompt, config, HttpContext.RequestAborted);
             sw.Stop();
 
             // Count tokens

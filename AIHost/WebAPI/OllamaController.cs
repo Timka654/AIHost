@@ -50,10 +50,14 @@ public class OllamaController : ControllerBase
             var promptTokens = tokenizer.Encode(prompt).Length;
 
             if (request.Stream)
+            {
+                using var _ = model.TrackRequest();
                 return await StreamGenerate(model, prompt, config, request.Model, loadDuration, promptTokens, sw);
+            }
 
+            using var __ = model.TrackRequest();
             var evalSw = Stopwatch.StartNew();
-            var fullOutput = model.Engine.Generate(prompt, config);
+            var fullOutput = model.Engine.Generate(prompt, config, HttpContext.RequestAborted);
             var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000L;
 
             // Return only the generated part, not the full prompt+output
@@ -101,19 +105,29 @@ public class OllamaController : ControllerBase
         Response.ContentType = "application/x-ndjson";
         var evalSw = Stopwatch.StartNew();
         var evalCount = 0;
+        var ct = HttpContext.RequestAborted;
 
-        model.Engine.GenerateStreaming(prompt, config, token =>
+        try
         {
-            evalCount++;
-            var chunk = System.Text.Json.JsonSerializer.Serialize(new
+            model.Engine.GenerateStreaming(prompt, config, token =>
             {
-                model = modelName,
-                response = token,
-                done = false
-            });
-            Response.WriteAsync(chunk + "\n").GetAwaiter().GetResult();
-            Response.Body.FlushAsync().GetAwaiter().GetResult();
-        });
+                if (ct.IsCancellationRequested) return;
+                evalCount++;
+                var chunk = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    model = modelName,
+                    response = token,
+                    done = false
+                });
+                Response.WriteAsync(chunk + "\n", ct).GetAwaiter().GetResult();
+                Response.Body.FlushAsync(ct).GetAwaiter().GetResult();
+            }, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogDebug("Streaming cancelled for model {Model}", modelName);
+            return new EmptyResult();
+        }
 
         var finalChunk = System.Text.Json.JsonSerializer.Serialize(new
         {
@@ -166,8 +180,9 @@ public class OllamaController : ControllerBase
             var tokenizer = model.Engine.Tokenizer;
             var promptTokens = tokenizer.Encode(prompt).Length;
 
+            using var __ = model.TrackRequest();
             var evalSw = Stopwatch.StartNew();
-            var fullOutput = model.Engine.Generate(prompt, config);
+            var fullOutput = model.Engine.Generate(prompt, config, HttpContext.RequestAborted);
             var evalDuration = evalSw.ElapsedMilliseconds * 1_000_000L;
 
             var generated = StripPrompt(fullOutput, prompt);

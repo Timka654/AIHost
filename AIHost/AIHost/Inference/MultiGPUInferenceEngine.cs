@@ -41,18 +41,22 @@ public class MultiGPUInferenceEngine : IInferenceEngine
 
     // ── Public generation API (mirrors InferenceEngine) ──────────────────────
 
-    public string Generate(string prompt, GenerationConfig config)
+    public string Generate(string prompt, GenerationConfig config,
+                            CancellationToken cancellationToken = default)
     {
-        var tokens = Run(prompt, config, onToken: null);
+        var tokens = Run(prompt, config, onToken: null, cancellationToken);
         return _tokenizer.Decode(tokens.ToArray());
     }
 
-    public void GenerateStreaming(string prompt, GenerationConfig config, Action<string> onToken)
-        => Run(prompt, config, onToken: id => onToken(_tokenizer.GetToken(id)));
+    public void GenerateStreaming(string prompt, GenerationConfig config,
+                                   Action<string> onToken,
+                                   CancellationToken cancellationToken = default)
+        => Run(prompt, config, id => onToken(_tokenizer.GetToken(id)), cancellationToken);
 
     // ── Core loop ────────────────────────────────────────────────────────────
 
-    private List<int> Run(string prompt, GenerationConfig config, Action<int>? onToken)
+    private List<int> Run(string prompt, GenerationConfig config, Action<int>? onToken,
+                           CancellationToken cancellationToken = default)
     {
         if (config.Seed >= 0) _random = new Random(config.Seed);
 
@@ -81,6 +85,12 @@ public class MultiGPUInferenceEngine : IInferenceEngine
 
         for (int i = 0; i < config.MaxNewTokens; i++)
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogDebug("[MultiGPU] Cancelled at token {N}", generated);
+                break;
+            }
+
             uint startPos = (uint)(_kvCache?.SequenceLength ?? 0);
             int[] inputTokens = (_kvCache != null && _kvCache.SequenceLength > 0)
                 ? new[] { tokens[^1] }

@@ -58,6 +58,13 @@ public sealed class ModelAutoUnloadService : BackgroundService
 
                 if (idleMinutes >= keepAliveMinutes)
                 {
+                    if (model.IsActive)
+                    {
+                        _logger.LogInformation(
+                            "Auto-unload skipped for {Model}: idle {Idle:F1}m >= {Threshold}m but {N} active request(s)",
+                            name, idleMinutes, keepAliveMinutes, model.ActiveRequests);
+                        continue;
+                    }
                     _logger.LogInformation(
                         "Auto-unloading {Model} (idle {Idle:F1}m, threshold {Threshold}m)",
                         name, idleMinutes, keepAliveMinutes);

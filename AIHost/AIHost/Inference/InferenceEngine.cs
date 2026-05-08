@@ -54,19 +54,20 @@ public class InferenceEngine : IInferenceEngine
     /// <summary>
     /// Generate text from a prompt
     /// </summary>
-    public string Generate(string prompt, GenerationConfig config)
+    public string Generate(string prompt, GenerationConfig config,
+                            CancellationToken cancellationToken = default)
     {
-        var tokens = PrepareAndRun(prompt, config, onToken: null);
+        var tokens = PrepareAndRun(prompt, config, onToken: null, cancellationToken);
         return _tokenizer.Decode(tokens.ToArray());
     }
 
-    /// <summary>
-    /// Generate text with streaming callback
-    /// </summary>
-    public void GenerateStreaming(string prompt, GenerationConfig config, Action<string> onTokenGenerated)
+    public void GenerateStreaming(string prompt, GenerationConfig config,
+                                   Action<string> onTokenGenerated,
+                                   CancellationToken cancellationToken = default)
     {
-        PrepareAndRun(prompt, config, onToken: tokenId =>
-            onTokenGenerated(_tokenizer.GetToken(tokenId)));
+        PrepareAndRun(prompt, config,
+            onToken: tokenId => onTokenGenerated(_tokenizer.GetToken(tokenId)),
+            cancellationToken);
     }
 
     /// <summary>
@@ -82,7 +83,8 @@ public class InferenceEngine : IInferenceEngine
         return results;
     }
 
-    private List<int> PrepareAndRun(string prompt, GenerationConfig config, Action<int>? onToken)
+    private List<int> PrepareAndRun(string prompt, GenerationConfig config, Action<int>? onToken,
+                                     CancellationToken cancellationToken = default)
     {
         if (config.Seed >= 0)
             _random = new Random(config.Seed);
@@ -131,6 +133,12 @@ public class InferenceEngine : IInferenceEngine
 
         for (int i = 0; i < config.MaxNewTokens; i++)
         {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogDebug("[Inference] Cancelled at token {N}", generatedCount);
+                break;
+            }
+
             uint startPos = _kvCache != null ? (uint)_kvCache.SequenceLength : 0;
             int[] inputTokens = _kvCache != null && _kvCache.SequenceLength > 0
                 ? new[] { tokens[^1] }
