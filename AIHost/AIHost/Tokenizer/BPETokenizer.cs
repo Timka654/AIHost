@@ -151,4 +151,25 @@ public class BPETokenizer
             return _tokens[tokenId].Replace('▁', ' ');
         return "<unk>";
     }
+
+    /// <summary>
+    /// Direct vocabulary lookup — returns the token ID for an exact vocab entry,
+    /// or -1 if not found. Use this for special tokens like &lt;|im_end|&gt; that
+    /// must NOT go through SentencePiece normalization.
+    /// </summary>
+    public int GetTokenId(string vocabEntry)
+        => _tokenToId.TryGetValue(vocabEntry, out var id) ? id : -1;
+
+    /// <summary>
+    /// Encode stop sequences properly: tries direct vocab lookup first (for special
+    /// tokens like &lt;|im_end|&gt;), then falls back to regular BPE encoding.
+    /// </summary>
+    public int[] EncodeStopSequence(string text)
+    {
+        // Direct lookup for exact special-token strings (no normalization)
+        if (_tokenToId.TryGetValue(text, out var specialId))
+            return [specialId];
+        // Fallback: standard BPE without BOS
+        return Encode(text, addBos: false, addEos: false);
+    }
 }

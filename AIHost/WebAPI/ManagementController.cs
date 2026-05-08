@@ -74,6 +74,10 @@ public class ChatRequest
 
     [JsonPropertyName("max_tokens")]
     public int? MaxTokens { get; set; }
+
+    /// <summary>Stream tokens as they are generated (SSE / NDJSON format).</summary>
+    [JsonPropertyName("stream")]
+    public bool Stream { get; set; } = false;
 }
 
 /// <summary>
@@ -415,6 +419,9 @@ public class ManagementController : ControllerBase
                 StopSequences       = modelConfig?.Parameters.Stop.ToList() ?? []
             };
 
+            if (request.Stream)
+                return await DirectChatStream(request, model, config);
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var response = model.Engine.Generate(request.Message, config);
             sw.Stop();
@@ -466,6 +473,56 @@ public class ManagementController : ControllerBase
             _logger.LogError(ex, "DirectChat failed for model {Model}: {Type}: {Message}", request.ModelName, ex.GetType().FullName, ex.Message);
             return StatusCode(500, new { error = ex.Message, type = ex.GetType().FullName, detail = ex.InnerException?.Message, stack = ex.ToString() });
         }
+    }
+
+    /// <summary>
+    /// Streaming variant of DirectChat — sends NDJSON chunks as each token arrives.
+    /// Each chunk: {"token":"...", "done":false}
+    /// Final chunk: {"response":"...", "tokens":N, "tps":X, "done":true}
+    /// </summary>
+    private async Task<IActionResult> DirectChatStream(ChatRequest request,
+        AIHost.Config.ModelInstance model, AIHost.Inference.GenerationConfig config)
+    {
+        Response.ContentType = "application/x-ndjson";
+        Response.Headers["Cache-Control"] = "no-cache";
+        Response.Headers["X-Accel-Buffering"] = "no"; // disable nginx buffering
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var fullResponse = new System.Text.StringBuilder();
+        int tokenCount = 0;
+
+        try
+        {
+            model.Engine.GenerateStreaming(request.Message, config, async token =>
+            {
+                fullResponse.Append(token);
+                tokenCount++;
+                var chunk = System.Text.Json.JsonSerializer.Serialize(new { token, done = false });
+                await Response.WriteAsync(chunk + "\n");
+                await Response.Body.FlushAsync();
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Streaming DirectChat failed for model {Model}", request.ModelName);
+            var errChunk = System.Text.Json.JsonSerializer.Serialize(new { error = ex.Message, done = true });
+            await Response.WriteAsync(errChunk + "\n");
+            return new EmptyResult();
+        }
+
+        sw.Stop();
+        var tps = sw.Elapsed.TotalSeconds > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
+        _modelManager.UpdateModelStats(request.ModelName, request.Message, tps);
+
+        var final = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            response = fullResponse.ToString(),
+            tokens = tokenCount,
+            tps = Math.Round(tps, 2),
+            done = true
+        });
+        await Response.WriteAsync(final + "\n");
+        return new EmptyResult();
     }
 
     /// <summary>

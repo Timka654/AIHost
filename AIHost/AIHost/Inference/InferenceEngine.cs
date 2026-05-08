@@ -113,9 +113,10 @@ public class InferenceEngine : IInferenceEngine
 
         int eosToken = _tokenizer.EosToken;
 
-        // Pre-encode stop sequences into token lists for fast suffix matching
+        // Pre-encode stop sequences: use direct vocab lookup for special tokens
+        // (avoids SentencePiece normalization that would break <|im_end|> etc.)
         var stopSeqTokens = config.StopSequences
-            .Select(s => _tokenizer.Encode(s, addBos: false, addEos: false))
+            .Select(s => _tokenizer.EncodeStopSequence(s))
             .Where(seq => seq.Length > 0)
             .ToList();
 
