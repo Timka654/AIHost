@@ -326,13 +326,19 @@ function renderChatModels(configs) {
             <label>Message:</label>
             <textarea id="chat-message" rows="4" placeholder="Type your message here..." style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;"></textarea>
         </div>
-        <div class="form-group">
-            <label>Temperature (0.0-2.0):</label>
-            <input type="number" id="chat-temperature" value="0.7" step="0.1" min="0" max="2" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
+        <div style="display: flex; gap: 15px; margin-bottom: 15px;">
+            <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                <label>Temperature (0.0-2.0):</label>
+                <input type="number" id="chat-temperature" value="0.7" step="0.1" min="0" max="2" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
+            </div>
+            <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                <label>Max Tokens:</label>
+                <input type="number" id="chat-max-tokens" value="512" step="64" min="1" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
+            </div>
         </div>
-        <div class="form-group">
-            <label>Max Tokens:</label>
-            <input type="number" id="chat-max-tokens" value="512" step="64" min="1" style="width: 100%; padding: 10px; border: 2px solid #e9ecef; border-radius: 5px; font-size: 14px;">
+        <div class="form-group" style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 5px; border: 1px solid #e9ecef;">
+            <input type="checkbox" id="chat-stream" checked style="width: 18px; height: 18px; cursor: pointer;">
+            <label for="chat-stream" style="margin: 0; cursor: pointer; font-weight: normal;">Enable Streaming (Ollama format)</label>
         </div>
         <button class="btn btn-success" onclick="sendChatMessage()">💬 Send Message</button>
     `;
@@ -641,13 +647,14 @@ async function clearCache() {
     }
 }
 
-// Send chat message
+// Send chat message with optional streaming
 async function sendChatMessage() {
     const modelName = document.getElementById('chat-model-select')?.value;
     const systemMessage = document.getElementById('chat-system-message')?.value;
     const message = document.getElementById('chat-message')?.value;
     const temperature = parseFloat(document.getElementById('chat-temperature')?.value) || 0.7;
     const maxTokens = parseInt(document.getElementById('chat-max-tokens')?.value) || 512;
+    const useStream = document.getElementById('chat-stream')?.checked ?? false;
 
     if (!modelName) {
         alert('Please select a model config first.');
@@ -659,12 +666,17 @@ async function sendChatMessage() {
         return;
     }
 
-    // Find the send button
     const submitBtn = document.querySelector('.btn-success[onclick="sendChatMessage()"]');
     if (submitBtn) {
         submitBtn.disabled = true;
-        submitBtn.textContent = '⏳ Loading model & sending...';
+        submitBtn.textContent = useStream ? '⏳ Receiving stream...' : '⏳ Loading & thinking...';
     }
+
+    // Подготавливаем UI (функция из прошлого ответа)
+    const { assistantContent, assistantTokens } = appendUserAndInitAssistantMessage(modelName, message);
+
+    const messageInput = document.getElementById('chat-message');
+    if (messageInput) messageInput.value = '';
 
     try {
         const response = await fetch(`${API_BASE}/manage/chat`, {
@@ -678,62 +690,123 @@ async function sendChatMessage() {
                 message: message,
                 system_message: systemMessage || null,
                 temperature: temperature,
-                max_tokens: maxTokens
+                max_tokens: maxTokens,
+                stream: useStream
             })
         });
 
         if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || `HTTP ${response.status}`);
+            const errorText = await response.text();
+            let errMsg = `HTTP ${response.status}`;
+            try { errMsg = JSON.parse(errorText).error || errMsg; } catch (e) { }
+            throw new Error(errMsg);
         }
 
-        const result = await response.json();
-        
-        // Display result in a nicer format
-        displayChatResponse(message, result);
-        
-        // Clear message input
-        const messageInput = document.getElementById('chat-message');
-        if (messageInput) messageInput.value = '';
+        if (useStream) {
+            // === РЕЖИМ СТРИМИНГА ===
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let fullText = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n').filter(line => line.trim());
+
+                for (const line of lines) {
+                    try {
+                        const data = JSON.parse(line);
+
+                        // Совместимость с Ollama: /api/generate отдает `response`, /api/chat отдает `message.content`
+                        const chunkText = data.response || data.message?.content || '';
+
+                        if (chunkText) {
+                            fullText += chunkText;
+                            assistantContent.innerHTML = escapeHtml(fullText);
+                            scrollToBottom();
+                        }
+
+                        if (data.done) {
+                            const tokens = data.eval_count || data.tokens || 'N/A';
+                            assistantTokens.textContent = `Tokens: ${tokens}`;
+                        }
+                    } catch (e) {
+                        console.warn('Failed to parse Ollama JSON chunk:', line);
+                    }
+                }
+            }
+        } else {
+            // === РЕЖИМ БЕЗ СТРИМИНГА ===
+            const result = await response.json();
+
+            const finalHtml = escapeHtml(result.response || result.message?.content || '');
+            const finalTokens = result.eval_count || result.tokens || 'N/A';
+
+            assistantContent.innerHTML = finalHtml;
+            assistantTokens.textContent = `Tokens: ${finalTokens}`;
+            scrollToBottom();
+        }
+
     } catch (error) {
-        alert(`Chat failed: ${error.message}`);
+        assistantContent.innerHTML += `<br><br><span style="color: #dc3545; font-weight: bold;">[Error: ${escapeHtml(error.message)}]</span>`;
+        assistantTokens.textContent = 'Tokens: Error';
+        scrollToBottom();
     } finally {
         if (submitBtn) {
             submitBtn.disabled = false;
             submitBtn.textContent = '💬 Send Message';
         }
     }
-}
-
-// Display chat response
-function displayChatResponse(userMessage, result) {
+}// Замена старой displayChatResponse на новую, которая подготавливает UI для стриминга
+function appendUserAndInitAssistantMessage(modelName, userMessage) {
     const container = document.getElementById('chat-models-container');
-    const existingMessages = document.getElementById('chat-messages');
-    
-    // Create messages container if it doesn't exist
-    if (!existingMessages) {
+    let messages = document.getElementById('chat-messages');
+
+    // Создаем окно чата, если его еще нет
+    if (!messages) {
         const messagesHtml = `
             <div id="chat-messages" style="margin-top: 20px; padding: 15px; background: white; border: 2px solid #e9ecef; border-radius: 5px; max-height: 400px; overflow-y: auto;">
                 <h4>Conversation</h4>
             </div>
         `;
         container.insertAdjacentHTML('beforeend', messagesHtml);
+        messages = document.getElementById('chat-messages');
     }
-    
-    const messages = document.getElementById('chat-messages');
+
+    // Уникальный ID для таргетинга элементов именно этого ответа
+    const messageId = Date.now();
+
     const messageHtml = `
         <div class="chat-message user" style="margin: 10px 0; padding: 10px; background: #f0f0f0; border-left: 3px solid #6c757d; border-radius: 5px;">
             <div style="font-weight: bold; font-size: 12px; margin-bottom: 5px; color: #6c757d;">USER</div>
             <div style="font-size: 14px; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(userMessage)}</div>
         </div>
         <div class="chat-message assistant" style="margin: 10px 0; padding: 10px; background: #e7f3ff; border-left: 3px solid #28a745; border-radius: 5px;">
-            <div style="font-weight: bold; font-size: 12px; margin-bottom: 5px; color: #28a745;">ASSISTANT (${escapeHtml(result.model)})</div>
-            <div style="font-size: 14px; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(result.response)}</div>
-            <div style="font-size: 11px; color: #6c757d; margin-top: 5px;">Tokens: ${result.tokens || 'N/A'}</div>
+            <div style="font-weight: bold; font-size: 12px; margin-bottom: 5px; color: #28a745;">ASSISTANT (${escapeHtml(modelName)})</div>
+            <div id="assistant-content-${messageId}" style="font-size: 14px; white-space: pre-wrap; word-wrap: break-word; min-height: 20px;">
+                <span style="color: #6c757d; font-style: italic;">Typing...</span>
+            </div>
+            <div id="assistant-tokens-${messageId}" style="font-size: 11px; color: #6c757d; margin-top: 5px;">Tokens: calculating...</div>
         </div>
     `;
+
     messages.insertAdjacentHTML('beforeend', messageHtml);
-    messages.scrollTop = messages.scrollHeight;
+    scrollToBottom();
+
+    return {
+        assistantContent: document.getElementById(`assistant-content-${messageId}`),
+        assistantTokens: document.getElementById(`assistant-tokens-${messageId}`)
+    };
+}
+
+// Хелпер для прокрутки чата вниз
+function scrollToBottom() {
+    const messagesDiv = document.getElementById('chat-messages');
+    if (messagesDiv) {
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
 }
 
 // Get auth headers
