@@ -147,13 +147,17 @@ public class TensorNameMapper
 
     // ── Internals ────────────────────────────────────────────────────────────
 
+    private readonly HashSet<string> _warnedMissing = [];
+
     private string Try(params string[] candidates)
     {
         foreach (var c in candidates)
             if (_allTensorNames.Contains(c)) return c;
 
-        // Nothing matched — return first candidate so caller gets a clear error
-        Console.WriteLine($"[Arch] Warning: none of [{string.Join(", ", candidates)}] found in GGUF");
+        // Log once per missing set to avoid spamming on every token generation
+        string key = candidates[0];
+        if (_warnedMissing.Add(key))
+            Console.WriteLine($"[Arch] Warning: none of [{string.Join(", ", candidates)}] found in GGUF");
         return candidates[0];
     }
 

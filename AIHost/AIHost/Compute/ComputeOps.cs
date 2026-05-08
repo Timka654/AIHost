@@ -1222,9 +1222,6 @@ public class ComputeOps : IDisposable
         int  seqLen      = tokenIds.Length;
         long bytesPerRow  = (long)quantizedTable.Buffer.Size / vocabSize;
 
-        Console.WriteLine($"[EmbedDbg] dtype={quantizedTable.DataType} shape=[{dModel},{vocabSize}]" +
-                          $" bufSize={quantizedTable.Buffer.Size} bytesPerRow={bytesPerRow}" +
-                          $" seqLen={seqLen} → small tensor=[{seqLen},{dModel}]");
 
         // Read one quantized row per token and pack them into a contiguous small buffer
         var packedBytes = new byte[seqLen * bytesPerRow];

@@ -402,15 +402,17 @@ public class ManagementController : ControllerBase
             // Auto-load model if not already loaded
             var model = await _modelManager.GetModelAsync(request.ModelName);
 
+            var modelConfig = _modelManager.GetModelConfig(request.ModelName);
             var config = new AIHost.Inference.GenerationConfig
             {
-                MaxNewTokens = request.MaxTokens ?? 512,
-                Temperature = request.Temperature ?? 0.7f,
-                TopK = request.TopK ?? 40,
-                TopP = request.TopP ?? 0.9f,
-                RepetitionPenalty = 1.1f,
-                Seed = -1,
-                UseKVCache = true
+                MaxNewTokens        = request.MaxTokens ?? modelConfig?.Parameters.MaxTokens ?? 512,
+                Temperature         = request.Temperature ?? modelConfig?.Parameters.Temperature ?? 0.7f,
+                TopK                = request.TopK ?? modelConfig?.Parameters.TopK ?? 40,
+                TopP                = request.TopP ?? modelConfig?.Parameters.TopP ?? 0.9f,
+                RepetitionPenalty   = modelConfig?.Parameters.RepetitionPenalty ?? 1.1f,
+                Seed                = modelConfig?.Parameters.Seed ?? -1,
+                UseKVCache          = modelConfig?.Parameters.UseKVCache ?? true,
+                StopSequences       = modelConfig?.Parameters.Stop.ToList() ?? []
             };
 
             var sw = System.Diagnostics.Stopwatch.StartNew();

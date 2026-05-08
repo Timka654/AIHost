@@ -557,7 +557,7 @@ public class Transformer : IDisposable
             headDim = qDim / _numHeads;
             kvDim   = (totalQKV - qDim) / 2;
             nKvH    = kvDim / headDim;
-            Console.WriteLine($"[LayerDbg] g={g} gatedAttn headDim={headDim} qDim={qDim} kvDim={kvDim} nKvH={nKvH}");
+            if (g == 0) Console.WriteLine($"[Attn] headDim={headDim} qDim={qDim} kvDim={kvDim} nKvH={nKvH}");
         }
         else
         {

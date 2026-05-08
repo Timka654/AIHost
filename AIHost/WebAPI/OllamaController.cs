@@ -345,7 +345,8 @@ public class OllamaController : ControllerBase
             UseKVCache = modelConfig.Parameters.UseKVCache,
             KVCacheQuantization = ParseKVCacheQuantization(modelConfig.Parameters.KVCacheQuantization),
             MaxPromptTokens = ComputeMaxPromptTokens(
-                modelContextLength, modelConfig.Parameters.ContextSize, modelConfig.Parameters.MaxTokens)
+                modelContextLength, modelConfig.Parameters.ContextSize, modelConfig.Parameters.MaxTokens),
+            StopSequences = modelConfig.Parameters.Stop.ToList()
         };
 
         // Override with request options

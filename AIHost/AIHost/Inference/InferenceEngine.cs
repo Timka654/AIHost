@@ -20,6 +20,8 @@ public class GenerationConfig
     public KVCacheQuantization KVCacheQuantization { get; set; } = KVCacheQuantization.None;
     /// <summary>Max prompt tokens before truncation (0 = no limit).</summary>
     public int MaxPromptTokens { get; set; } = 0;
+    /// <summary>Stop generation when any of these strings appears at the end of generated text.</summary>
+    public List<string> StopSequences { get; set; } = [];
 }
 
 /// <summary>
@@ -110,6 +112,18 @@ public class InferenceEngine : IInferenceEngine
         }
 
         int eosToken = _tokenizer.EosToken;
+
+        // Pre-encode stop sequences into token lists for fast suffix matching
+        var stopSeqTokens = config.StopSequences
+            .Select(s => _tokenizer.Encode(s, addBos: false, addEos: false))
+            .Where(seq => seq.Length > 0)
+            .ToList();
+
+        // Also find single-token equivalents (e.g. <|im_end|>) so we can stop immediately
+        var stopSingleTokens = new HashSet<int>(stopSeqTokens
+            .Where(s => s.Length == 1).Select(s => s[0]));
+        stopSingleTokens.Add(eosToken);
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         bool prefillDone = false;
         int generatedCount = 0;
@@ -150,9 +164,18 @@ public class InferenceEngine : IInferenceEngine
             generatedCount++;
             onToken?.Invoke(nextToken);
 
-            if (nextToken == eosToken)
+            if (stopSingleTokens.Contains(nextToken))
             {
-                _logger.LogDebug("[Inference] EOS at token {N}, total {Ms}ms", generatedCount, sw.ElapsedMilliseconds);
+                _logger.LogDebug("[Inference] Stop token {T} at {N}, total {Ms}ms", nextToken, generatedCount, sw.ElapsedMilliseconds);
+                break;
+            }
+
+            // Multi-token stop sequence check (suffix match on recent tokens)
+            if (stopSeqTokens.Any(seq =>
+                tokens.Count >= seq.Length &&
+                tokens.Skip(tokens.Count - seq.Length).SequenceEqual(seq)))
+            {
+                _logger.LogDebug("[Inference] Stop sequence matched at {N}, total {Ms}ms", generatedCount, sw.ElapsedMilliseconds);
                 break;
             }
         }
