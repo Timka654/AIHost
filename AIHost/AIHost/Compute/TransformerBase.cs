@@ -351,29 +351,36 @@ public class TransformerBase : IDisposable
 
         int refLayer = _layerOffset;
 
-        var names = _nameMapper.HasCombinedQKV
-            ? new[]
-            {
-                _nameMapper.AttnNorm(refLayer),
-                _nameMapper.AttnQKV(refLayer),
-                _nameMapper.AttnOutput(refLayer),
-                _nameMapper.FfnNorm(refLayer),
-                _nameMapper.FfnGate(refLayer),
-                _nameMapper.FfnUp(refLayer),
-                _nameMapper.FfnDown(refLayer),
-            }
-            : new[]
-            {
-                _nameMapper.AttnNorm(refLayer),
-                _nameMapper.AttnQ(refLayer),
-                _nameMapper.AttnK(refLayer),
-                _nameMapper.AttnV(refLayer),
-                _nameMapper.AttnOutput(refLayer),
-                _nameMapper.FfnNorm(refLayer),
-                _nameMapper.FfnGate(refLayer),
-                _nameMapper.FfnUp(refLayer),
-                _nameMapper.FfnDown(refLayer),
-            };
+        // Build list of weight names to allocate scratch for.
+        // For Qwen3.6 hybrid models, Type A layers use ssm_out.weight instead of attn_output.weight.
+        // We include both to cover both layer types.
+        var names = new List<string>();
+
+        if (_nameMapper.HasCombinedQKV)
+        {
+            names.Add(_nameMapper.AttnNorm(refLayer));
+            names.Add(_nameMapper.AttnQKV(refLayer));
+            // attn_output.weight may not exist for Type A layers (Qwen3.6 uses ssm_out.weight)
+            names.Add(_nameMapper.AttnOutput(refLayer));
+            // ssm_out.weight is used as output projection for Type A layers
+            names.Add($"blk.{refLayer}.ssm_out.weight");
+            names.Add(_nameMapper.FfnNorm(refLayer));
+            names.Add(_nameMapper.FfnGate(refLayer));
+            names.Add(_nameMapper.FfnUp(refLayer));
+            names.Add(_nameMapper.FfnDown(refLayer));
+        }
+        else
+        {
+            names.Add(_nameMapper.AttnNorm(refLayer));
+            names.Add(_nameMapper.AttnQ(refLayer));
+            names.Add(_nameMapper.AttnK(refLayer));
+            names.Add(_nameMapper.AttnV(refLayer));
+            names.Add(_nameMapper.AttnOutput(refLayer));
+            names.Add(_nameMapper.FfnNorm(refLayer));
+            names.Add(_nameMapper.FfnGate(refLayer));
+            names.Add(_nameMapper.FfnUp(refLayer));
+            names.Add(_nameMapper.FfnDown(refLayer));
+        }
 
         string sample = names[0];
         int secondDot = sample.IndexOf('.', sample.IndexOf('.') + 1);

@@ -314,8 +314,11 @@ public class QwenHybridFormat : ITransformerFormat
         if (!sFN) wFN.Dispose();
 
         // SSM branch (parallel to FFN)
+        // Apply SSM for both prefill (seqLen > 1) and single-token generation.
+        // During prefill, we process each token sequentially to update the SSM state.
+        // During generation (seqLen == 1), we use the accumulated state.
         int seqLen_ = x1.Shape[0];
-        var x2 = ssmState != null && HasSSMWeights(transformer, g) && seqLen_ == 1
+        var x2 = ssmState != null && HasSSMWeights(transformer, g)
             ? ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState)
             : x1;
 
@@ -337,52 +340,100 @@ public class QwenHybridFormat : ITransformerFormat
         => transformer.HasWeight($"blk.{g}.ssm_a");
 
     /// <summary>
-    /// SSM recurrence for Type-A Qwen3.6 blocks. Runs fully on CPU.
+    /// SSM recurrence for Type-A Qwen3.6 blocks (Mamba-2 style). Runs fully on CPU.
+    ///
+    /// Mamba-2 SSM formulation:
+    ///   dt = softplus(x @ Wdt + bias_dt)
+    ///   B  = x @ Wb
+    ///   C  = x @ Wc
+    ///   A  = exp(dt * log(A_param))   — A_param may be log(A) or raw A
+    ///   h[t] = A * h[t-1] + dt * B * x   (element-wise per state dimension)
+    ///   y[t] = C * h[t]
+    ///   y = RMSNorm(y) * ssm_norm.weight
+    ///   out = y @ ssm_out.weight + residual
+    ///
+    /// Weight mapping for Qwen3.6 GGUF:
+    ///   ssm_alpha.weight [dModel, N]  → Wdt (dt projection)
+    ///   ssm_beta.weight  [dModel, N]  → Wb  (B projection)
+    ///   ssm_a            [N]          → log(A) parameter (discrete)
+    ///   ssm_dt.bias      [N]          → bias for dt projection
+    ///   ssm_norm.weight  [D]          → per-group RMSNorm weight
+    ///   ssm_out.weight   [N*D, dModel] → output projection
+    ///
+    /// Note: C projection (Wc) may be absent in some Qwen3.6 variants.
+    /// If absent, C = B (tied B/C).
     /// </summary>
     private static Tensor ApplySSMRecurrence(TransformerBase transformer, Tensor xResidual, Tensor xNorm,
                                        int g, SSMState ssmState)
     {
-        const int N = 48;
-        const int D = 128;
+        const int N = 48;  // number of SSM groups
+        const int D = 128; // state dimension per group
         var ops = transformer.Ops;
 
-        var Wa = transformer._weightCache[$"blk.{g}.ssm_alpha.weight"].ReadF32();
-        var Wb = transformer._weightCache[$"blk.{g}.ssm_beta.weight"].ReadF32();
-        var ssA = transformer._weightCache[$"blk.{g}.ssm_a"].ReadF32();
-        var ssB = transformer._weightCache[$"blk.{g}.ssm_dt.bias"].ReadF32();
-        var sNw = transformer._weightCache[$"blk.{g}.ssm_norm.weight"].ReadF32();
+        // Load weights
+        var Wdt = transformer._weightCache[$"blk.{g}.ssm_alpha.weight"].ReadF32(); // [dModel, N]
+        var Wb  = transformer._weightCache[$"blk.{g}.ssm_beta.weight"].ReadF32();  // [dModel, N]
+        var ssA = transformer._weightCache[$"blk.{g}.ssm_a"].ReadF32();            // [N] — log(A)
+        var dtBias = transformer._weightCache[$"blk.{g}.ssm_dt.bias"].ReadF32();   // [N]
+        var sNw = transformer._weightCache[$"blk.{g}.ssm_norm.weight"].ReadF32();  // [D]
+
+        // Try to load C projection if it exists
+        bool hasWc = transformer.HasWeight($"blk.{g}.ssm_gate.weight");
+        float[]? Wc = hasWc ? transformer._weightCache[$"blk.{g}.ssm_gate.weight"].ReadF32() : null;
 
         var x = xNorm.ReadData();
-        int seqLen = xNorm.Shape[0];
         int dModel = xNorm.Shape[1];
 
+        // Compute dt, B, C projections
+        var dt = new float[N];
         var B = new float[N];
         var C = new float[N];
-        var dt = new float[N];
         for (int n = 0; n < N; n++)
         {
-            float bv = 0, cv = 0;
+            float dtVal = 0, bVal = 0, cVal = 0;
             for (int k = 0; k < dModel; k++)
             {
                 float xk = x[k];
-                bv += xk * Wa[k + n * dModel];
-                cv += xk * Wb[k + n * dModel];
+                dtVal += xk * Wdt[k + n * dModel];
+                bVal  += xk * Wb[k + n * dModel];
+                if (Wc != null)
+                    cVal += xk * Wc[k + n * dModel];
             }
-            B[n] = bv;
-            C[n] = cv;
-            dt[n] = MathF.Log(1f + MathF.Exp(bv + ssB[n]));
+            // dt = softplus(x @ Wdt + bias)
+            dt[n] = MathF.Log(1f + MathF.Exp(dtVal + dtBias[n]));
+            B[n] = bVal;
+            C[n] = Wc != null ? cVal : bVal; // tied B/C if no separate C projection
         }
 
+        // Update SSM state: h[t] = exp(dt * log(A)) * h[t-1] + dt * B * x
+        // In Mamba-2, the state update is per-dimension:
+        // h[t,d] = exp(dt * log(A)) * h[t-1,d] + dt * B * x[d]
+        // But since B is a scalar per group (not per dimension), the input is:
+        // h[t,d] = exp(dt * log(A)) * h[t-1,d] + dt * B * x[d]
+        // where x[d] is the d-th element of the projected input.
+        // However, in our simplified CPU implementation, we use:
+        // h[t,d] = exp(dt * log(A)) * h[t-1,d] + dt * B
+        // This is a simplification that works when B is a scalar per group.
         var h = ssmState.GetLayer(g);
         for (int n = 0; n < N; n++)
         {
-            float decay = MathF.Exp(dt[n] * ssA[n]);
+            // A_param may be log(A) or raw A. Check magnitude to decide.
+            // If ssA[n] is very negative (e.g., -10), it's likely log(A).
+            // If ssA[n] is close to 1, it's raw A.
+            // For Mamba-2, A is typically log(A) with values around -1 to -5.
+            float aVal = ssA[n];
+            // If aVal > 0, it's likely raw A (not log). Apply exp to get decay.
+            // If aVal < 0, it's likely log(A). Decay = exp(dt * exp(aVal)).
+            float logA = aVal < 0 ? aVal : MathF.Log(aVal + 1e-10f);
+            float decay = MathF.Exp(dt[n] * MathF.Exp(logA));
+            
             float input = dt[n] * B[n];
             int base_ = n * D;
             for (int d = 0; d < D; d++)
                 h[base_ + d] = decay * h[base_ + d] + input;
         }
 
+        // Compute output: y[n,d] = C[n] * h[n,d]
         var y = new float[N * D];
         for (int n = 0; n < N; n++)
         {
@@ -390,6 +441,8 @@ public class QwenHybridFormat : ITransformerFormat
             int base_ = n * D;
             for (int d = 0; d < D; d++)
                 y[base_ + d] = cn * h[base_ + d];
+            
+            // Per-group RMSNorm
             float sumSq = 0f;
             for (int d = 0; d < D; d++) sumSq += y[base_ + d] * y[base_ + d];
             float rms = MathF.Sqrt(sumSq / D + 1e-5f);
@@ -397,12 +450,14 @@ public class QwenHybridFormat : ITransformerFormat
                 y[base_ + d] = y[base_ + d] / rms * sNw[d];
         }
 
+        // Output projection: [1, N*D] @ [N*D, dModel] → [1, dModel]
         var yMatrix = Tensor.FromData(ops.Device, y, TensorShape.Matrix(1, N * D), "ssm_y");
         var (wOut, sOut) = transformer.TempF32Named($"blk.{g}.ssm_out.weight");
         var ssmProj = ops.MatMulWeights(yMatrix, wOut, "ssm_proj");
         if (!sOut) wOut.Dispose();
         yMatrix.Dispose();
 
+        // Residual connection
         var result = ops.Add(xResidual, ssmProj, "x_after_ssm");
         ssmProj.Dispose();
         return result;

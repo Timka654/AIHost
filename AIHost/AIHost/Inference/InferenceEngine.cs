@@ -278,6 +278,18 @@ public class InferenceEngine : IInferenceEngine
                         int rankComma = Array.FindIndex(sorted, x => x.i == 1919);
                         _logger.LogTrace("[LogitCmp] 'quin'(24150)=rank{RankQuin},logit{LQuin:F3} | ' ,'(1919)=rank{RankComma},logit{LComma:F3}", rankQuin+1, lastLogits[24150], rankComma+1, lastLogits[1919]);
                         _logger.LogTrace("[LogitCmp] top1={Id}('{Tok}')={Val:F3}", sorted[0].i, _tokenizer.GetToken(sorted[0].i), sorted[0].v);
+                        // Print top-5 tokens for debugging
+                        _logger.LogWarning("[LogitCmp] Top-5 tokens at first step:");
+                        for (int t = 0; t < 5 && t < sorted.Length; t++)
+                        {
+                            var tokStr = _tokenizer.GetToken(sorted[t].i);
+                            _logger.LogWarning("  #{Rank}: id={Id} token='{Tok}' logit={Logit:F4}",
+                                t + 1, sorted[t].i, tokStr, sorted[t].v);
+                        }
+                        // Print statistics
+                        float maxL = sorted[0].v, minL = sorted[^1].v, meanL = lastLogits.Average();
+                        _logger.LogWarning("[LogitCmp] Stats: max={Max:F4} min={Min:F4} mean={Mean:F4} range={Range:F4}",
+                            maxL, minL, meanL, maxL - minL);
                     }
                 }
                 finally

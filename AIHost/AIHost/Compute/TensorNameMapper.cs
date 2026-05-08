@@ -43,6 +43,36 @@ public class TensorNameMapper
                 Console.WriteLine($"  {n}");
         }
 
+        // Print shapes for key tensors in layers 0 and 3 (Type A and Type B representatives)
+        foreach (var layer in new[] { 0, 3 })
+        {
+            var layerTensors = model.Tensors
+                .Where(t => t.Name.StartsWith($"blk.{layer}."))
+                .OrderBy(t => t.Name)
+                .ToList();
+            if (layerTensors.Count > 0)
+            {
+                Console.WriteLine($"[Arch] Layer-{layer} tensor shapes:");
+                foreach (var t in layerTensors)
+                {
+                    var shapeStr = string.Join("×", t.Shape.Select(s => s.ToString()));
+                    Console.WriteLine($"  {t.Name} [{shapeStr}] type={t.Type}");
+                }
+            }
+        }
+
+        // Print SSM metadata
+        var meta = model.Metadata;
+        Console.WriteLine("[Arch] SSM metadata:");
+        foreach (var key in new[] { "ssm.inner_size", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank",
+                                     "attention.key_length", "attention.value_length",
+                                     "attention.head_count", "attention.head_count_kv",
+                                     "embedding_length", "block_count" })
+        {
+            var val = meta.GetArchValue<object>(key);
+            Console.WriteLine($"  {key} = {val ?? "(not found)"}");
+        }
+
         // Detect and warn about special architectures
         if (HasAny("attn_q_a.weight", "attn_kv_a_mqa.weight"))
             Console.WriteLine("[Arch] MLA attention detected (DeepSeek-style) — not fully supported");
