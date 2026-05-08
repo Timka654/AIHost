@@ -33,7 +33,8 @@ public class InferenceEngine : IInferenceEngine
     private readonly BPETokenizer _tokenizer;
     private readonly ComputeOps _ops;
     private Random _random;
-    private KVCache? _kvCache;
+    private KVCache?   _kvCache;
+    private SSMState?  _ssmState;
     private bool _disposed;
     private readonly int _batchSize;
     private readonly ILogger<InferenceEngine> _logger = AppLogger.Create<InferenceEngine>();
@@ -103,14 +104,17 @@ public class InferenceEngine : IInferenceEngine
 
         if (config.UseKVCache)
         {
-            if (_kvCache == null)
-                _kvCache = new KVCache(_ops);
-            else
-                _kvCache.Clear();
+            if (_kvCache == null)   _kvCache   = new KVCache(_ops);
+            else                    _kvCache.Clear();
+            // SSMState travels with the KV cache — reset together so the
+            // recurrent hidden state is consistent with the KV sequence length.
+            if (_ssmState == null)  _ssmState  = new SSMState();
+            else                    _ssmState.Clear();
         }
         else
         {
             _kvCache?.Clear();
+            _ssmState?.Clear();
         }
 
         int eosToken = _tokenizer.EosToken;
@@ -145,7 +149,7 @@ public class InferenceEngine : IInferenceEngine
                 : tokens.ToArray();
 
             var iterSw = System.Diagnostics.Stopwatch.StartNew();
-            var logits = _model.Forward(inputTokens, startPos, _kvCache);
+            var logits = _model.Forward(inputTokens, startPos, _kvCache, _ssmState);
             var lastLogits = ExtractLastToken(logits);
             logits.Dispose();
 
@@ -367,6 +371,7 @@ public class InferenceEngine : IInferenceEngine
     {
         if (_disposed) return;
         _kvCache?.Dispose();
+        _ssmState?.Dispose();
         _disposed = true;
     }
 }

@@ -195,10 +195,11 @@ public class Transformer : IDisposable
     /// Run the locally-loaded layers on activation tensor x.
     /// KV-cache uses LOCAL layer indices (0-based for this device).
     /// </summary>
-    public Tensor ForwardLayers(Tensor x, uint startPos, KVCache? cache = null)
+    public Tensor ForwardLayers(Tensor x, uint startPos, KVCache? cache = null,
+                                 AIHost.Inference.SSMState? ssmState = null)
     {
         for (int i = 0; i < _localLayerCount; i++)
-            x = ApplyLayer(x, i, startPos, cache);
+            x = ApplyLayer(x, i, startPos, cache, ssmState);
         return x;
     }
 
@@ -364,7 +365,8 @@ public class Transformer : IDisposable
     /// <summary>
     /// Forward pass through transformer.
     /// </summary>
-    public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null)
+    public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null,
+                           AIHost.Inference.SSMState? ssmState = null)
     {
         if (_nameMapper == null)
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
@@ -378,7 +380,7 @@ public class Transformer : IDisposable
 
         // 2. All transformer layers
         for (int i = 0; i < _numLayers; i++)
-            x = ApplyLayer(x, i, startPosition, kvCache);
+            x = ApplyLayer(x, i, startPosition, kvCache, ssmState);
 
         // 3. Final layer norm
         {
@@ -399,7 +401,8 @@ public class Transformer : IDisposable
         return logits;
     }
 
-    private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null)
+    private Tensor ApplyLayer(Tensor x, int layerIdx, uint position, KVCache? kvCache = null,
+                               AIHost.Inference.SSMState? ssmState = null)
     {
         int g  = layerIdx + _layerOffset;
         var nm = _nameMapper!;
@@ -419,7 +422,7 @@ public class Transformer : IDisposable
             return ApplyLayerTypeB(x, g, layerIdx, position, kvCache);  // Type B
 
         if (hasCombinedQKV)
-            return ApplyLayerCombinedQKV(x, g, layerIdx, position, kvCache, nm);
+            return ApplyLayerCombinedQKV(x, g, layerIdx, position, kvCache, nm, ssmState);
         int seqLen = x.Shape[0];
 
         // Batch mode (one fence wait per layer): fast for generation (seqLen=1, tiny matrices).
@@ -622,6 +625,106 @@ public class Transformer : IDisposable
         return (_ops.Dequantize(cached), false);
     }
 
+    private bool HasSSMWeights(int g)
+        => _weightCache.ContainsKey($"blk.{g}.ssm_a");
+
+    /// <summary>
+    /// SSM recurrence for Type-A Qwen3.6 blocks. Runs fully on CPU to avoid
+    /// new GPU shader complexity; the state is only 6 144 floats (24 KB) per layer.
+    ///
+    /// Computation (ZOH discretisation, seqLen=1 autoregressive case):
+    ///   B  = x_in  @ W_alpha.T           [48]  — input-dependent B
+    ///   C  = x_in  @ W_beta.T            [48]  — input-dependent C
+    ///   dt = softplus(B + ssm_dt_bias)   [48]
+    ///   For each group g (0..47) and each d (0..127):
+    ///     h[g*128+d] = exp(dt[g]*A[g]) * h[g*128+d]  +  dt[g]*B[g]
+    ///   y[g*128:(g+1)*128] = C[g] * h[g*128:(g+1)*128]
+    ///   y  = RMSNorm(y, ssm_norm)        [6144]
+    ///   ssm_proj = y → GPU → MatMulWeights(ssm_out) → [5120]
+    ///   return x_residual + ssm_proj
+    /// </summary>
+    private Tensor ApplySSMRecurrence(Tensor xResidual, Tensor xNorm,
+                                       int g, AIHost.Inference.SSMState ssmState)
+    {
+        const int N  = 48;   // number of SSM groups
+        const int D  = 128;  // dims per group
+
+        // ── Read weights from cache (all F32) ──────────────────────────────
+        var Wa  = _weightCache[$"blk.{g}.ssm_alpha.weight"].Buffer.Read<float>(); // [5120,48] col-major
+        var Wb  = _weightCache[$"blk.{g}.ssm_beta.weight"].Buffer.Read<float>();  // [5120,48] col-major
+        var ssA = _weightCache[$"blk.{g}.ssm_a"].Buffer.Read<float>();            // [48]
+        var ssB = _weightCache[$"blk.{g}.ssm_dt.bias"].Buffer.Read<float>();      // [48]
+        var sNw = _weightCache[$"blk.{g}.ssm_norm.weight"].Buffer.Read<float>();  // [128]
+
+        // ── Pull current token's normed hidden state to CPU ─────────────────
+        var x = xNorm.ReadData();  // [seqLen, 5120]; for generation seqLen=1
+        int seqLen = xNorm.Shape[0];
+        int dModel = xNorm.Shape[1];
+
+        // ── Compute B, C, dt (CPU matmul: seqLen=1 so just dot products) ────
+        var B  = new float[N];
+        var C  = new float[N];
+        var dt = new float[N];
+        // Wa/Wb stored as (5120,48) GGUF col-major → Wa[k + n*5120]
+        for (int n = 0; n < N; n++)
+        {
+            float bv = 0, cv = 0;
+            for (int k = 0; k < dModel; k++)
+            {
+                float xk = x[k]; // last token (seqLen-1)*dModel + k
+                bv += xk * Wa[k + n * dModel];
+                cv += xk * Wb[k + n * dModel];
+            }
+            B[n] = bv;
+            C[n] = cv;
+            // dt = softplus(B + bias)
+            dt[n] = MathF.Log(1f + MathF.Exp(bv + ssB[n]));
+        }
+
+        // ── Update SSM state h [6144] ────────────────────────────────────────
+        var h = ssmState.GetLayer(g);
+        for (int n = 0; n < N; n++)
+        {
+            float decay = MathF.Exp(dt[n] * ssA[n]);   // A stored as negative log(|A|)
+            float input = dt[n] * B[n];
+            int   base_ = n * D;
+            for (int d = 0; d < D; d++)
+                h[base_ + d] = decay * h[base_ + d] + input;
+        }
+
+        // ── Compute output y = C * h, then per-group RMSNorm ────────────────
+        var y = new float[N * D];
+        for (int n = 0; n < N; n++)
+        {
+            float cn = C[n];
+            int base_ = n * D;
+
+            // y[group] = C[n] * h[group]
+            for (int d = 0; d < D; d++)
+                y[base_ + d] = cn * h[base_ + d];
+
+            // RMSNorm per group (weight sNw [128])
+            float sumSq = 0f;
+            for (int d = 0; d < D; d++) sumSq += y[base_ + d] * y[base_ + d];
+            float rms = MathF.Sqrt(sumSq / D + 1e-5f);
+            for (int d = 0; d < D; d++)
+                y[base_ + d] = y[base_ + d] / rms * sNw[d];
+        }
+
+        // ── Project y [6144] → GPU → ssm_out [6144→5120] ────────────────────
+        var yMatrix = Tensor.FromData(_ops.Device, y, TensorShape.Matrix(1, N * D), "ssm_y");
+
+        var (wOut, sOut) = TempF32Named($"blk.{g}.ssm_out.weight");
+        var ssmProj = _ops.MatMulWeights(yMatrix, wOut, "ssm_proj");
+        if (!sOut) wOut.Dispose();
+        yMatrix.Dispose();
+
+        // ── Add SSM contribution to residual ─────────────────────────────────
+        var result = _ops.Add(xResidual, ssmProj, "x_after_ssm");
+        ssmProj.Dispose();
+        return result;
+    }
+
     private Tensor ApplyLayerSSMFallback(Tensor x, int g, TensorNameMapper nm)
     {
         // Skip the SSM computation entirely — just pass x through with FFN if available.
@@ -657,7 +760,8 @@ public class Transformer : IDisposable
     /// n_embd != n_heads * head_dim (typical in GQA models).
     /// </summary>
     private Tensor ApplyLayerCombinedQKV(Tensor x, int g, int layerIdx, uint position,
-                                          KVCache? kvCache, TensorNameMapper nm)
+                                          KVCache? kvCache, TensorNameMapper nm,
+                                          AIHost.Inference.SSMState? ssmState = null)
     {
 
         // Attention: xnorm → QKV → split
@@ -739,20 +843,30 @@ public class Transformer : IDisposable
         var x1 = _ops.Add(x, attnProj, "x_after_attn");
         attnProj.Dispose();
 
-        // FFN
-        var x1Norm = _ops.Clone(x1, "ffn_norm_in");
+        // Post-attention norm: shared pre-norm for both SSM and FFN branches
+        var x1Norm = _ops.Clone(x1, "post_attn_norm_in");
         var (wFN, sFN) = TempF32(nm.FfnNorm(g));
         _ops.LayerNorm(x1Norm, wFN);
         if (!sFN) wFN.Dispose();
 
+        // ── SSM branch (parallel to FFN) ────────────────────────────────────
+        // The SSM uses x1Norm as input, maintains recurrent state h [6144],
+        // and adds its output to the residual alongside FFN.
+        var x2 = ssmState != null && HasSSMWeights(g)
+            ? ApplySSMRecurrence(x1, x1Norm, g, ssmState)
+            : x1;
+
+        // ── FFN branch ────────────────────────────────────────────────────────
         var (wG, sG) = TempF32(nm.FfnGate(g));
         var (wU, sU) = TempF32(nm.FfnUp(g));
         var (wD, sD) = TempF32(nm.FfnDown(g));
         var ffnOut = _ops.FeedForward(x1Norm, wG, wU, wD, "ffn_out");
         if (!sG) wG.Dispose(); if (!sU) wU.Dispose(); if (!sD) wD.Dispose();
         x1Norm.Dispose();
-        var output = _ops.Add(x1, ffnOut, "layer_out");
-        x1.Dispose(); ffnOut.Dispose(); x.Dispose();
+
+        var output = _ops.Add(x2, ffnOut, "layer_out");
+        if (!ReferenceEquals(x1, x2)) { x1.Dispose(); } // x2 may own x1's reference via SSM
+        x2.Dispose(); ffnOut.Dispose(); x.Dispose();
         return output;
     }
 
@@ -808,13 +922,20 @@ public class Transformer : IDisposable
         if (layerHasCombined)
             TryCacheWeight(nm.AttnOutput(globalLayer));
 
-        // FFN weights — present in most layers
+        // FFN / post-attention norm
         TryCacheWeight(nm.FfnNorm(globalLayer));
-        // post_attention_norm: used as FFN pre-norm in Type B, as SSM pre-norm in Type A
         TryCacheWeight($"blk.{globalLayer}.post_attention_norm.weight");
         TryCacheWeight(nm.FfnGate(globalLayer));
         TryCacheWeight(nm.FfnUp(globalLayer));
         TryCacheWeight(nm.FfnDown(globalLayer));
+
+        // SSM weights (Type A blocks only; all F32 so no dequantization overhead except ssm_out)
+        TryCacheWeight($"blk.{globalLayer}.ssm_a");
+        TryCacheWeight($"blk.{globalLayer}.ssm_alpha.weight");
+        TryCacheWeight($"blk.{globalLayer}.ssm_beta.weight");
+        TryCacheWeight($"blk.{globalLayer}.ssm_dt.bias");
+        TryCacheWeight($"blk.{globalLayer}.ssm_norm.weight");
+        TryCacheWeight($"blk.{globalLayer}.ssm_out.weight");
     }
 
     /// <summary>Cache a weight only if it exists in the GGUF file (skips optional/absent tensors).</summary>
