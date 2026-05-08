@@ -43,6 +43,26 @@ public class Tensor : IDisposable
     }
 
     /// <summary>
+    /// Прочитать данные из тензора с авто-конвертацией F16→F32
+    /// </summary>
+    public float[] ReadF32()
+    {
+        if (DataType == DataType.F32)
+            return Buffer.Read<float>();
+
+        if (DataType == DataType.F16)
+        {
+            var raw = Buffer.Read<ushort>();
+            var result = new float[raw.Length];
+            for (int i = 0; i < raw.Length; i++)
+                result[i] = HalfToFloat(raw[i]);
+            return result;
+        }
+
+        throw new InvalidOperationException($"ReadF32: unsupported dtype {DataType}");
+    }
+
+    /// <summary>
     /// Прочитать данные из тензора
     /// </summary>
     public float[] ReadData()
@@ -51,6 +71,39 @@ public class Tensor : IDisposable
             throw new InvalidOperationException("ReadData supports only F32 tensors");
 
         return Buffer.Read<float>();
+    }
+
+    /// <summary>IEEE 754 binary16 → float conversion (no intrinsics).</summary>
+    private static float HalfToFloat(ushort h)
+    {
+        uint sign = (uint)((h >> 15) & 1);
+        uint exp = (uint)((h >> 10) & 0x1F);
+        uint mant = (uint)(h & 0x3FF);
+
+        if (exp == 0)
+        {
+            // Subnormal / zero
+            if (mant == 0) return sign == 0 ? 0f : -0f;
+            // Normalize subnormal
+            int shift = 10;
+            while ((mant & 0x400) == 0) { mant <<= 1; shift--; }
+            exp = (uint)(1 - shift + 127);
+            mant = (mant & 0x3FF) << 13;
+        }
+        else if (exp == 0x1F)
+        {
+            // Inf / NaN
+            exp = 0xFF;
+            mant <<= 13;
+        }
+        else
+        {
+            exp = exp + 127 - 15;
+            mant <<= 13;
+        }
+
+        uint f32 = (sign << 31) | (exp << 23) | mant;
+        return BitConverter.ToSingle(BitConverter.GetBytes(f32), 0);
     }
 
     /// <summary>

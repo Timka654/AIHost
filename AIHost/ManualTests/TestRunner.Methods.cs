@@ -831,7 +831,7 @@ void main() {
         Console.WriteLine($"✓ Model loaded: {model.Tensors.Count} tensors\n");
 
         // Create transformer (owns its ComputeOps internally)
-        var transformer = new Compute.Transformer(provider, model);
+        var transformer = Compute.TransformerFactory.Create(provider, model);
         transformer.LoadWeights();
 
         // Load real tokenizer from GGUF metadata

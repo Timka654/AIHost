@@ -49,7 +49,7 @@ public class MultiGPUTransformer : IDisposable
 {
     private readonly IComputeDevice[] _devices;
     private readonly IGGUFModel[] _models;   // one per device
-    private readonly Transformer[] _transformers;
+    private readonly TransformerBase[] _transformers;
     private readonly int[] _deviceFirstLayer; // global layer index where each device starts
     private bool _disposed;
     private readonly ILogger<MultiGPUTransformer> _logger = AppLogger.Create<MultiGPUTransformer>();
@@ -77,7 +77,7 @@ public class MultiGPUTransformer : IDisposable
         _models = devices.Select(modelFactory).ToArray();
 
         // Determine total layer count from first model
-        var tempXfm = new Transformer(devices[0], _models[0]);
+        var tempXfm = TransformerFactory.Create(devices[0], _models[0]);
         int numLayers = tempXfm.LayerCount;
         tempXfm.Dispose();
 
@@ -103,10 +103,10 @@ public class MultiGPUTransformer : IDisposable
         // Device 0 always owns the embedding AND the head (lm_head + output_norm)
         // so the large head tensors stay on the primary GPU regardless of layer split.
         // All other devices carry only their assigned transformer layers.
-        _transformers = new Transformer[n];
+        _transformers = new TransformerBase[n];
         for (int d = 0; d < n; d++)
         {
-            _transformers[d] = new Transformer(devices[d], _models[d]);
+            _transformers[d] = TransformerFactory.Create(devices[d], _models[d]);
             _transformers[d].LoadWeightsPartial(
                 globalFirstLayer: _deviceFirstLayer[d],
                 globalLastLayer:  _deviceFirstLayer[d + 1],

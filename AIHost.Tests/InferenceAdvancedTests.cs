@@ -15,7 +15,7 @@ namespace AIHost.Tests;
 public class InferenceFixture : IDisposable
 {
     public IComputeDevice Device { get; }
-    public Transformer Model { get; }
+    public TransformerBase Model { get; }
     public BPETokenizer Tokenizer { get; }
     public InferenceEngine Engine { get; }
 
@@ -30,7 +30,7 @@ public class InferenceFixture : IDisposable
         Device = new VulkanComputeDevice();
         _ggufModel = new GGUFModel(modelPath, Device);
 
-        Model = new Transformer(Device, _ggufModel);
+        Model = TransformerFactory.Create(Device, _ggufModel);
         Model.LoadWeights();
 
         Tokenizer = BPETokenizer.FromGGUF(_ggufModel.Reader);

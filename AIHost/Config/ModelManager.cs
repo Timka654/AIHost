@@ -274,7 +274,7 @@ public class ModelManager : IDisposable
                 config.EnableMmap, config.EnableMlock,
                 requireDeviceLocal: !config.AllowSharedMemory);
             var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
-            var transformer = new Transformer(device, ggufModel);
+            var transformer = TransformerFactory.Create(device, ggufModel);
             transformer.LoadWeights();
             engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize);
         }

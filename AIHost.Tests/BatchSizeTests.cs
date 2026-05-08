@@ -131,9 +131,9 @@ internal class MockGGUFModel : IGGUFModel
     public void Dispose() { }
 }
 
-internal class MockTransformer : Transformer
+internal class MockTransformer : TransformerBase
 {
-    public MockTransformer(IComputeDevice device, IGGUFModel model) : base(device, model) { }
+    public MockTransformer(IComputeDevice device, IGGUFModel model) : base(device, model, new AIHost.Compute.Formats.LlamaFormat()) { }
 }
 
 internal class MockBPETokenizer : BPETokenizer

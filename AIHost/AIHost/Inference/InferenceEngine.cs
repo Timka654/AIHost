@@ -29,7 +29,7 @@ public class GenerationConfig
 /// </summary>
 public class InferenceEngine : IInferenceEngine
 {
-    private readonly Transformer _model;
+    private readonly TransformerBase _model;
     private readonly BPETokenizer _tokenizer;
     private readonly ComputeOps _ops;
     private Random _random;
@@ -43,7 +43,7 @@ public class InferenceEngine : IInferenceEngine
     public int BatchSize => _batchSize;
     public int ContextLength => _model.ContextLength;
 
-    public InferenceEngine(Transformer model, BPETokenizer tokenizer, ComputeOps ops, int batchSize = 8)
+    public InferenceEngine(TransformerBase model, BPETokenizer tokenizer, ComputeOps ops, int batchSize = 8)
     {
         _model = model;
         _tokenizer = tokenizer;
