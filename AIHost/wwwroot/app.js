@@ -718,9 +718,7 @@ async function sendChatMessage() {
                 for (const line of lines) {
                     try {
                         const data = JSON.parse(line);
-
-                        // Совместимость с Ollama: /api/generate отдает `response`, /api/chat отдает `message.content`
-                        const chunkText = data.response || data.message?.content || '';
+                        const chunkText = data.token || data.response || data.message?.content || '';
 
                         if (chunkText) {
                             fullText += chunkText;
