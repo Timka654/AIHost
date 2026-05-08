@@ -44,8 +44,11 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     public string Generate(string prompt, GenerationConfig config,
                             CancellationToken cancellationToken = default)
     {
-        var tokens = Run(prompt, config, onToken: null, cancellationToken);
-        return _tokenizer.Decode(tokens.ToArray());
+        var promptTokens = _tokenizer.Encode(prompt, addBos: true, addEos: false).ToList();
+        var allTokens = Run(prompt, config, onToken: null, cancellationToken);
+        // Return only newly generated tokens (skip prompt tokens)
+        var newTokens = allTokens.Skip(promptTokens.Count).ToArray();
+        return _tokenizer.Decode(newTokens);
     }
 
     public void GenerateStreaming(string prompt, GenerationConfig config,

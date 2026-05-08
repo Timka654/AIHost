@@ -500,7 +500,9 @@ public class ManagementController : ControllerBase
             var response = model.Engine.Generate(formattedPrompt, config, ct);
             sw.Stop();
 
-            var tokenCount = response.Length;
+            // Count actual tokens by encoding the response
+            var responseTokens = model.Engine.Tokenizer.Encode(response, addBos: false, addEos: false);
+            var tokenCount = responseTokens.Length;
             var tps = sw.Elapsed.TotalSeconds > 0 ? tokenCount / sw.Elapsed.TotalSeconds : 0;
             _modelManager.UpdateModelStats(request.ModelName, request.Message, tps);
 
