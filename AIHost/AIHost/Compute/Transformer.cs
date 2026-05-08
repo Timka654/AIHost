@@ -36,9 +36,10 @@ public class Transformer : IDisposable
 
     // For multi-GPU: offset added to local layer index when looking up weight names.
     // Default 0 (single-GPU). Device 1 handling global layers 11-21 sets this to 11.
-    private int _layerOffset = 0;
-    private int _localLayerCount;
-    private int _numKVHeads;
+    private int   _layerOffset = 0;
+    private int   _localLayerCount;
+    private int   _numKVHeads;
+    private float _ropeFreqBase = 10000.0f;   // read from GGUF; Qwen3.6 = 10_000_000
     private TensorNameMapper? _nameMapper; // set after weights are loaded
 
     public int LayerCount => _numLayers;
@@ -75,6 +76,7 @@ public class Transformer : IDisposable
         ContextLength = ArchInt("context_length", 0);
 
         var ropeFreqBase = ArchFlt("rope.freq_base", 10000.0f);
+        _ropeFreqBase = ropeFreqBase;
         var ffnLength    = ArchInt("feed_forward_length", 0);
         var ropeDimCount = ArchInt("rope.dimension_count", _dModel / _numHeads);
         var rmsEps       = ArchFlt("attention.layer_norm_rms_epsilon", 1e-5f);
@@ -541,8 +543,8 @@ public class Transformer : IDisposable
         // 5. RoPE (n_q_heads=24, n_kv_heads=4, head_dim=256)
         int nQH = qDim / headDim;       // 24
         int nKVH = K.Shape[1] / headDim; // 4
-        _ops.ApplyRoPEFull(gatedQ, position, nQH,  headDim);
-        _ops.ApplyRoPEFull(K,      position, nKVH, headDim);
+        _ops.ApplyRoPEFull(gatedQ, position, nQH,  headDim, _ropeFreqBase);
+        _ops.ApplyRoPEFull(K,      position, nKVH, headDim, _ropeFreqBase);
 
         // 6. GQA
         Tensor attnOut;
@@ -811,8 +813,8 @@ public class Transformer : IDisposable
         qkv.Dispose();
         // xNorm intentionally NOT disposed yet — needed for gate computation below.
 
-        _ops.ApplyRoPEFull(Q, position, _numHeads, headDim);
-        _ops.ApplyRoPEFull(K, position, nKvH,      headDim);
+        _ops.ApplyRoPEFull(Q, position, _numHeads, headDim, _ropeFreqBase);
+        _ops.ApplyRoPEFull(K, position, nKvH,      headDim, _ropeFreqBase);
 
         Tensor attnOut;
         if (kvCache != null)
