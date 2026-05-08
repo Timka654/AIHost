@@ -604,16 +604,27 @@ public class ModelInstance : IDisposable
     public bool IsActive => _activeRequests > 0;
 
     /// <summary>
-    /// Call at request start; returns an IDisposable that decrements on dispose.
+    /// Call at request start; returns an IDisposable that decrements on Dispose.
+    /// Also bumps LastRequestAt so the auto-unload idle timer resets from
+    /// when the request STARTS — not from when it finishes (which could be
+    /// 9+ minutes later for long generations on slow hardware).
     /// Usage: using var _ = model.TrackRequest();
     /// </summary>
     public IDisposable TrackRequest()
     {
         Interlocked.Increment(ref _activeRequests);
+        // Touch LastRequestAt at request START so the idle clock resets now.
+        lock (_statsLock) { LastRequestAt = DateTime.UtcNow; }
         return new RequestScope(this);
     }
 
-    private void ReleaseRequest() => Interlocked.Decrement(ref _activeRequests);
+    private void ReleaseRequest()
+    {
+        Interlocked.Decrement(ref _activeRequests);
+        // Touch LastRequestAt at request END too so the full idle window is
+        // measured from when the client last received a response.
+        lock (_statsLock) { LastRequestAt = DateTime.UtcNow; }
+    }
 
     private sealed class RequestScope(ModelInstance owner) : IDisposable
     {
