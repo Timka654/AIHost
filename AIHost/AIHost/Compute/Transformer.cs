@@ -850,9 +850,11 @@ public class Transformer : IDisposable
         if (!sFN) wFN.Dispose();
 
         // ── SSM branch (parallel to FFN) ────────────────────────────────────
-        // The SSM uses x1Norm as input, maintains recurrent state h [6144],
-        // and adds its output to the residual alongside FFN.
-        var x2 = ssmState != null && HasSSMWeights(g)
+        // Only active during single-token generation (seqLen=1).
+        // During prefill (seqLen>1) we skip SSM: the state will warm up
+        // naturally as generation tokens arrive one by one.
+        int seqLen_ = x1.Shape[0];
+        var x2 = ssmState != null && HasSSMWeights(g) && seqLen_ == 1
             ? ApplySSMRecurrence(x1, x1Norm, g, ssmState)
             : x1;
 
