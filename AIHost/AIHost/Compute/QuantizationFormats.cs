@@ -85,41 +85,41 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint blk = gid / 256u;
     uint e   = gid % 256u;
-    uint off = blk * 110u;          // 110 bytes per block
+    uint off = blk * 110u;
 
-    // ggml dequantize_row_q3_K: same grouped layout as Q2_K for qs and hmask
     uint chunk  = e / 128u;
     uint local  = e % 128u;
     uint qs_idx = chunk * 32u + (local % 32u);
     uint shift  = (local / 32u) * 2u;
 
-    // Lower 2 bits from qs at offset 32
     uint low2 = (readU8(off + 32u + qs_idx) >> shift) & 3u;
 
-    // High 1 bit from hmask at offset 0: hmask[local%32] bit (chunk*4 + local/32)
     uint hm_idx = local % 32u;
     uint hm_bit = chunk * 4u + (local / 32u);
     uint high1  = (readU8(off + hm_idx) >> hm_bit) & 1u;
 
-    // 3-bit signed value: high1=1 → no subtract, high1=0 → subtract 4
     int qval = int(low2 | (high1 << 2u)) - 4;
 
-    // Scale decoding: ggml applies aux[] transform to scales[12] at offset 96.
-    // For scale index is = e/16, aux_group = is/4, k = is%4:
-    //   aux[0][k] = (raw[k]   & 0xF) | (((raw[8+k]>>0)&3)<<4)
-    //   aux[1][k] = (raw[k+4] & 0xF) | (((raw[8+k]>>2)&3)<<4)
-    //   aux[2][k] = (raw[k]  >>4)    | (((raw[8+k]>>4)&3)<<4)
-    //   aux[3][k] = (raw[k+4]>>4)    | (((raw[8+k]>>6)&3)<<4)
     uint is_sc  = e / 16u;
     uint k      = is_sc % 4u;
     uint ag     = is_sc / 4u;
     uint sc_off = off + 96u;
     uint tmp_b  = readU8(sc_off + 8u + k);
-    uint rk, scale_byte;
-    if      (ag == 0u) { rk = readU8(sc_off + k);     scale_byte = (rk & 0xFu) | (((tmp_b >> 0u) & 3u) << 4u); }
-    else if (ag == 1u) { rk = readU8(sc_off + k + 4u); scale_byte = (rk & 0xFu) | (((tmp_b >> 2u) & 3u) << 4u); }
-    else if (ag == 2u) { rk = readU8(sc_off + k);     scale_byte = ((rk >> 4u) & 0xFu) | (((tmp_b >> 4u) & 3u) << 4u); }
-    else               { rk = readU8(sc_off + k + 4u); scale_byte = ((rk >> 4u) & 0xFu) | (((tmp_b >> 6u) & 3u) << 4u); }
+    uint rk;
+    uint scale_byte;
+    if (ag == 0u) {
+        rk = readU8(sc_off + k);
+        scale_byte = (rk & 0xFu) | (((tmp_b >> 0u) & 3u) << 4u);
+    } else if (ag == 1u) {
+        rk = readU8(sc_off + k + 4u);
+        scale_byte = (rk & 0xFu) | (((tmp_b >> 2u) & 3u) << 4u);
+    } else if (ag == 2u) {
+        rk = readU8(sc_off + k);
+        scale_byte = ((rk >> 4u) & 0xFu) | (((tmp_b >> 4u) & 3u) << 4u);
+    } else {
+        rk = readU8(sc_off + k + 4u);
+        scale_byte = ((rk >> 4u) & 0xFu) | (((tmp_b >> 6u) & 3u) << 4u);
+    }
 
     float d = f16tof32(readU16(off + 108u));
     float dl = d * float(int(scale_byte) - 32);

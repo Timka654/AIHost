@@ -28,6 +28,11 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
 
     public override string Name => _entryPoint;
 
+    internal VulkanComputeKernel(VulkanDeviceContext ctx, string source, string entryPoint)
+        : this(ctx.Vk, ctx.Device, source, entryPoint)
+    {
+    }
+
     internal VulkanComputeKernel(Vk vk, Device device, string source, string entryPoint)
     {
         _vk = vk;

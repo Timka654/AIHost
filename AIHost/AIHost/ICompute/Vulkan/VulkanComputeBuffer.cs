@@ -31,6 +31,15 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
     public override DataType ElementType => _elementType;
 
     public VulkanComputeBuffer(
+        VulkanDeviceContext ctx,
+        ulong size, BufferType type, DataType elementType,
+        bool requireDeviceLocal = false)
+        : this(ctx.Vk, ctx.Device, ctx.PhysicalDevice, ctx.GetQueue(0), ctx.QueueFamilyIndex,
+              size, type, elementType, requireDeviceLocal)
+    {
+    }
+
+    public VulkanComputeBuffer(
         Vk vk, Device device, PhysicalDevice physicalDevice,
         Queue queue, uint queueFamilyIndex,
         ulong size, BufferType type, DataType elementType,

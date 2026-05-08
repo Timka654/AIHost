@@ -347,6 +347,9 @@ await app.RunAsync();
 modelManager.Dispose();
 computeDevice.Dispose();
 
+// Освобождаем глобальные Vulkan ресурсы
+VulkanGlobalContext.DestroyAll();
+
 /// <summary>
 /// Ensure all required directories and template files exist
 /// </summary>

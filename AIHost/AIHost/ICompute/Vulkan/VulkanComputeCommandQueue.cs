@@ -5,12 +5,16 @@ namespace AIHost.ICompute.Vulkan;
 /// <summary>
 /// Очередь команд для Vulkan с пулом command buffers для поддержки
 /// параллельных контекстов (thread-safe через слоты).
+/// 
+/// Каждый поток получает свой слот command buffer и свою очередь команд
+/// из пула очередей VulkanDeviceContext. Это позволяет нескольким потокам
+/// отправлять команды параллельно без ErrorDeviceLost.
 /// </summary>
 internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 {
     private readonly Vk _vk;
     private readonly Device _device;
-    private readonly Queue _queue;
+    private readonly VulkanDeviceContext _deviceContext;
     private readonly CommandPool _commandPool;
 
     /// <summary>Пул command buffers + fences для параллельного доступа.</summary>
@@ -31,11 +35,11 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 
     private bool _disposed;
 
-    internal VulkanComputeCommandQueue(Vk vk, Device device, Queue queue, uint queueFamilyIndex, int poolSize = 4)
+    internal VulkanComputeCommandQueue(VulkanDeviceContext ctx, int poolSize = 4)
     {
-        _vk = vk;
-        _device = device;
-        _queue = queue;
+        _deviceContext = ctx;
+        _vk = ctx.Vk;
+        _device = ctx.Device;
         _poolSize = Math.Max(1, poolSize);
 
         // Создание command pool
@@ -43,10 +47,10 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         {
             SType = StructureType.CommandPoolCreateInfo,
             Flags = CommandPoolCreateFlags.ResetCommandBufferBit,
-            QueueFamilyIndex = queueFamilyIndex
+            QueueFamilyIndex = ctx.QueueFamilyIndex
         };
 
-        if (_vk.CreateCommandPool(device, &poolInfo, null, out _commandPool) != Result.Success)
+        if (_vk.CreateCommandPool(_device, &poolInfo, null, out _commandPool) != Result.Success)
             throw new InvalidOperationException("Failed to create command pool");
 
         // Выделение пула command buffers
@@ -63,7 +67,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 
         fixed (CommandBuffer* pCmdBuffers = _commandBuffers)
         {
-            if (_vk.AllocateCommandBuffers(device, &allocInfo, pCmdBuffers) != Result.Success)
+            if (_vk.AllocateCommandBuffers(_device, &allocInfo, pCmdBuffers) != Result.Success)
                 throw new InvalidOperationException("Failed to allocate command buffers");
         }
 
@@ -76,7 +80,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
                 Flags = FenceCreateFlags.SignaledBit
             };
 
-            if (_vk.CreateFence(device, &fenceInfo, null, out _fences[i]) != Result.Success)
+            if (_vk.CreateFence(_device, &fenceInfo, null, out _fences[i]) != Result.Success)
                 throw new InvalidOperationException($"Failed to create fence for slot {i}");
         }
     }
@@ -90,6 +94,14 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         int slot = Interlocked.Increment(ref s_nextSlot) % _poolSize;
         t_slotIndex = slot;
         return slot;
+    }
+
+    /// <summary>Получить очередь команд для текущего потока (на основе слота).</summary>
+    private Queue GetThreadQueue()
+    {
+        int slot = GetSlot();
+        // Используем разные очереди из пула VulkanDeviceContext для разных потоков
+        return _deviceContext.GetQueue(slot);
     }
 
     /// <summary>Начать запись в command buffer текущего слота.</summary>
@@ -242,13 +254,14 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         int slot = GetSlot();
         var cb = _commandBuffers[slot];
         var fence = _fences[slot];
+        var queue = GetThreadQueue();
 
         // Завершение записи команд
         var endResult = _vk.EndCommandBuffer(cb);
         if (endResult != Result.Success)
             throw new InvalidOperationException($"vkEndCommandBuffer failed: {endResult}");
 
-        // Отправка команд в очередь
+        // Отправка команд в очередь (используем очередь, назначенную этому потоку)
         var cmdBufferLocal = cb;
         var submitInfo = new SubmitInfo
         {
@@ -257,7 +270,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
             PCommandBuffers = &cmdBufferLocal
         };
 
-        var submitResult = _vk.QueueSubmit(_queue, 1, &submitInfo, fence);
+        var submitResult = _vk.QueueSubmit(queue, 1, &submitInfo, fence);
         if (submitResult != Result.Success)
             throw new InvalidOperationException($"vkQueueSubmit failed: {submitResult}");
 
