@@ -27,7 +27,7 @@
 	<!-- Generate BuildInfo.cs with UTC build timestamp before every compile. -->
 	<Target Name="GenerateBuildInfo" BeforeTargets="BeforeCompile">
 		<PropertyGroup>
-			<_BuildTs>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm"))z UTC</_BuildTs>
+			<_BuildTs>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss"))z UTC</_BuildTs>
 		</PropertyGroup>
 		<WriteLinesToFile
 			File="$(IntermediateOutputPath)BuildInfo.g.cs"
