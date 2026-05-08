@@ -809,7 +809,7 @@ public class Transformer : IDisposable
         var K = _ops.SliceCols(qkv,         qDim, kvDim, "K");
         var V = _ops.SliceCols(qkv, qDim + kvDim, kvDim, "V");
         qkv.Dispose();
-        xNorm.Dispose();
+        // xNorm intentionally NOT disposed yet — needed for gate computation below.
 
         _ops.ApplyRoPEFull(Q, position, _numHeads, headDim);
         _ops.ApplyRoPEFull(K, position, nKvH,      headDim);
@@ -828,17 +828,34 @@ public class Transformer : IDisposable
             _ops.DeferExternal(Q); _ops.DeferExternal(K); _ops.DeferExternal(V);
         }
 
-        // Output projection: standard or transposed (gated attention).
-        // Gated: W_gate stored as [d_model, Q_dim] → use MatMulWeightsT so
-        //   attnOut[M, Q_dim] @ W_gate^T[Q_dim, d_model] → [M, d_model]
+        // Output projection:
+        //   Standard: attnProj = attnOut @ W_o
+        //   Gated (Qwen3.5): W_gate used twice:
+        //     1. gate = SiLU(xNorm @ W_gate)      forward  → [M, Q_dim]
+        //     2. gated = attnOut * gate             element-wise
+        //     3. attnProj = gated @ W_gate.T        transposed → [M, d_model]
+        //   This "weight-tying" pattern is characteristic of Qwen3 gated attention.
         var (wAO, sAO) = TempF32(wAOkey);
         Tensor attnProj;
         if (isGatedAttn)
-            attnProj = _ops.MatMulWeightsT(attnOut, wAO, "attn_proj");
+        {
+            // gate = SiLU(xNorm @ W_gate): xNorm [M,d_model] × W_gate [d_model,Q_dim] → [M,Q_dim]
+            var gate = _ops.MatMulWeights(xNorm, wAO, "attn_gate");
+            _ops.SiLU(gate);
+            // gated = attnOut * gate
+            var gated = _ops.Multiply(attnOut, gate, "attn_gated");
+            gate.Dispose(); attnOut.Dispose();
+            // project: gated @ W_gate.T → [M, d_model]
+            attnProj = _ops.MatMulWeightsT(gated, wAO, "attn_proj");
+            gated.Dispose();
+        }
         else
+        {
             attnProj = _ops.MatMulWeights(attnOut, wAO, "attn_proj");
+            attnOut.Dispose();
+        }
         if (!sAO) wAO.Dispose();
-        attnOut.Dispose();
+        xNorm.Dispose();  // safe to dispose now
 
         var x1 = _ops.Add(x, attnProj, "x_after_attn");
         attnProj.Dispose();
