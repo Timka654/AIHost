@@ -488,6 +488,20 @@ public class QwenHybridFormat : ITransformerFormat
     ///   conv_dim = 2*key_dim + value_dim = 10240
     ///   ssm_d_inner = 6144
     /// </summary>
+
+    /// <summary>Per-token intermediate results (Phase 1: parallel, stateless).</summary>
+    private struct PerTokenState
+    {
+        public float[] z;
+        public float[] beta;
+        public float[] alpha;
+        public float[] gate;
+        public float[] qkvMixed;
+        public float[] qConv;
+        public float[] kConv;
+        public float[] vConv;
+    }
+
     private static Tensor ApplySSMRecurrence(TransformerBase transformer, Tensor xResidual, Tensor xNorm,
                                        int g, SSMState ssmState, int seqLen)
     {
@@ -539,168 +553,114 @@ public class QwenHybridFormat : ITransformerFormat
         // ── Get recurrent state ─────────────────────────────────────────────
         var ssmStateArr = ssmState.GetLayer(g);
 
-        // ── Process each token ──────────────────────────────────────────────
-        var ySeq = new float[seqLen * VALUE_DIM];
-
-        // Use Parallel.For for token-level parallelism.
-        // Each token's SSM step is independent except for state updates,
-        // but state updates are per-token sequential (each token reads/writes
-        // the same state array). We use a lock per layer for state access.
-        object stateLock = new object();
-
+        // ── Phase 1: Parallel per-token computation (stateless) ────────────
+        var perToken = new PerTokenState[seqLen];
         Parallel.For(0, seqLen, t =>
         {
             int xOff = t * dModel;
+            var pt = new PerTokenState();
+            pt.z = MatVecMulSIMD(xData, xOff, wZT, VALUE_DIM, dModel);
 
-            // ── Step 1: z = xNorm @ attn_gate.weight → [VALUE_DIM] ─────────
-            var z = MatVecMulSIMD(xData, xOff, wZT, VALUE_DIM, dModel);
-
-            // ── Step 2: beta = sigmoid(xNorm @ ssm_beta) → [N_V_HEADS] ─────
-            var beta = new float[N_V_HEADS];
+            pt.beta = new float[N_V_HEADS];
             var rawBeta = MatVecMulSIMD(xData, xOff, WbT, N_V_HEADS, dModel);
             for (int n = 0; n < N_V_HEADS; n++)
-                beta[n] = 1.0f / (1.0f + MathF.Exp(-rawBeta[n]));
+                pt.beta[n] = 1.0f / (1.0f + MathF.Exp(-rawBeta[n]));
 
-            // ── Step 3: alpha = softplus(xNorm @ ssm_alpha + dt_bias) → [N_V_HEADS]
-            var alpha = new float[N_V_HEADS];
+            pt.alpha = new float[N_V_HEADS];
             var rawAlpha = MatVecMulSIMD(xData, xOff, WdtT, N_V_HEADS, dModel);
             for (int n = 0; n < N_V_HEADS; n++)
-                alpha[n] = MathF.Log(1f + MathF.Exp(rawAlpha[n] + dtBias[n]));
+                pt.alpha[n] = MathF.Log(1f + MathF.Exp(rawAlpha[n] + dtBias[n]));
 
-            // ── Step 4: gate = alpha * ssm_a → [N_V_HEADS] ─────────────────
-            var gate = new float[N_V_HEADS];
+            pt.gate = new float[N_V_HEADS];
             for (int n = 0; n < N_V_HEADS; n++)
-                gate[n] = alpha[n] * ssA[n];
+                pt.gate[n] = pt.alpha[n] * ssA[n];
 
-            // ── Step 5: conv1d on qkv_mixed → conv_out[CONV_DIM] ───────────
-            var qkvMixed = MatVecMulSIMD(xData, xOff, wQKVT, CONV_DIM, dModel);
+            pt.qkvMixed = MatVecMulSIMD(xData, xOff, wQKVT, CONV_DIM, dModel);
 
-            var convWindow = ssmState.UpdateConvState(g, qkvMixed);
+            float[] curConvState;
+            lock (ssmState) { curConvState = (float[])ssmState.GetConvState(g).Clone(); }
 
             var convOut = new float[CONV_DIM];
             for (int c = 0; c < CONV_DIM; c++)
             {
                 float sum = 0;
-                for (int k = 0; k < CONV_KERNEL; k++)
-                    sum += convWindow[k * CONV_DIM + c] * convW[k * CONV_DIM + c];
+                sum += curConvState[0 * CONV_DIM + c] * convW[0 * CONV_DIM + c];
+                sum += curConvState[1 * CONV_DIM + c] * convW[1 * CONV_DIM + c];
+                sum += curConvState[2 * CONV_DIM + c] * convW[2 * CONV_DIM + c];
+                sum += pt.qkvMixed[c] * convW[3 * CONV_DIM + c];
                 convOut[c] = sum;
             }
 
-            // ── Step 6: SiLU(conv_out) → split ──────────────────────────────
-            var qConv = new float[KEY_DIM];
-            var kConv = new float[KEY_DIM];
-            var vConv = new float[VALUE_DIM];
-
+            pt.qConv = new float[KEY_DIM];
+            pt.kConv = new float[KEY_DIM];
+            pt.vConv = new float[VALUE_DIM];
             for (int i = 0; i < KEY_DIM; i++)
-            {
-                float cv = convOut[i];
-                qConv[i] = cv / (1.0f + MathF.Exp(-cv));
-            }
+            { float cv = convOut[i]; pt.qConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
             for (int i = 0; i < KEY_DIM; i++)
-            {
-                float cv = convOut[KEY_DIM + i];
-                kConv[i] = cv / (1.0f + MathF.Exp(-cv));
-            }
+            { float cv = convOut[KEY_DIM + i]; pt.kConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
             for (int i = 0; i < VALUE_DIM; i++)
-            {
-                float cv = convOut[2 * KEY_DIM + i];
-                vConv[i] = cv / (1.0f + MathF.Exp(-cv));
-            }
+            { float cv = convOut[2 * KEY_DIM + i]; pt.vConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
 
-            // ── Step 7: L2 norm q_conv, k_conv ──────────────────────────────
             const float eps = 1e-5f;
             for (int h = 0; h < N_K_HEADS; h++)
             {
                 int base_ = h * HEAD_V_DIM;
                 float sumSqQ = 0, sumSqK = 0;
                 for (int d = 0; d < HEAD_V_DIM; d++)
-                {
-                    sumSqQ += qConv[base_ + d] * qConv[base_ + d];
-                    sumSqK += kConv[base_ + d] * kConv[base_ + d];
-                }
-                float normQ = MathF.Sqrt(sumSqQ + eps);
-                float normK = MathF.Sqrt(sumSqK + eps);
+                { sumSqQ += pt.qConv[base_ + d] * pt.qConv[base_ + d]; sumSqK += pt.kConv[base_ + d] * pt.kConv[base_ + d]; }
+                float normQ = MathF.Sqrt(sumSqQ + eps), normK = MathF.Sqrt(sumSqK + eps);
                 for (int d = 0; d < HEAD_V_DIM; d++)
-                {
-                    qConv[base_ + d] /= normQ;
-                    kConv[base_ + d] /= normK;
-                }
+                { pt.qConv[base_ + d] /= normQ; pt.kConv[base_ + d] /= normK; }
             }
 
-            // ── Step 8: Delta Net autoregressive ────────────────────────────
-            float scale = 1.0f / MathF.Sqrt(HEAD_V_DIM);
+            perToken[t] = pt;
+        });
+
+        // ── Phase 2: Sequential Delta Net recurrence ─────────────────────────
+        var ySeq = new float[seqLen * VALUE_DIM];
+        float scale = 1.0f / MathF.Sqrt(HEAD_V_DIM);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var pt = perToken[t];
+            ssmState.UpdateConvState(g, pt.qkvMixed);
             var yToken = new float[VALUE_DIM];
 
-            lock (stateLock)
+            for (int n = 0; n < N_V_HEADS; n++)
             {
-                for (int n = 0; n < N_V_HEADS; n++)
-                {
-                    int h = n % N_K_HEADS;
-                    int stateBase = n * HEAD_V_DIM * HEAD_V_DIM;
-                    int vBase = n * HEAD_V_DIM;
-                    int kBase = h * HEAD_V_DIM;
-                    int qBase = h * HEAD_V_DIM;
+                int h = n % N_K_HEADS;
+                int stateBase = n * HEAD_V_DIM * HEAD_V_DIM;
+                int vBase = n * HEAD_V_DIM, kBase = h * HEAD_V_DIM, qBase = h * HEAD_V_DIM;
 
-                    float gExp = MathF.Exp(gate[n]);
-                    for (int i = 0; i < HEAD_V_DIM; i++)
-                    {
-                        int rowBase = stateBase + i * HEAD_V_DIM;
-                        for (int j = 0; j < HEAD_V_DIM; j++)
-                            ssmStateArr[rowBase + j] *= gExp;
-                    }
+                float gExp = MathF.Exp(pt.gate[n]);
+                for (int i = 0; i < HEAD_V_DIM; i++)
+                { int rowBase = stateBase + i * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) ssmStateArr[rowBase + j] *= gExp; }
 
-                    var sk = new float[HEAD_V_DIM];
-                    for (int d = 0; d < HEAD_V_DIM; d++)
-                    {
-                        float sum = 0;
-                        int rowBase = stateBase + d * HEAD_V_DIM;
-                        for (int j = 0; j < HEAD_V_DIM; j++)
-                            sum += ssmStateArr[rowBase + j] * kConv[kBase + j];
-                        sk[d] = sum;
-                    }
+                var sk = new float[HEAD_V_DIM];
+                for (int d = 0; d < HEAD_V_DIM; d++)
+                { float sum = 0; int rowBase = stateBase + d * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) sum += ssmStateArr[rowBase + j] * pt.kConv[kBase + j]; sk[d] = sum; }
 
-                    var dVec = new float[HEAD_V_DIM];
-                    for (int d = 0; d < HEAD_V_DIM; d++)
-                        dVec[d] = (vConv[vBase + d] - sk[d]) * beta[n];
+                var dVec = new float[HEAD_V_DIM];
+                for (int d = 0; d < HEAD_V_DIM; d++) dVec[d] = (pt.vConv[vBase + d] - sk[d]) * pt.beta[n];
 
-                    for (int i = 0; i < HEAD_V_DIM; i++)
-                    {
-                        int rowBase = stateBase + i * HEAD_V_DIM;
-                        float ki = kConv[kBase + i];
-                        for (int j = 0; j < HEAD_V_DIM; j++)
-                            ssmStateArr[rowBase + j] += ki * dVec[j];
-                    }
+                for (int i = 0; i < HEAD_V_DIM; i++)
+                { int rowBase = stateBase + i * HEAD_V_DIM; float ki = pt.kConv[kBase + i]; for (int j = 0; j < HEAD_V_DIM; j++) ssmStateArr[rowBase + j] += ki * dVec[j]; }
 
-                    for (int d = 0; d < HEAD_V_DIM; d++)
-                    {
-                        float sum = 0;
-                        int rowBase = stateBase + d * HEAD_V_DIM;
-                        for (int j = 0; j < HEAD_V_DIM; j++)
-                            sum += ssmStateArr[rowBase + j] * qConv[qBase + j];
-                        yToken[vBase + d] = sum * scale;
-                    }
-                }
+                for (int d = 0; d < HEAD_V_DIM; d++)
+                { float sum = 0; int rowBase = stateBase + d * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) sum += ssmStateArr[rowBase + j] * pt.qConv[qBase + j]; yToken[vBase + d] = sum * scale; }
             }
 
-            // ── Step 9: Gated norm ──────────────────────────────────────────
             for (int n = 0; n < N_V_HEADS; n++)
             {
                 int groupBase = n * HEAD_V_DIM;
                 float sumSq = 0;
-                for (int d = 0; d < HEAD_V_DIM; d++)
-                {
-                    float val = yToken[groupBase + d];
-                    sumSq += val * val;
-                }
-                float rms = MathF.Sqrt(sumSq / HEAD_V_DIM + 1e-5f);
-                float rmsInv = 1.0f / rms;
-                float zSilu = z[groupBase] / (1.0f + MathF.Exp(-z[groupBase]));
-                for (int d = 0; d < HEAD_V_DIM; d++)
-                    yToken[groupBase + d] = yToken[groupBase + d] * rmsInv * sNw[d] * zSilu;
+                for (int d = 0; d < HEAD_V_DIM; d++) { float val = yToken[groupBase + d]; sumSq += val * val; }
+                float rmsInv = 1.0f / MathF.Sqrt(sumSq / HEAD_V_DIM + 1e-5f);
+                float zSilu = pt.z[groupBase] / (1.0f + MathF.Exp(-pt.z[groupBase]));
+                for (int d = 0; d < HEAD_V_DIM; d++) yToken[groupBase + d] = yToken[groupBase + d] * rmsInv * sNw[d] * zSilu;
             }
 
             Buffer.BlockCopy(yToken, 0, ySeq, t * VALUE_DIM * sizeof(float), VALUE_DIM * sizeof(float));
-        });
+        }
 
         // ── Step 10: Output projection (parallel) ───────────────────────────
         var resultData = new float[seqLen * dModel];
