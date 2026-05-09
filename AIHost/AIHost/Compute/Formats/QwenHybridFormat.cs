@@ -398,16 +398,10 @@ public class QwenHybridFormat : ITransformerFormat
         Tensor x2;
         if (ssmState != null && HasSSMWeights(transformer, g))
         {
-            var logger2 = AppLogger.Create<QwenHybridFormat>();
-            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: flushing batch before SSM", g, seqLen);
             ops.Flush();
-            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: starting SSM recurrence", g, seqLen);
             var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, seqLen);
-            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: SSM done", g, seqLen);
             x1.Dispose();
             x2 = ssmOut;
-            // Start a new batch for FFN
-            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: starting FFN batch", g, seqLen);
             ops.BeginBatch();
         }
         else
@@ -459,15 +453,10 @@ public class QwenHybridFormat : ITransformerFormat
     /// OPTIMIZED: Gated Delta Net recurrence (linear attention).
     ///
     /// Optimizations applied:
-    ///   1. Parallel.For for token processing (each token's SSM step is independent)
+    ///   1. Parallel.For for stateless matvec operations (Phase 1)
     ///   2. Vector<float> (SIMD/AVX) for matrix-vector multiplications (~4x-8x speedup)
-    ///   3. Pre-transposed weight layouts for better cache locality
-    ///   4. Reduced allocations via pooled arrays
-    ///
-    /// For decode (seqLen=1): uses GPU shader (SsmGdnDecode) for steps 1-9,
-    /// then CPU for step 10 (output projection) and residual.
-    ///
-    /// For prefill (seqLen>1): runs fully on CPU with parallel optimizations.
+    ///   3. Sequential conv1d + Delta Net recurrence (Phase 2)
+    ///   4. Parallel output projection (Phase 3)
     ///
     /// Based on llama.cpp reference implementation for Qwen3.5 (LLM_ARCH_QWEN35).
     /// This is NOT Mamba-2! It's Gated Delta Net with:
@@ -489,7 +478,7 @@ public class QwenHybridFormat : ITransformerFormat
     ///   ssm_d_inner = 6144
     /// </summary>
 
-    /// <summary>Per-token intermediate results (Phase 1: parallel, stateless).</summary>
+    /// <summary>Per-token intermediate results from Phase 1 (parallel matvecs).</summary>
     private struct PerTokenState
     {
         public float[] z;
@@ -497,9 +486,6 @@ public class QwenHybridFormat : ITransformerFormat
         public float[] alpha;
         public float[] gate;
         public float[] qkvMixed;
-        public float[] qConv;
-        public float[] kConv;
-        public float[] vConv;
     }
 
     private static Tensor ApplySSMRecurrence(TransformerBase transformer, Tensor xResidual, Tensor xNorm,
@@ -516,10 +502,7 @@ public class QwenHybridFormat : ITransformerFormat
         var ops = transformer.Ops;
         int dModel = xNorm.Shape[1];
 
-        var ssmLogger = AppLogger.Create<QwenHybridFormat>();
-        ssmLogger.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen} starting SSM recurrence (optimized)", g, seqLen);
-
-        // ── Load weights via TempF32Named (uses pre-allocated scratch buffers) ─
+        // ── Load weights ─
         float[] LoadSSMWeight(string name)
         {
             var (t, isScratch) = transformer.TempF32Named(name);
@@ -540,94 +523,83 @@ public class QwenHybridFormat : ITransformerFormat
 
         var xData = xNorm.ReadData();
 
-        // ── Weights are already in GGUF column-major layout ─────────────────
-        // MatVecMulSIMD expects: weightT[j * dModel + k] = originalWeight[k + j * dModel]
-        // Since j*dModel+k == k+j*dModel (addition is commutative), the original
-        // GGUF layout is exactly what MatVecMulSIMD needs — NO transposition.
-        var wZT = wZ;       // [dModel, VALUE_DIM] → used as-is
-        var WbT = Wb;       // [dModel, N_V_HEADS]
-        var WdtT = Wdt;     // [dModel, N_V_HEADS]
-        var wQKVT = wQKV;   // [dModel, CONV_DIM]
-        var wOutT = wOut;   // [VALUE_DIM, dModel]
+        // GGUF column-major weights are used as-is by MatVecMulSIMD
+        // MatVecMulSIMD expects: weight[j*dModel + k] — which IS the GGUF layout: element(k,j) at k + j*dModel
 
         // ── Get recurrent state ─────────────────────────────────────────────
-        var ssmStateArr = ssmState.GetLayer(g);
 
-        // ── Phase 1: Parallel per-token computation (stateless) ────────────
+        // ── Phase 1: Parallel matvec operations (stateless) ─────────────────
         var perToken = new PerTokenState[seqLen];
         Parallel.For(0, seqLen, t =>
         {
             int xOff = t * dModel;
             var pt = new PerTokenState();
-            pt.z = MatVecMulSIMD(xData, xOff, wZT, VALUE_DIM, dModel);
-
+            pt.z = MatVecMulSIMD(xData, xOff, wZ, VALUE_DIM, dModel);
+            var rawBeta = MatVecMulSIMD(xData, xOff, Wb, N_V_HEADS, dModel);
             pt.beta = new float[N_V_HEADS];
-            var rawBeta = MatVecMulSIMD(xData, xOff, WbT, N_V_HEADS, dModel);
             for (int n = 0; n < N_V_HEADS; n++)
                 pt.beta[n] = 1.0f / (1.0f + MathF.Exp(-rawBeta[n]));
-
+            var rawAlpha = MatVecMulSIMD(xData, xOff, Wdt, N_V_HEADS, dModel);
             pt.alpha = new float[N_V_HEADS];
-            var rawAlpha = MatVecMulSIMD(xData, xOff, WdtT, N_V_HEADS, dModel);
             for (int n = 0; n < N_V_HEADS; n++)
                 pt.alpha[n] = MathF.Log(1f + MathF.Exp(rawAlpha[n] + dtBias[n]));
-
             pt.gate = new float[N_V_HEADS];
             for (int n = 0; n < N_V_HEADS; n++)
                 pt.gate[n] = pt.alpha[n] * ssA[n];
+            pt.qkvMixed = MatVecMulSIMD(xData, xOff, wQKV, CONV_DIM, dModel);
+            perToken[t] = pt;
+        });
 
-            pt.qkvMixed = MatVecMulSIMD(xData, xOff, wQKVT, CONV_DIM, dModel);
+        // ── Phase 2: Sequential conv1d + Delta Net recurrence ──────────────
+        var ssmStateArr = ssmState.GetLayer(g);
+        var ySeq = new float[seqLen * VALUE_DIM];
+        float scale = 1.0f / MathF.Sqrt(HEAD_V_DIM);
+        const float eps = 1e-5f;
 
-            float[] curConvState;
-            lock (ssmState) { curConvState = (float[])ssmState.GetConvState(g).Clone(); }
+        for (int t = 0; t < seqLen; t++)
+        {
+            var pt = perToken[t];
 
+            // conv1d with sequential conv state update
             // convW shape in GGUF: [CONV_KERNEL=4, CONV_DIM=10240] column-major
-            // Element (k,c) is at index k + c * CONV_KERNEL
-            // convWindow is row-major: [CONV_KERNEL * CONV_DIM], element (k,c) at k*CONV_DIM + c
+            // Element (k,c) at index k + c * CONV_KERNEL
+            var convWindow = ssmState.UpdateConvState(g, pt.qkvMixed);
             var convOut = new float[CONV_DIM];
             for (int c = 0; c < CONV_DIM; c++)
             {
                 float sum = 0;
-                sum += curConvState[0 * CONV_DIM + c] * convW[0 + c * CONV_KERNEL];
-                sum += curConvState[1 * CONV_DIM + c] * convW[1 + c * CONV_KERNEL];
-                sum += curConvState[2 * CONV_DIM + c] * convW[2 + c * CONV_KERNEL];
-                sum += pt.qkvMixed[c] * convW[3 + c * CONV_KERNEL];
+                sum += convWindow[0 * CONV_DIM + c] * convW[0 + c * CONV_KERNEL];
+                sum += convWindow[1 * CONV_DIM + c] * convW[1 + c * CONV_KERNEL];
+                sum += convWindow[2 * CONV_DIM + c] * convW[2 + c * CONV_KERNEL];
+                sum += convWindow[3 * CONV_DIM + c] * convW[3 + c * CONV_KERNEL];
                 convOut[c] = sum;
             }
 
-            pt.qConv = new float[KEY_DIM];
-            pt.kConv = new float[KEY_DIM];
-            pt.vConv = new float[VALUE_DIM];
+            // SiLU + split
+            var qConv = new float[KEY_DIM];
+            var kConv = new float[KEY_DIM];
+            var vConv = new float[VALUE_DIM];
             for (int i = 0; i < KEY_DIM; i++)
-            { float cv = convOut[i]; pt.qConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
+            { float cv = convOut[i]; qConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
             for (int i = 0; i < KEY_DIM; i++)
-            { float cv = convOut[KEY_DIM + i]; pt.kConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
+            { float cv = convOut[KEY_DIM + i]; kConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
             for (int i = 0; i < VALUE_DIM; i++)
-            { float cv = convOut[2 * KEY_DIM + i]; pt.vConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
+            { float cv = convOut[2 * KEY_DIM + i]; vConv[i] = cv / (1.0f + MathF.Exp(-cv)); }
 
-            const float eps = 1e-5f;
+            // L2 norm per head
             for (int h = 0; h < N_K_HEADS; h++)
             {
                 int base_ = h * HEAD_V_DIM;
                 float sumSqQ = 0, sumSqK = 0;
                 for (int d = 0; d < HEAD_V_DIM; d++)
-                { sumSqQ += pt.qConv[base_ + d] * pt.qConv[base_ + d]; sumSqK += pt.kConv[base_ + d] * pt.kConv[base_ + d]; }
+                { sumSqQ += qConv[base_ + d] * qConv[base_ + d]; sumSqK += kConv[base_ + d] * kConv[base_ + d]; }
                 float normQ = MathF.Sqrt(sumSqQ + eps), normK = MathF.Sqrt(sumSqK + eps);
                 for (int d = 0; d < HEAD_V_DIM; d++)
-                { pt.qConv[base_ + d] /= normQ; pt.kConv[base_ + d] /= normK; }
+                { qConv[base_ + d] /= normQ; kConv[base_ + d] /= normK; }
             }
 
-            perToken[t] = pt;
-        });
-
-        // ── Phase 2: Sequential Delta Net recurrence ─────────────────────────
-        var ySeq = new float[seqLen * VALUE_DIM];
-        float scale = 1.0f / MathF.Sqrt(HEAD_V_DIM);
-        for (int t = 0; t < seqLen; t++)
-        {
-            var pt = perToken[t];
-            ssmState.UpdateConvState(g, pt.qkvMixed);
+            // Delta Net recurrence
             var yToken = new float[VALUE_DIM];
-
             for (int n = 0; n < N_V_HEADS; n++)
             {
                 int h = n % N_K_HEADS;
@@ -640,18 +612,19 @@ public class QwenHybridFormat : ITransformerFormat
 
                 var sk = new float[HEAD_V_DIM];
                 for (int d = 0; d < HEAD_V_DIM; d++)
-                { float sum = 0; int rowBase = stateBase + d * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) sum += ssmStateArr[rowBase + j] * pt.kConv[kBase + j]; sk[d] = sum; }
+                { float sum = 0; int rowBase = stateBase + d * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) sum += ssmStateArr[rowBase + j] * kConv[kBase + j]; sk[d] = sum; }
 
                 var dVec = new float[HEAD_V_DIM];
-                for (int d = 0; d < HEAD_V_DIM; d++) dVec[d] = (pt.vConv[vBase + d] - sk[d]) * pt.beta[n];
+                for (int d = 0; d < HEAD_V_DIM; d++) dVec[d] = (vConv[vBase + d] - sk[d]) * pt.beta[n];
 
                 for (int i = 0; i < HEAD_V_DIM; i++)
-                { int rowBase = stateBase + i * HEAD_V_DIM; float ki = pt.kConv[kBase + i]; for (int j = 0; j < HEAD_V_DIM; j++) ssmStateArr[rowBase + j] += ki * dVec[j]; }
+                { int rowBase = stateBase + i * HEAD_V_DIM; float ki = kConv[kBase + i]; for (int j = 0; j < HEAD_V_DIM; j++) ssmStateArr[rowBase + j] += ki * dVec[j]; }
 
                 for (int d = 0; d < HEAD_V_DIM; d++)
-                { float sum = 0; int rowBase = stateBase + d * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) sum += ssmStateArr[rowBase + j] * pt.qConv[qBase + j]; yToken[vBase + d] = sum * scale; }
+                { float sum = 0; int rowBase = stateBase + d * HEAD_V_DIM; for (int j = 0; j < HEAD_V_DIM; j++) sum += ssmStateArr[rowBase + j] * qConv[qBase + j]; yToken[vBase + d] = sum * scale; }
             }
 
+            // Gated norm
             for (int n = 0; n < N_V_HEADS; n++)
             {
                 int groupBase = n * HEAD_V_DIM;
@@ -665,14 +638,13 @@ public class QwenHybridFormat : ITransformerFormat
             Buffer.BlockCopy(yToken, 0, ySeq, t * VALUE_DIM * sizeof(float), VALUE_DIM * sizeof(float));
         }
 
-        // ── Step 10: Output projection (parallel) ───────────────────────────
+        // ── Phase 3: Parallel output projection ──────────────────────────────
         var resultData = new float[seqLen * dModel];
         Parallel.For(0, seqLen, t =>
         {
             int yOff = t * VALUE_DIM;
             int rOff = t * dModel;
-            // Use SIMD for output projection: ySeq[t] @ wOutT → result[t]
-            var row = MatVecMulSIMD(ySeq, yOff, wOutT, dModel, VALUE_DIM);
+            var row = MatVecMulSIMD(ySeq, yOff, wOut, dModel, VALUE_DIM);
             Buffer.BlockCopy(row, 0, resultData, rOff * sizeof(float), dModel * sizeof(float));
         });
 
@@ -687,23 +659,19 @@ public class QwenHybridFormat : ITransformerFormat
 
     /// <summary>
     /// SIMD-accelerated matrix-vector multiplication.
-    /// Computes: result[j] = sum_k(xData[xOff + k] * weightT[j * dModel + k])
-    /// where weightT is pre-transposed: weightT[j * dModel + k] = originalWeight[k + j * dModel]
-    ///
-    /// Uses Vector<float> for SIMD acceleration (4-8 floats per operation on modern CPUs).
-    /// Falls back to scalar loop for remaining elements.
+    /// Computes: result[j] = sum_k(xData[xOff + k] * weight[j * dModel + k])
+    /// GGUF column-major weight: element(k,j) at k + j*dModel = weight[j*dModel + k]
     /// </summary>
-    private static float[] MatVecMulSIMD(float[] xData, int xOff, float[] weightT, int resultDim, int dModel)
+    private static float[] MatVecMulSIMD(float[] xData, int xOff, float[] weight, int resultDim, int dModel)
     {
         var result = new float[resultDim];
-        int vectorSize = Vector<float>.Count; // 4 for SSE2, 8 for AVX2
+        int vectorSize = Vector<float>.Count;
 
         for (int j = 0; j < resultDim; j++)
         {
             int wOff = j * dModel;
             float sum = 0;
 
-            // SIMD loop
             int k = 0;
             if (vectorSize > 1)
             {
@@ -711,38 +679,19 @@ public class QwenHybridFormat : ITransformerFormat
                 for (; k <= dModel - vectorSize; k += vectorSize)
                 {
                     var vX = new Vector<float>(xData, xOff + k);
-                    var vW = new Vector<float>(weightT, wOff + k);
+                    var vW = new Vector<float>(weight, wOff + k);
                     vSum += vX * vW;
                 }
                 for (int s = 0; s < vectorSize; s++)
                     sum += vSum[s];
             }
 
-            // Scalar remainder
             for (; k < dModel; k++)
-                sum += xData[xOff + k] * weightT[wOff + k];
+                sum += xData[xOff + k] * weight[wOff + k];
 
             result[j] = sum;
         }
 
-        return result;
-    }
-
-    /// <summary>
-    /// Transpose a matrix from [cols, rows] layout to [rows, cols] layout.
-    /// Original: data[col * dModel + row] = data[k + i * dModel]
-    /// Transposed: result[row * dModel + col] = data[col * dModel + row]
-    /// </summary>
-    private static float[] Transpose(float[] data, int dModel, int dim2)
-    {
-        var result = new float[data.Length];
-        for (int i = 0; i < dim2; i++)
-        {
-            int srcBase = i * dModel;
-            int dstBase = i;
-            for (int k = 0; k < dModel; k++)
-                result[dstBase + k * dim2] = data[srcBase + k];
-        }
         return result;
     }
 
@@ -785,7 +734,6 @@ public class QwenHybridFormat : ITransformerFormat
             wQKV, wZ, wBeta, wAlpha, dtBias, ssA, scratch,
             ssmStateTensor,
             ssmNorm, output);
-        // Don't dispose convStateTensor/ssmStateTensor — they wrap buffers owned by SSMState
 
         // ── Read output back to CPU for output projection ────────────────────
         var yToken = output.ReadData();  // float[6144]
