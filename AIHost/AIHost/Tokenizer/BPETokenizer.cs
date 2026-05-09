@@ -12,6 +12,10 @@ public class BPETokenizer
     private readonly int _unknownToken;
     private readonly bool _isSentencePiece;
 
+    // GPT-2 style bytes_to_unicode mapping for BPE/tiktoken tokenizers
+    // Maps each byte (0-255) to a unicode character that exists as a token in the vocabulary
+    private readonly Dictionary<byte, int> _byteToTokenId;
+
     public int VocabSize => _tokens.Length;
     public int BosToken => _bosToken;
     public int EosToken => _eosToken;
@@ -30,6 +34,73 @@ public class BPETokenizer
         {
             _tokenToId[tokens[i]] = i;
         }
+
+        // Build byte -> token id mapping for BPE/tiktoken (GPT-2 style)
+        _byteToTokenId = BuildByteToTokenIdMapping();
+    }
+
+    /// <summary>
+    /// Builds a mapping from raw bytes to token IDs using the GPT-2 bytes_to_unicode scheme.
+    /// This is needed for BPE/tiktoken tokenizers where control characters (like \n, \r, \t)
+    /// and other bytes are represented as unicode characters in the vocabulary.
+    /// </summary>
+    private Dictionary<byte, int> BuildByteToTokenIdMapping()
+    {
+        var mapping = new Dictionary<byte, int>();
+
+        // GPT-2 bytes_to_unicode mapping:
+        // - Bytes 33-126 ('!' to '~') and 161-172, 174-255 map to themselves
+        // - All other bytes (0-32, 127-160, 173) map to unicode chars starting from 256
+        var byteList = new List<int>();
+        var charList = new List<int>();
+
+        // Printable ASCII: 33 ('!') to 126 ('~')
+        for (int i = 33; i <= 126; i++)
+        {
+            byteList.Add(i);
+            charList.Add(i);
+        }
+
+        // Extended ASCII: 161 ('¡') to 172 ('¬')
+        for (int i = 161; i <= 172; i++)
+        {
+            byteList.Add(i);
+            charList.Add(i);
+        }
+
+        // Extended ASCII: 174 ('®') to 255 ('ÿ')
+        for (int i = 174; i <= 255; i++)
+        {
+            byteList.Add(i);
+            charList.Add(i);
+        }
+
+        // Remaining bytes (0-32, 127-160, 173) get mapped to unicode chars 256+
+        int n = 0;
+        for (int b = 0; b < 256; b++)
+        {
+            if (!byteList.Contains(b))
+            {
+                byteList.Add(b);
+                charList.Add(256 + n);
+                n++;
+            }
+        }
+
+        // Now build the reverse mapping: for each byte, find the token id
+        for (int i = 0; i < 256; i++)
+        {
+            byte byteVal = (byte)byteList[i];
+            char mappedChar = (char)charList[i];
+            string charStr = mappedChar.ToString();
+
+            if (_tokenToId.TryGetValue(charStr, out int tokenId))
+            {
+                mapping[byteVal] = tokenId;
+            }
+        }
+
+        return mapping;
     }
 
 
@@ -181,6 +252,8 @@ public class BPETokenizer
                 // No ▁ prefix, no space replacement.
                 // Tokens may contain spaces as part of the token (e.g. " Hello").
                 // Use greedy longest-match directly on the raw text.
+                // When a character is not found in the vocabulary, use byte-level
+                // encoding (GPT-2 bytes_to_unicode mapping) instead of unknown token.
                 int pos = 0;
                 while (pos < segment.Length)
                 {
@@ -205,13 +278,18 @@ public class BPETokenizer
                     }
                     else
                     {
-                        // Try single character
+                        // Character not found in vocabulary.
+                        // Use byte-level encoding: encode as UTF-8 bytes and map
+                        // each byte through the GPT-2 bytes_to_unicode mapping.
                         char c = segment[pos];
-                        string charStr = c.ToString();
-                        if (_tokenToId.TryGetValue(charStr, out int charTokenId))
-                            tokens.Add(charTokenId);
-                        else
-                            tokens.Add(_unknownToken);
+                        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(new[] { c });
+                        foreach (byte b in bytes)
+                        {
+                            if (_byteToTokenId.TryGetValue(b, out int byteTokenId))
+                                tokens.Add(byteTokenId);
+                            else
+                                tokens.Add(_unknownToken);
+                        }
                         pos++;
                     }
                 }
