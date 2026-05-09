@@ -83,7 +83,7 @@ public class TensorNameMapper
         if (HasAny("attn_q.weight") && !HasCombinedQKV)
             Console.WriteLine("[Arch] Separate Q/K/V weights — standard attention path");
         if (IsHybridSSM)
-            Console.WriteLine("[Arch] Hybrid SSM+Attention model detected — SSM layers will use attention fallback (output may be incorrect for SSM layers)");
+            Console.WriteLine("[Arch] Hybrid SSM+Attention model detected — SSM layers use ApplySSMRecurrence (Gated Delta Net), attention layers use standard GQA");
     }
 
     // ── Attention layout ─────────────────────────────────────────────────────

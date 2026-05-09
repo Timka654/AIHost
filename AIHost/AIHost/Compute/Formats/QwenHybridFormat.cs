@@ -526,15 +526,15 @@ public class QwenHybridFormat : ITransformerFormat
 
         var xData = xNorm.ReadData();
 
-        // ── Pre-transpose weights for SIMD-friendly access ──────────────────
-        // Original layout: weight[col, row] = weight[k + i * dModel]
-        // Transposed layout: weightT[row, col] = weight[i + k * dModel]
-        // This gives contiguous memory access when iterating over k (dModel dim).
-        var wZT = Transpose(wZ, dModel, VALUE_DIM);
-        var WbT = Transpose(Wb, dModel, N_V_HEADS);
-        var WdtT = Transpose(Wdt, dModel, N_V_HEADS);
-        var wQKVT = Transpose(wQKV, dModel, CONV_DIM);
-        var wOutT = Transpose(wOut, VALUE_DIM, dModel);
+        // ── Weights are already in GGUF column-major layout ─────────────────
+        // MatVecMulSIMD expects: weightT[j * dModel + k] = originalWeight[k + j * dModel]
+        // Since j*dModel+k == k+j*dModel (addition is commutative), the original
+        // GGUF layout is exactly what MatVecMulSIMD needs — NO transposition.
+        var wZT = wZ;       // [dModel, VALUE_DIM] → used as-is
+        var WbT = Wb;       // [dModel, N_V_HEADS]
+        var WdtT = Wdt;     // [dModel, N_V_HEADS]
+        var wQKVT = wQKV;   // [dModel, CONV_DIM]
+        var wOutT = wOut;   // [VALUE_DIM, dModel]
 
         // ── Get recurrent state ─────────────────────────────────────────────
         var ssmStateArr = ssmState.GetLayer(g);

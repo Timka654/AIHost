@@ -1421,12 +1421,22 @@ public class ComputeOps : IDisposable
     // memory-limited GPUs. Use per-row extraction instead.
     private const long EmbeddingF32SizeThreshold = 512L * 1024 * 1024; // 512 MB
 
+    // Max seqLen for CPU-side dequantization in EmbeddingLookupFromQuantized.
+    // For sequences longer than this, GPU dequantization is used (with chunking).
+    // CPU dequant avoids GPU staging copy + dispatch cycles that can trigger
+    // ErrorDeviceLost on AMD RADV when the GPU is under memory pressure.
+    private const int EmbeddingCpuDequantMaxSeqLen = 256;
+
     /// <summary>
     /// Embedding lookup that dequantizes only the rows needed for the current token IDs.
     /// For small embedding tables falls back to the standard full-dequant path.
     /// For large tables (e.g. 248K-vocab 27B models, 5 GB F32) reads only
     /// seqLen rows from the quantized buffer on CPU, concatenates them into a
     /// small scratch tensor, dequantizes that on GPU, and returns the result.
+    ///
+    /// CRITICAL FIX for AMD RADV: For small sequences (seqLen <= EmbeddingCpuDequantMaxSeqLen),
+    /// performs full CPU-side dequantization to avoid GPU staging copy + dispatch cycles
+    /// that can trigger ErrorDeviceLost (vkQueueSubmit failure).
     /// </summary>
     public Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedTable,
                                                 string? resultName = null)
@@ -1448,7 +1458,6 @@ public class ComputeOps : IDisposable
         int  seqLen      = tokenIds.Length;
         long bytesPerRow  = (long)quantizedTable.Buffer.Size / vocabSize;
 
-
         // Read one quantized row per token and pack them into a contiguous small buffer
         var packedBytes = new byte[seqLen * bytesPerRow];
         for (int i = 0; i < seqLen; i++)
@@ -1457,6 +1466,18 @@ public class ComputeOps : IDisposable
             ulong  byteOffset = (ulong)(tokenId * bytesPerRow);
             byte[] rowBytes   = quantizedTable.Buffer.ReadRange<byte>(byteOffset, (int)bytesPerRow);
             Buffer.BlockCopy(rowBytes, 0, packedBytes, (int)(i * bytesPerRow), (int)bytesPerRow);
+        }
+
+        // CRITICAL FIX: For small sequences, dequantize on CPU to avoid GPU staging
+        // copy + dispatch cycles that trigger ErrorDeviceLost on AMD RADV.
+        // The GPU dequant path (below) creates a temporary GPU buffer, uploads packed
+        // quantized data, then dispatches a dequant shader — this sequence of
+        // staging-copy → dispatch can cause vkQueueSubmit to fail with ErrorDeviceLost
+        // when the GPU is under memory pressure from the large embedding table.
+        if (seqLen <= EmbeddingCpuDequantMaxSeqLen)
+        {
+            return EmbeddingLookupFromQuantizedCpu(tokenIds, quantizedTable, packedBytes,
+                                                    seqLen, dModel, bytesPerRow, resultName);
         }
 
         // Upload packed rows as a small quantized tensor shaped [seqLen, dModel].
@@ -1472,6 +1493,326 @@ public class ComputeOps : IDisposable
         var smallF32 = Dequantize(smallQuantized, resultName);
         smallQuantized.Dispose();
         return smallF32;
+    }
+
+    /// <summary>
+    /// CPU-side dequantization of packed quantized embedding rows.
+    /// Avoids GPU staging copies and dispatches that can trigger ErrorDeviceLost on AMD RADV.
+    /// Implements all K-quant formats (Q2_K through Q6_K) inline in C#.
+    /// </summary>
+    private Tensor EmbeddingLookupFromQuantizedCpu(int[] tokenIds, Tensor quantizedTable,
+        byte[] packedBytes, int seqLen, int dModel, long bytesPerRow, string? resultName)
+    {
+        var resultData = new float[seqLen * dModel];
+
+        for (int i = 0; i < seqLen; i++)
+        {
+            int rowOffset = (int)(i * bytesPerRow);
+            int destOffset = i * dModel;
+            DequantizeRowCpu(quantizedTable.DataType, packedBytes, rowOffset, resultData, destOffset, dModel);
+        }
+
+        return Tensor.FromData(_device, resultData,
+            new TensorShape(new[] { seqLen, dModel }), resultName ?? "embeddings");
+    }
+
+    /// <summary>CPU dequantization of one K-quant row (Q2_K..Q6_K, block size 256).</summary>
+    private static void DequantizeRowCpu(DataType dtype, byte[] src, int srcOff,
+        float[] dst, int dstOff, int dModel)
+    {
+        switch (dtype)
+        {
+            case DataType.Q2_K: DequantizeRowQ2K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q3_K: DequantizeRowQ3K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q4_K: DequantizeRowQ4K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q5_K: DequantizeRowQ5K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q6_K: DequantizeRowQ6K(src, srcOff, dst, dstOff, dModel); break;
+            default:
+                throw new NotSupportedException($"CPU dequant not supported for {dtype}");
+        }
+    }
+
+    // ── K-quant CPU dequant helpers ──────────────────────────────────────
+    // Block size = 256 elements for all K-quant formats.
+    // Layouts match the GLSL shaders in QuantizationFormats.cs.
+
+    private static float F16ToF32(ushort h)
+    {
+        uint sign = (uint)((h >> 15) & 1);
+        uint exp = (uint)((h >> 10) & 0x1F);
+        uint mant = (uint)(h & 0x3FF);
+        if (exp == 0)
+        {
+            if (mant == 0) return sign == 0 ? 0f : -0f;
+            int shift = 10;
+            while ((mant & 0x400) == 0) { mant <<= 1; shift--; }
+            exp = (uint)(1 - shift + 127);
+            mant = (mant & 0x3FF) << 13;
+        }
+        else if (exp == 0x1F)
+        {
+            exp = 0xFF;
+            mant <<= 13;
+        }
+        else
+        {
+            exp = exp - 15 + 127;
+            mant <<= 13;
+        }
+        uint bits = (sign << 31) | (exp << 23) | (mant & 0x7FFFFF);
+        return BitConverter.Int32BitsToSingle((int)bits);
+    }
+
+    /// <summary>Q2_K: 256 elements, 84 bytes/block.</summary>
+    private static void DequantizeRowQ2K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256;
+        const int BLOCK_BYTES = 84;
+        int numBlocks = (dModel + QK_K - 1) / QK_K;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            int blockOff = srcOff + b * BLOCK_BYTES;
+            int elemBase = b * QK_K;
+            int count = Math.Min(QK_K, dModel - elemBase);
+
+            // scales[16] at offset 0, lower nibble = scale, upper nibble = min
+            // d at offset 80 (f16), dmin at offset 82 (f16)
+            ushort dRaw  = (ushort)(src[blockOff + 80] | (src[blockOff + 81] << 8));
+            ushort dmRaw = (ushort)(src[blockOff + 82] | (src[blockOff + 83] << 8));
+            float d    = F16ToF32(dRaw);
+            float dmin = F16ToF32(dmRaw);
+
+            // qs[64] at offset 16
+            for (int e = 0; e < count; e++)
+            {
+                int sub = e / 16;
+                byte scByte = src[blockOff + sub];
+                float sc_lo = (scByte & 0x0F);
+                float sc_hi = (scByte >> 4) & 0x0F;
+
+                int chunk = e / 128;
+                int local = e % 128;
+                int qsIdx = chunk * 32 + (local % 32);
+                int shift = (local / 32) * 2;
+                int qv = (src[blockOff + 16 + qsIdx] >> shift) & 0x03;
+
+                dst[dstOff + elemBase + e] = d * sc_lo * qv - dmin * sc_hi;
+            }
+        }
+    }
+
+    /// <summary>Q3_K: 256 elements, 110 bytes/block.</summary>
+    private static void DequantizeRowQ3K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256;
+        const int BLOCK_BYTES = 110;
+        int numBlocks = (dModel + QK_K - 1) / QK_K;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            int blockOff = srcOff + b * BLOCK_BYTES;
+            int elemBase = b * QK_K;
+            int count = Math.Min(QK_K, dModel - elemBase);
+
+            ushort dRaw = (ushort)(src[blockOff + 108] | (src[blockOff + 109] << 8));
+            float d = F16ToF32(dRaw);
+
+            for (int e = 0; e < count; e++)
+            {
+                int chunk = e / 128;
+                int local = e % 128;
+                int qsIdx = chunk * 32 + (local % 32);
+                int shift = (local / 32) * 2;
+
+                int low2 = (src[blockOff + 32 + qsIdx] >> shift) & 3;
+
+                int hmIdx = local % 32;
+                int hmBit = chunk * 4 + (local / 32);
+                int high1 = (src[blockOff + hmIdx] >> hmBit) & 1;
+
+                int qval = (low2 | (high1 << 2)) - 4;
+
+                // scales[12] at offset 96
+                int is_sc = e / 16;
+                int k = is_sc % 4;
+                int ag = is_sc / 4;
+                int scOff = blockOff + 96;
+                int tmpB = src[scOff + 8 + k];
+                int rk;
+                int scaleByte;
+                if (ag == 0)
+                {
+                    rk = src[scOff + k];
+                    scaleByte = (rk & 0x0F) | ((tmpB >> 0) & 3) << 4;
+                }
+                else if (ag == 1)
+                {
+                    rk = src[scOff + k + 4];
+                    scaleByte = (rk & 0x0F) | ((tmpB >> 2) & 3) << 4;
+                }
+                else if (ag == 2)
+                {
+                    rk = src[scOff + k];
+                    scaleByte = ((rk >> 4) & 0x0F) | ((tmpB >> 4) & 3) << 4;
+                }
+                else
+                {
+                    rk = src[scOff + k + 4];
+                    scaleByte = ((rk >> 4) & 0x0F) | ((tmpB >> 6) & 3) << 4;
+                }
+
+                float dl = d * (scaleByte - 32);
+                dst[dstOff + elemBase + e] = dl * qval;
+            }
+        }
+    }
+
+    /// <summary>Q4_K: 256 elements, 144 bytes/block.</summary>
+    private static void DequantizeRowQ4K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256;
+        const int BLOCK_BYTES = 144;
+        int numBlocks = (dModel + QK_K - 1) / QK_K;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            int blockOff = srcOff + b * BLOCK_BYTES;
+            int elemBase = b * QK_K;
+            int count = Math.Min(QK_K, dModel - elemBase);
+
+            ushort dRaw  = (ushort)(src[blockOff + 0] | (src[blockOff + 1] << 8));
+            ushort dmRaw = (ushort)(src[blockOff + 2] | (src[blockOff + 3] << 8));
+            float d    = F16ToF32(dRaw);
+            float dmin = F16ToF32(dmRaw);
+
+            // scales[12] at offset 4, qs[128] at offset 16
+            for (int e = 0; e < count; e++)
+            {
+                int group = e / 64;
+                int withinGroup = e % 64;
+                int isUpper = (withinGroup >= 32) ? 1 : 0;
+                int wgLower = withinGroup % 32;
+                int scaleIndex = group * 2 + isUpper;
+
+                // get_scale_min_k4
+                float sc, mn;
+                int scOff = blockOff + 4;
+                if (scaleIndex < 4)
+                {
+                    sc = (src[scOff + scaleIndex] & 63);
+                    mn = (src[scOff + scaleIndex + 4] & 63);
+                }
+                else
+                {
+                    int j = scaleIndex;
+                    sc = ((src[scOff + j + 4] & 0x0F) | ((src[scOff + j - 4] >> 6) << 4));
+                    mn = ((src[scOff + j + 4] >> 4) | ((src[scOff + j] >> 6) << 4));
+                }
+
+                int qsOff = blockOff + 16 + group * 32 + wgLower;
+                int qsByte = src[qsOff];
+                int q = (qsByte >> (isUpper * 4)) & 0x0F;
+
+                dst[dstOff + elemBase + e] = d * sc * q - dmin * mn;
+            }
+        }
+    }
+
+    /// <summary>Q5_K: 256 elements, 176 bytes/block.</summary>
+    private static void DequantizeRowQ5K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256;
+        const int BLOCK_BYTES = 176;
+        int numBlocks = (dModel + QK_K - 1) / QK_K;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            int blockOff = srcOff + b * BLOCK_BYTES;
+            int elemBase = b * QK_K;
+            int count = Math.Min(QK_K, dModel - elemBase);
+
+            ushort dRaw  = (ushort)(src[blockOff + 0] | (src[blockOff + 1] << 8));
+            ushort dmRaw = (ushort)(src[blockOff + 2] | (src[blockOff + 3] << 8));
+            float d    = F16ToF32(dRaw);
+            float dmin = F16ToF32(dmRaw);
+
+            for (int e = 0; e < count; e++)
+            {
+                int sub = e / 32;
+                float sc, mn;
+                int scOff = blockOff + 4;
+                if (sub < 4)
+                {
+                    sc = (src[scOff + sub] & 63);
+                    mn = (src[scOff + sub + 4] & 63);
+                }
+                else
+                {
+                    int j = sub;
+                    sc = ((src[scOff + j + 4] & 0x0F) | ((src[scOff + j - 4] >> 6) << 4));
+                    mn = ((src[scOff + j + 4] >> 4) | ((src[scOff + j] >> 6) << 4));
+                }
+
+                int j5 = e / 64;
+                int local = e % 64;
+                int isUpper = (local >= 32) ? 1 : 0;
+                int l = local % 32;
+                int qlIdx = j5 * 32 + l;
+
+                // Lower 4 bits from qs[128] at offset 48
+                int ql = (src[blockOff + 48 + qlIdx] >> (isUpper * 4)) & 0x0F;
+
+                // High 1 bit from qh[32] at offset 16
+                int qhBit = j5 * 2 + isUpper;
+                int qh = (src[blockOff + 16 + qlIdx] >> qhBit) & 1;
+
+                int q = ql | (qh << 4);
+
+                dst[dstOff + elemBase + e] = d * sc * q - dmin * mn;
+            }
+        }
+    }
+
+    /// <summary>Q6_K: 256 elements, 210 bytes/block.</summary>
+    private static void DequantizeRowQ6K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256;
+        const int BLOCK_BYTES = 210;
+        int numBlocks = (dModel + QK_K - 1) / QK_K;
+
+        for (int b = 0; b < numBlocks; b++)
+        {
+            int blockOff = srcOff + b * BLOCK_BYTES;
+            int elemBase = b * QK_K;
+            int count = Math.Min(QK_K, dModel - elemBase);
+
+            ushort dRaw = (ushort)(src[blockOff + 208] | (src[blockOff + 209] << 8));
+            float d = F16ToF32(dRaw);
+
+            for (int e = 0; e < count; e++)
+            {
+                int blk_h = e / 128;
+                int w = e % 128;
+                int quarter = w / 32;
+                int wq = w % 32;
+
+                int qlExtra = ((quarter == 1 || quarter == 3) ? 32 : 0);
+                int qlOff = blockOff + blk_h * 64 + qlExtra + wq;
+                int isUpper = (quarter == 2 || quarter == 3) ? 1 : 0;
+                int lower4 = (src[qlOff] >> (isUpper * 4)) & 0x0F;
+
+                int qhOff = blockOff + 128 + blk_h * 32 + wq;
+                int qhShift = quarter * 2;
+                int upper2 = (src[qhOff] >> qhShift) & 0x03;
+
+                int q = lower4 | (upper2 << 4);
+
+                int sc = (sbyte)src[blockOff + 192 + (e / 16)];
+
+                dst[dstOff + elemBase + e] = d * sc * (q - 32);
+            }
+        }
     }
 
     /// <summary>
