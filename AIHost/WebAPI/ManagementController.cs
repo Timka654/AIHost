@@ -150,6 +150,14 @@ public class BufferPoolStatsResponse
     public long ActiveMemoryBytes { get; set; }
 }
 
+public class InMemoryLogGetRequest
+{
+    [JsonPropertyName("category")]
+    public string? Category { get; set; }
+
+    public int? Skip { get; set; }
+}
+
 /// <summary>
 /// Management API controller for admin operations
 /// </summary>
@@ -293,19 +301,18 @@ public class ManagementController : ControllerBase
     /// Optional ?category= substring filter (e.g. "Transformer" or "Inference").
     /// </summary>
     [HttpGet("debug-logs")]
-    public IActionResult GetInMemoryLogs([FromQuery] string? category = null)
+    public IActionResult GetInMemoryLogs([FromQuery] InMemoryLogGetRequest? data = null)
     {
+        data ??= new InMemoryLogGetRequest();
         try
         {
             LogEntry[] entries;
-            if (!string.IsNullOrEmpty(category))
-                entries = _inMemoryLoggerProvider.GetEntries(category);
-            else
-                entries = _inMemoryLoggerProvider.GetAllEntries();
+
+            entries = _inMemoryLoggerProvider.GetEntries(out var count, data.Category, data.Skip);
 
             return Ok(new
             {
-                total = entries.Length,
+                total = count,
                 entries = entries.Select(e => new
                 {
                     timestamp = e.Timestamp,
@@ -467,23 +474,23 @@ public class ManagementController : ControllerBase
         {
             // Try to reload config if not found in memory
             _modelManager.ReloadConfig(request.ModelName);
-            
+
             // Auto-load model if not already loaded
             var model = await _modelManager.GetModelAsync(request.ModelName);
 
             var modelConfig = _modelManager.GetModelConfig(request.ModelName);
             var config = new AIHost.Inference.GenerationConfig
             {
-                MaxNewTokens        = request.MaxTokens ?? modelConfig?.Parameters.MaxTokens ?? 512,
-                Temperature         = request.Temperature ?? modelConfig?.Parameters.Temperature ?? 0.7f,
-                TopK                = request.TopK ?? modelConfig?.Parameters.TopK ?? 40,
-                TopP                = request.TopP ?? modelConfig?.Parameters.TopP ?? 0.9f,
-                RepetitionPenalty   = modelConfig?.Parameters.RepetitionPenalty ?? 1.1f,
-                FrequencyPenalty    = modelConfig?.Parameters.FrequencyPenalty ?? 0.0f,
-                PresencePenalty     = modelConfig?.Parameters.PresencePenalty ?? 0.0f,
-                Seed                = modelConfig?.Parameters.Seed ?? -1,
-                UseKVCache          = modelConfig?.Parameters.UseKVCache ?? true,
-                StopSequences       = modelConfig?.Parameters.Stop.ToList() ?? []
+                MaxNewTokens = request.MaxTokens ?? modelConfig?.Parameters.MaxTokens ?? 512,
+                Temperature = request.Temperature ?? modelConfig?.Parameters.Temperature ?? 0.7f,
+                TopK = request.TopK ?? modelConfig?.Parameters.TopK ?? 40,
+                TopP = request.TopP ?? modelConfig?.Parameters.TopP ?? 0.9f,
+                RepetitionPenalty = modelConfig?.Parameters.RepetitionPenalty ?? 1.1f,
+                FrequencyPenalty = modelConfig?.Parameters.FrequencyPenalty ?? 0.0f,
+                PresencePenalty = modelConfig?.Parameters.PresencePenalty ?? 0.0f,
+                Seed = modelConfig?.Parameters.Seed ?? -1,
+                UseKVCache = modelConfig?.Parameters.UseKVCache ?? true,
+                StopSequences = modelConfig?.Parameters.Stop.ToList() ?? []
             };
 
             // Apply chat template so instruction-tuned models receive properly formatted input.
@@ -556,7 +563,7 @@ public class ManagementController : ControllerBase
     private static string BuildDirectChatPrompt(AIHost.Config.ModelInstance model, ChatRequest request)
     {
         var tokenizer = model.Engine.Tokenizer;
-        bool isQwen   = tokenizer.GetTokenId("<|im_start|>") >= 0;
+        bool isQwen = tokenizer.GetTokenId("<|im_start|>") >= 0;
         var sb = new System.Text.StringBuilder();
 
         var systemText = request.SystemMessage
@@ -651,7 +658,7 @@ public class ManagementController : ControllerBase
             // Download to cache directory
             var fileName = Path.GetFileName(new Uri(request.Url).LocalPath);
             var cachePath = Path.Combine(_modelManager.CacheDirectory, fileName);
-            
+
             // Create cache directory if needed
             Directory.CreateDirectory(_modelManager.CacheDirectory);
 
@@ -671,7 +678,7 @@ public class ManagementController : ControllerBase
             // Create model config in models directory
             var modelDir = Path.Combine(_modelManager.ModelsDirectory, request.Name);
             Directory.CreateDirectory(modelDir);
-            
+
             var config = new ModelConfig
             {
                 Name = request.Name,
@@ -684,7 +691,8 @@ public class ManagementController : ControllerBase
             var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
             await System.IO.File.WriteAllTextAsync(configPath, json);
 
-            return Ok(new { 
+            return Ok(new
+            {
                 message = $"Model '{request.Name}' downloaded successfully to cache",
                 cache_path = cachePath,
                 config_path = configPath
@@ -710,7 +718,7 @@ public class ManagementController : ControllerBase
             // Get available physical memory (platform-specific)
             long availableMemory = 0;
             long totalMemory = 0;
-            
+
             if (OperatingSystem.IsWindows())
             {
                 // Windows: Use WMI if available
@@ -1446,7 +1454,7 @@ public class ManagementController : ControllerBase
 
             // Try to load the model
             var model = await _modelManager.GetModelAsync(name);
-            
+
             return Ok(new { message = "Model loaded successfully", name });
         }
         catch (FileNotFoundException ex)

@@ -105,21 +105,34 @@ public class QwenHybridFormat : ITransformerFormat
         int seqLen = x.Shape[0];
         bool useBatch = seqLen > 1; // Batch mode for prefill
 
+        // ── Pre-dequantize all weights BEFORE batch mode ────────────────────
+        // Same fix as ApplyLayerCombinedQKV: DequantizeInto does its own Flush/DeviceWaitIdle
+        // between chunks, which breaks batch mode and causes ErrorDeviceLost on AMD RADV.
+        var wAN = transformer.TempF32Named($"blk.{g}.attn_norm.weight");
+        var wQ = transformer.TempF32Named($"blk.{g}.attn_q.weight");
+        var wK = transformer.TempF32Named($"blk.{g}.attn_k.weight");
+        var wV = transformer.TempF32Named($"blk.{g}.attn_v.weight");
+        var wO = transformer.TempF32Named($"blk.{g}.attn_output.weight");
+        var wPN = transformer.TempF32Named($"blk.{g}.post_attention_norm.weight");
+        var wG = transformer.TempF32Named($"blk.{g}.ffn_gate.weight");
+        var wU = transformer.TempF32Named($"blk.{g}.ffn_up.weight");
+        var wD = transformer.TempF32Named($"blk.{g}.ffn_down.weight");
+
         if (useBatch)
             ops.BeginBatch();
 
         // 1. Pre-attention RMSNorm
         var xNorm = ops.Clone(x, "attn_norm_in");
-        { var (wAN, sAN) = transformer.TempF32Named($"blk.{g}.attn_norm.weight"); ops.LayerNorm(xNorm, wAN); if (!sAN) ops.DeferExternal(wAN); }
+        ops.LayerNorm(xNorm, wAN.tensor);
+        if (!wAN.isScratch) ops.DeferExternal(wAN.tensor);
 
         // 2. Separate Q, K, V projections
-        var (wQ, sQ) = transformer.TempF32Named($"blk.{g}.attn_q.weight");
-        var (wK, sK) = transformer.TempF32Named($"blk.{g}.attn_k.weight");
-        var (wV, sV) = transformer.TempF32Named($"blk.{g}.attn_v.weight");
-        var rawQ = ops.MatMulWeights(xNorm, wQ, "rawQ");
-        var K = ops.MatMulWeights(xNorm, wK, "K");
-        var V = ops.MatMulWeights(xNorm, wV, "V");
-        if (!sQ) ops.DeferExternal(wQ); if (!sK) ops.DeferExternal(wK); if (!sV) ops.DeferExternal(wV);
+        var rawQ = ops.MatMulWeights(xNorm, wQ.tensor, "rawQ");
+        var K = ops.MatMulWeights(xNorm, wK.tensor, "K");
+        var V = ops.MatMulWeights(xNorm, wV.tensor, "V");
+        if (!wQ.isScratch) ops.DeferExternal(wQ.tensor);
+        if (!wK.isScratch) ops.DeferExternal(wK.tensor);
+        if (!wV.isScratch) ops.DeferExternal(wV.tensor);
         if (useBatch) ops.DeferExternal(xNorm); else xNorm.Dispose();
 
         // 3. Gated Q detection via attn_gate.weight presence
@@ -188,26 +201,25 @@ public class QwenHybridFormat : ITransformerFormat
         }
 
         // 7. Output projection
-        var (wO, sO) = transformer.TempF32Named($"blk.{g}.attn_output.weight");
         var logger = AppLogger.Create<QwenHybridFormat>();
         logger.LogWarning("[TypeB] Layer {Layer} attnOut=[{A0}×{A1}] wO=[{B0}×{B1}] dModel={DM}",
-            g, attnOut.Shape[0], attnOut.Shape[1], wO.Shape[0], wO.Shape[1], transformer._dModel);
+            g, attnOut.Shape[0], attnOut.Shape[1], wO.tensor.Shape[0], wO.tensor.Shape[1], transformer._dModel);
         Tensor attnProj;
-        if (wO.Shape[0] == attnOut.Shape[1])
+        if (wO.tensor.Shape[0] == attnOut.Shape[1])
         {
-            attnProj = ops.MatMulWeights(attnOut, wO, "attn_proj_B");
+            attnProj = ops.MatMulWeights(attnOut, wO.tensor, "attn_proj_B");
         }
-        else if (wO.Shape[1] == attnOut.Shape[1])
+        else if (wO.tensor.Shape[1] == attnOut.Shape[1])
         {
-            attnProj = ops.MatMulWeightsT(attnOut, wO, "attn_proj_B");
+            attnProj = ops.MatMulWeightsT(attnOut, wO.tensor, "attn_proj_B");
         }
         else
         {
             throw new InvalidOperationException(
                 $"TypeB Layer {g}: cannot project attnOut [{attnOut.Shape[0]}×{attnOut.Shape[1]}] " +
-                $"with W_o [{wO.Shape[0]}×{wO.Shape[1]}]");
+                $"with W_o [{wO.tensor.Shape[0]}×{wO.tensor.Shape[1]}]");
         }
-        if (!sO) ops.DeferExternal(wO);
+        if (!wO.isScratch) ops.DeferExternal(wO.tensor);
         if (useBatch) ops.DeferExternal(attnOut); else attnOut.Dispose();
 
         var x1 = ops.Add(x, attnProj, "x_after_attn_B");
@@ -215,13 +227,13 @@ public class QwenHybridFormat : ITransformerFormat
 
         // 8. Post-attention norm → FFN
         var x1Norm = ops.Clone(x1, "post_attn_norm_in");
-        { var (wPN, sPN) = transformer.TempF32Named($"blk.{g}.post_attention_norm.weight"); ops.LayerNorm(x1Norm, wPN); if (!sPN) ops.DeferExternal(wPN); }
+        ops.LayerNorm(x1Norm, wPN.tensor);
+        if (!wPN.isScratch) ops.DeferExternal(wPN.tensor);
 
-        var (wG, sG) = transformer.TempF32Named($"blk.{g}.ffn_gate.weight");
-        var (wU, sU) = transformer.TempF32Named($"blk.{g}.ffn_up.weight");
-        var (wD, sD) = transformer.TempF32Named($"blk.{g}.ffn_down.weight");
-        var ffnOut = ops.FeedForward(x1Norm, wG, wU, wD, "ffn_B");
-        if (!sG) ops.DeferExternal(wG); if (!sU) ops.DeferExternal(wU); if (!sD) ops.DeferExternal(wD);
+        var ffnOut = ops.FeedForward(x1Norm, wG.tensor, wU.tensor, wD.tensor, "ffn_B");
+        if (!wG.isScratch) ops.DeferExternal(wG.tensor);
+        if (!wU.isScratch) ops.DeferExternal(wU.tensor);
+        if (!wD.isScratch) ops.DeferExternal(wD.tensor);
         if (useBatch) ops.DeferExternal(x1Norm); else x1Norm.Dispose();
 
         var output = ops.Add(x1, ffnOut, "layer_out_B");
@@ -263,6 +275,27 @@ public class QwenHybridFormat : ITransformerFormat
         int seqLen = x.Shape[0];
         bool useBatch = seqLen > 1; // Batch mode for prefill to reduce Flush/DeviceWaitIdle count
 
+        // ── Pre-dequantize all weights BEFORE batch mode ────────────────────
+        // CRITICAL FIX: DequantizeInto (called by TempF32) does its own Flush/DeviceWaitIdle
+        // between chunks for large tensors. If called inside batch mode, this breaks the
+        // command buffer batching and causes ErrorDeviceLost on AMD RADV because the
+        // descriptor ring gets reset mid-batch, and subsequent dispatches overwrite
+        // descriptor sets still cached in the Texture Cache Parser (TCP).
+        //
+        // Solution: dequantize all weights to F32 scratch buffers BEFORE BeginBatch(),
+        // so DequantizeInto runs in normal mode (with proper Flush/DeviceWaitIdle).
+        // Then inside batch mode, only GPU dispatches (matmul, norm, etc.) are recorded.
+        var wAN = transformer.TempF32(nm.AttnNorm(g));
+        var wQKV = transformer.TempF32(nm.AttnQKV(g));
+        string wAOkey = $"blk.{g}.ssm_out.weight";
+        if (!transformer.HasWeight(wAOkey))
+            wAOkey = nm.AttnOutput(g);
+        var wAO = transformer.TempF32Named(wAOkey);
+        var wFN = transformer.TempF32(nm.FfnNorm(g));
+        var wG = transformer.TempF32(nm.FfnGate(g));
+        var wU = transformer.TempF32(nm.FfnUp(g));
+        var wD = transformer.TempF32(nm.FfnDown(g));
+
         if (useBatch)
             ops.BeginBatch();
 
@@ -270,14 +303,12 @@ public class QwenHybridFormat : ITransformerFormat
 
         // 1. Pre-attention RMSNorm
         var xNorm = ops.Clone(x, "attn_norm_in");
-        var (wAN, sAN) = transformer.TempF32(nm.AttnNorm(g));
-        ops.LayerNorm(xNorm, wAN);
-        if (!sAN) ops.DeferExternal(wAN);
+        ops.LayerNorm(xNorm, wAN.tensor);
+        if (!wAN.isScratch) ops.DeferExternal(wAN.tensor);
 
         // 2. Combined QKV projection
-        var (wQKV, sQKV) = transformer.TempF32(nm.AttnQKV(g));
-        var qkv = ops.MatMulWeights(xNorm, wQKV, "qkv");
-        if (!sQKV) ops.DeferExternal(wQKV);
+        var qkv = ops.MatMulWeights(xNorm, wQKV.tensor, "qkv");
+        if (!wQKV.isScratch) ops.DeferExternal(wQKV.tensor);
 
         int totalQKV = qkv.Shape[1];
 
@@ -337,20 +368,16 @@ public class QwenHybridFormat : ITransformerFormat
         }
 
         // 7. Attention output projection (ssm_out.weight serves dual purpose)
-        string wAOkey = $"blk.{g}.ssm_out.weight";
-        if (!transformer.HasWeight(wAOkey))
-            wAOkey = nm.AttnOutput(g);
-        var (wAO, sAO) = transformer.TempF32Named(wAOkey);
         Tensor attnProj;
-        if (wAO.Shape[0] == attnOut.Shape[1])
-            attnProj = ops.MatMulWeights(attnOut, wAO, "attn_proj");
-        else if (wAO.Shape[1] == attnOut.Shape[1])
-            attnProj = ops.MatMulWeightsT(attnOut, wAO, "attn_proj");
+        if (wAO.tensor.Shape[0] == attnOut.Shape[1])
+            attnProj = ops.MatMulWeights(attnOut, wAO.tensor, "attn_proj");
+        else if (wAO.tensor.Shape[1] == attnOut.Shape[1])
+            attnProj = ops.MatMulWeightsT(attnOut, wAO.tensor, "attn_proj");
         else
             throw new InvalidOperationException(
                 $"TypeA Layer {g}: cannot project attnOut [{attnOut.Shape[0]}×{attnOut.Shape[1]}] " +
-                $"with W_o [{wAO.Shape[0]}×{wAO.Shape[1]}]");
-        if (!sAO) ops.DeferExternal(wAO);
+                $"with W_o [{wAO.tensor.Shape[0]}×{wAO.tensor.Shape[1]}]");
+        if (!wAO.isScratch) ops.DeferExternal(wAO.tensor);
         if (useBatch) ops.DeferExternal(attnOut); else attnOut.Dispose();
         if (useBatch) ops.DeferExternal(xNorm); else xNorm.Dispose();
 
@@ -360,48 +387,39 @@ public class QwenHybridFormat : ITransformerFormat
 
         // ── Post-attention norm (shared for SSM and FFN) ────────────────────
         var x1Norm = ops.Clone(x1, "post_attn_norm_in");
-        var (wFN, sFN) = transformer.TempF32(nm.FfnNorm(g));
-        ops.LayerNorm(x1Norm, wFN);
-        if (!sFN) ops.DeferExternal(wFN);
+        ops.LayerNorm(x1Norm, wFN.tensor);
+        if (!wFN.isScratch) ops.DeferExternal(wFN.tensor);
 
         // ── Gated Delta Net (SSM) branch ────────────────────────────────────
         // SSM recurrence runs on CPU. Weights are cached via TempF32Named (scratch buffers).
-        // For prefill (seqLen>1): SSM is skipped (returns xResidual directly).
-        // For decode (seqLen==1): SSM runs on CPU, needs GPU data → flush first.
+        // For both prefill and decode: flush batch first, run SSM on CPU, then start new batch for FFN.
+        // CPU SSM reads GPU data via ReadData() which requires all pending GPU work to complete.
         Tensor x2;
         if (ssmState != null && HasSSMWeights(transformer, g))
         {
-            if (useBatch)
-            {
-                // Prefill: SSM is skipped, but we still need to flush the batch
-                // before the FFN part. Actually for prefill SSM returns xResidual,
-                // so we can continue in batch mode.
-                var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, seqLen);
-                if (useBatch) ops.DeferExternal(x1); else x1.Dispose();
-                x2 = ssmOut;
-            }
-            else
-            {
-                // Decode: flush attention batch first, then run SSM on CPU
-                ops.Flush();
-                var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, seqLen);
-                x1.Dispose();
-                x2 = ssmOut;
-                // Start a new batch for FFN
-                ops.BeginBatch();
-            }
+            var logger2 = AppLogger.Create<QwenHybridFormat>();
+            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: flushing batch before SSM", g, seqLen);
+            ops.Flush();
+            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: starting SSM recurrence", g, seqLen);
+            var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, seqLen);
+            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: SSM done", g, seqLen);
+            x1.Dispose();
+            x2 = ssmOut;
+            // Start a new batch for FFN
+            logger2.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen}: starting FFN batch", g, seqLen);
+            ops.BeginBatch();
         }
         else
         {
             x2 = x1;
         }
 
+
         // ── FFN branch ──────────────────────────────────────────────────────
-        var (wG, sG) = transformer.TempF32(nm.FfnGate(g));
-        var (wU, sU) = transformer.TempF32(nm.FfnUp(g));
-        var (wD, sD) = transformer.TempF32(nm.FfnDown(g));
-        var ffnOut = ops.FeedForward(x1Norm, wG, wU, wD, "ffn_out");
-        if (!sG) ops.DeferExternal(wG); if (!sU) ops.DeferExternal(wU); if (!sD) ops.DeferExternal(wD);
+        var ffnOut = ops.FeedForward(x1Norm, wG.tensor, wU.tensor, wD.tensor, "ffn_out");
+        if (!wG.isScratch) ops.DeferExternal(wG.tensor);
+        if (!wU.isScratch) ops.DeferExternal(wU.tensor);
+        if (!wD.isScratch) ops.DeferExternal(wD.tensor);
         if (useBatch) ops.DeferExternal(x1Norm); else x1Norm.Dispose();
 
         var output = ops.Add(x2, ffnOut, "layer_out");
@@ -477,18 +495,12 @@ public class QwenHybridFormat : ITransformerFormat
         var ops = transformer.Ops;
         int dModel = xNorm.Shape[1];
 
-        // ── Fast path: seqLen=1 (decode) — CPU (GPU shader disabled, ErrorDeviceLost) ─
-        // GPU shaders (ssm_gdn_decode/recur) cause vkQueueSubmit ErrorDeviceLost on AMD.
-        // CPU decode for a single token is fast enough (~ms).
-        // ── Prefill (seqLen>1): skip SSM entirely, return xResidual directly ─
-        // SSM on CPU for many tokens is extremely slow (minutes).
-        // During prefill, attention + FFN already provide reasonable output.
-        if (seqLen > 1)
-            return xResidual;
+        var ssmLogger = AppLogger.Create<QwenHybridFormat>();
+        ssmLogger.LogWarning("[DBG_SSM] Layer {Layer} seqLen={SeqLen} starting SSM recurrence", g, seqLen);
 
-        // ── Old CPU fallback (disabled for performance) ───────────────────────
-        // Load weights via TempF32Named (uses pre-allocated scratch buffers)
+        // ── Load weights via TempF32Named (uses pre-allocated scratch buffers) ─
         float[] LoadSSMWeight(string name)
+
         {
             var (t, isScratch) = transformer.TempF32Named(name);
             var data = t.ReadData();

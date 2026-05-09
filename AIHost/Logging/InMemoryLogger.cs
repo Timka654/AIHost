@@ -47,6 +47,8 @@ public class InMemoryLogger : ILogger
     /// <summary>Get all stored log entries (newest last).</summary>
     public LogEntry[] GetEntries() => _entries.ToArray();
 
+    public int Count => _entries.Count;
+
     /// <summary>Clear all stored entries.</summary>
     public void Clear() { while (_entries.TryDequeue(out _)) { } }
 }
@@ -89,14 +91,23 @@ public class InMemoryLoggerProvider : ILoggerProvider
     }
 
     /// <summary>Get entries filtered by category (substring match).</summary>
-    public LogEntry[] GetEntries(string categoryFilter)
+    public LogEntry[] GetEntries(out int count, string? categoryFilter = null, int? skip = null)
     {
-        return _loggers
-            .Where(kv => kv.Key.Contains(categoryFilter, StringComparison.OrdinalIgnoreCase))
+        var selector = _loggers.AsEnumerable();
+
+        if (!string.IsNullOrEmpty(categoryFilter))
+            selector = selector.Where(kv => kv.Key.Contains(categoryFilter, StringComparison.OrdinalIgnoreCase));
+
+        count = selector.Sum(x => x.Value.Count);
+
+        return selector
             .SelectMany(kv => kv.Value.GetEntries())
             .OrderBy(e => e.Timestamp)
+            .Skip(skip ?? 0)
+            .Take(2000)
             .ToArray();
     }
+
 
     /// <summary>Clear all loggers.</summary>
     public void ClearAll()

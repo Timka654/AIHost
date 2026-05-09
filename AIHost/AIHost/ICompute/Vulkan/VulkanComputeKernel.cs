@@ -25,7 +25,15 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
     // (e.g. Qwen3.6-27B with chunked DequantizeInto + SSM + FFN = ~30+ dispatches per layer).
     // With 256 slots, even if ResetDispatchRing() is delayed or missed, we have
     // enough headroom to avoid overwriting descriptor sets that the GPU is still using.
-    private const int DescriptorPoolSize = 256;
+    //
+    // FURTHER INCREASE to 2048 for batch-mode prefill: Qwen3.6-27B has ~28 layers,
+    // each layer does ~30 dispatches = ~840 total dispatches in one batch.
+    // With 256 slots, the ring wraps around after 256 dispatches and overwrites
+    // descriptor sets still cached in the Texture Cache Parser (TCP) on AMD RADV,
+    // causing GPUVM faults → ErrorDeviceLost.
+    // 2048 slots provide enough headroom for the entire prefill batch without wrapping.
+    private const int DescriptorPoolSize = 2048;
+
 
     private DescriptorSet[] _descriptorSets = [];
     private int _dispatchIndex;
