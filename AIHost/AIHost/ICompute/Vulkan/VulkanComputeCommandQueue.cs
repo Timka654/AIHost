@@ -260,45 +260,63 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         var fence = _fences[slot];
         var queue = GetThreadQueue();
 
-        // Завершение записи команд
-        var endResult = _vk.EndCommandBuffer(cb);
-        if (endResult != Result.Success)
-            throw new InvalidOperationException($"vkEndCommandBuffer failed: {endResult}");
-
-        // Отправка команд в очередь (используем очередь, назначенную этому потоку)
-        var cmdBufferLocal = cb;
-        var submitInfo = new SubmitInfo
+        try
         {
-            SType = StructureType.SubmitInfo,
-            CommandBufferCount = 1,
-            PCommandBuffers = &cmdBufferLocal
-        };
+            // Завершение записи команд
+            var endResult = _vk.EndCommandBuffer(cb);
+            if (endResult != Result.Success)
+                throw new InvalidOperationException($"vkEndCommandBuffer failed: {endResult}");
 
-        var submitResult = _vk.QueueSubmit(queue, 1, &submitInfo, fence);
-        if (submitResult != Result.Success)
-            throw new InvalidOperationException($"vkQueueSubmit failed: {submitResult}");
+            // Отправка команд в очередь (используем очередь, назначенную этому потоку)
+            var cmdBufferLocal = cb;
+            var submitInfo = new SubmitInfo
+            {
+                SType = StructureType.SubmitInfo,
+                CommandBufferCount = 1,
+                PCommandBuffers = &cmdBufferLocal
+            };
 
-        // Сбрасываем флаг записи ТОЛЬКО после успешного QueueSubmit.
-        // Если QueueSubmit выбрасывает ErrorDeviceLost, t_isRecording остаётся true,
-        // и следующий Dispatch() не вызовет BeginSlotRecording() (который зависнет на WaitForFences).
-        t_isRecording = false;
+            var submitResult = _vk.QueueSubmit(queue, 1, &submitInfo, fence);
+            if (submitResult != Result.Success)
+                throw new InvalidOperationException($"vkQueueSubmit failed: {submitResult}");
 
-        // Ожидаем завершения fence — это гарантирует, что последующий QueueSubmit
-        // на этой же очереди не перезапишет текущий. Без этого ожидания два
-        // параллельных Flush() на одной очереди вызывают ErrorDeviceLost.
-        fixed (Fence* pFence = &_fences[slot])
-        {
-            _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
+            _logger.LogDebug("[DBG_QUEUE] Flush slot={Slot} submitResult={Result}", slot, submitResult);
+
+            // Ожидаем завершения fence — это гарантирует, что последующий QueueSubmit
+            // на этой же очереди не перезапишет текущий. Без этого ожидания два
+            // параллельных Flush() на одной очереди вызывают ErrorDeviceLost.
+            fixed (Fence* pFence = &_fences[slot])
+            {
+                _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
+            }
+
+            // DeviceWaitIdle after every flush to ensure all GPU operations are fully
+            // complete before any subsequent buffer allocation/deallocation.
+            // This prevents GPUVM faults caused by use-after-free patterns where
+            // a buffer is destroyed while the GPU still has pending references.
+            _vk.DeviceWaitIdle(_device);
+            _logger.LogDebug("[DBG_QUEUE] Flush done slot={Slot} deviceWaitIdle=OK", slot);
         }
-
-        _logger.LogDebug("[DBG_QUEUE] Flush slot={Slot} submitResult={Result}", slot, submitResult);
-
-        // DeviceWaitIdle after every flush to ensure all GPU operations are fully
-        // complete before any subsequent buffer allocation/deallocation.
-        // This prevents GPUVM faults caused by use-after-free patterns where
-        // a buffer is destroyed while the GPU still has pending references.
-        _vk.DeviceWaitIdle(_device);
-        _logger.LogDebug("[DBG_QUEUE] Flush done slot={Slot} deviceWaitIdle=OK", slot);
+        catch (Exception ex)
+        {
+            // CRITICAL FIX: If any Vulkan call throws (e.g. ErrorDeviceLost from QueueSubmit,
+            // or DeviceWaitIdle timeout), we MUST reset t_isRecording so the next Dispatch()
+            // call will re-initialize via BeginSlotRecording().
+            // Without this, t_isRecording stays true, and the next Dispatch() skips
+            // BeginSlotRecording(), which means it uses a stale command buffer that was
+            // never properly begun — causing immediate ErrorDeviceLost on the next submit.
+            _logger.LogError(ex, "[DBG_QUEUE] Flush failed slot={Slot} — resetting t_isRecording", slot);
+            t_isRecording = false;
+            throw; // rethrow — caller must handle ErrorDeviceLost
+        }
+        finally
+        {
+            // Гарантированный сброс флага записи в любом случае.
+            // Если всё прошло успешно, t_isRecording уже false (установлено выше).
+            // Если было исключение, t_isRecording сбрасывается в catch-блоке.
+            // Этот finally — дополнительная страховка.
+            t_isRecording = false;
+        }
 
         // Reset dispatch ring for all kernels after flush.
         // In non-batch mode, _dispatchIndex grows unboundedly and after 64 dispatches

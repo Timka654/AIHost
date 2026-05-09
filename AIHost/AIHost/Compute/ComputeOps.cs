@@ -25,13 +25,42 @@ public class ComputeOps : IDisposable
     internal bool _dbgLayer0 = true;
     private readonly ILogger<ComputeOps> _logger = AppLogger.Create<ComputeOps>();
 
+    // ── Persistent offset buffer for K-quant dequantization ──────────────────
+    // CRITICAL FIX: On AMD RADV, creating and destroying a small buffer for every
+    // DequantizeQ*K call causes GPUVM faults (PERMISSION_FAULTS with CLIENT_ID=TCP).
+    // The Texture Cache Parser caches descriptor data and may attempt to write to
+    // a freed buffer's GPUVM address when a new buffer is allocated at the same address.
+    //
+    // Solution: create ONE persistent offset buffer at construction time and reuse it
+    // for ALL K-quant dequantization dispatches. The buffer is never disposed until
+    // ComputeOps itself is disposed.
+    //
+    // For chunked DequantizeInto, each chunk still gets its own offset buffer because
+    // different chunks need different elementOffset values simultaneously (they are
+    // dispatched sequentially, but the buffer content must not change between
+    // SetArgument and the actual GPU read). However, the single-dispatch fast path
+    // in DequantizeInto also uses the persistent zero-offset buffer.
+    private readonly IComputeBuffer _persistentZeroOffset;
+    private bool _persistentOffsetInitialized;
+
     public IComputeDevice Device => _device;
 
     public ComputeOps(IComputeDevice device)
     {
         _device = device;
         _queue = device.CreateCommandQueue();
+
+        // Create persistent zero-offset buffer for K-quant dequantization.
+        // This buffer is initialized once and reused for all DequantizeQ*K calls
+        // and the DequantizeInto fast path. It is NEVER disposed until ComputeOps
+        // itself is disposed, eliminating the create/dispose cycle that triggers
+        // GPUVM faults on AMD RADV.
+        _persistentZeroOffset = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+        uint[] zeroOffset = { 0u };
+        _persistentZeroOffset.Write(zeroOffset);
+        _persistentOffsetInitialized = true;
     }
+
 
     // ── Batch infrastructure ─────────────────────────────────────────────────
 
@@ -45,7 +74,20 @@ public class ComputeOps : IDisposable
     /// </summary>
     public void Flush()
     {
-        _queue.Flush();
+        try
+        {
+            _queue.Flush();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[DBG_OPS] Flush failed — resetting kernel dispatch rings");
+            // Reset dispatch rings even on failure so next batch starts clean
+            foreach (var kernel in _kernelCache.Values)
+                if (kernel is VulkanComputeKernel vk)
+                    vk.ResetDispatchRing();
+            _batchMode = false;
+            throw; // rethrow — caller must handle ErrorDeviceLost
+        }
         foreach (var d in _deferred) d.Dispose();
         _deferred.Clear();
         _batchMode = false;
@@ -66,7 +108,19 @@ public class ComputeOps : IDisposable
         else
         {
             _logger.LogDebug("[DBG_OPS] MaybeFlush non-batch flush");
-            _queue.Flush();
+            try
+            {
+                _queue.Flush();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[DBG_OPS] MaybeFlush failed — resetting dispatch rings");
+                // Reset dispatch rings even on failure so next batch starts clean
+                foreach (var kernel in _kernelCache.Values)
+                    if (kernel is VulkanComputeKernel vk)
+                        vk.ResetDispatchRing();
+                throw; // rethrow — caller must handle ErrorDeviceLost
+            }
             // Reset dispatch ring after every non-batch flush.
             // In non-batch mode, _dispatchIndex grows unboundedly and after 64 dispatches
             // starts overwriting descriptor sets that the GPU may still have cached in
@@ -539,6 +593,7 @@ public class ComputeOps : IDisposable
 
     /// <summary>
     /// Деквантизировать тензор Q2_K → F32
+    /// Uses persistent zero-offset buffer (binding=2) to avoid GPUVM faults on AMD RADV.
     /// </summary>
     public Tensor DequantizeQ2K(Tensor quantized, string? resultName = null)
     {
@@ -551,6 +606,12 @@ public class ComputeOps : IDisposable
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
+        // CRITICAL FIX: Use persistent zero-offset buffer instead of creating a new one
+        // every call. On AMD RADV, creating and destroying small buffers causes GPUVM
+        // faults because the Texture Cache Parser (TCP) caches descriptor data and may
+        // attempt to write to a freed buffer's GPUVM address.
+        kernel.SetArgument(2, _persistentZeroOffset);
+
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
         MaybeFlush();
@@ -560,6 +621,7 @@ public class ComputeOps : IDisposable
 
     /// <summary>
     /// Деквантизировать тензор Q3_K → F32
+    /// Uses persistent zero-offset buffer (binding=2) to avoid GPUVM faults on AMD RADV.
     /// </summary>
     public Tensor DequantizeQ3K(Tensor quantized, string? resultName = null)
     {
@@ -572,6 +634,9 @@ public class ComputeOps : IDisposable
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
+        // CRITICAL FIX: Use persistent zero-offset buffer
+        kernel.SetArgument(2, _persistentZeroOffset);
+
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
         MaybeFlush();
@@ -581,6 +646,7 @@ public class ComputeOps : IDisposable
 
     /// <summary>
     /// Деквантизировать тензор Q4_K → F32
+    /// Uses persistent zero-offset buffer (binding=2) to avoid GPUVM faults on AMD RADV.
     /// </summary>
     public Tensor DequantizeQ4K(Tensor quantized, string? resultName = null)
     {
@@ -593,6 +659,9 @@ public class ComputeOps : IDisposable
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
+        // CRITICAL FIX: Use persistent zero-offset buffer
+        kernel.SetArgument(2, _persistentZeroOffset);
+
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
         MaybeFlush();
@@ -602,6 +671,7 @@ public class ComputeOps : IDisposable
 
     /// <summary>
     /// Деквантизировать тензор Q5_K → F32
+    /// Uses persistent zero-offset buffer (binding=2) to avoid GPUVM faults on AMD RADV.
     /// </summary>
     public Tensor DequantizeQ5K(Tensor quantized, string? resultName = null)
     {
@@ -614,6 +684,9 @@ public class ComputeOps : IDisposable
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
+        // CRITICAL FIX: Use persistent zero-offset buffer
+        kernel.SetArgument(2, _persistentZeroOffset);
+
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
         MaybeFlush();
@@ -623,6 +696,7 @@ public class ComputeOps : IDisposable
 
     /// <summary>
     /// Деквантизировать тензор Q6_K → F32
+    /// Uses persistent zero-offset buffer (binding=2) to avoid GPUVM faults on AMD RADV.
     /// </summary>
     public Tensor DequantizeQ6K(Tensor quantized, string? resultName = null)
     {
@@ -635,12 +709,16 @@ public class ComputeOps : IDisposable
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
+        // CRITICAL FIX: Use persistent zero-offset buffer
+        kernel.SetArgument(2, _persistentZeroOffset);
+
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
         MaybeFlush();
 
         return result;
     }
+
 
     /// <summary>
     /// Универсальная деквантизация (автоопределение типа)
@@ -721,13 +799,13 @@ public class ComputeOps : IDisposable
         if (totalGroups <= MaxGroupsPerDispatch)
         {
             // Single dispatch — fast path, offset = 0
-            var offsetBuffer = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
-            uint[] zeroOffset = { 0u };
-            offsetBuffer.Write(zeroOffset);
-
+            // CRITICAL FIX: Use persistent zero-offset buffer instead of creating a new one.
+            // On AMD RADV, creating and destroying small buffers causes GPUVM faults because
+            // the Texture Cache Parser (TCP) caches descriptor data and may attempt to write
+            // to a freed buffer's GPUVM address.
             kernel.SetArgument(0, quantized.Buffer);
             kernel.SetArgument(1, target.Buffer);
-            kernel.SetArgument(2, offsetBuffer);
+            kernel.SetArgument(2, _persistentZeroOffset);
             _queue.Dispatch(kernel, new[] { totalGroups }, null);
 
             if (_batchMode)
@@ -739,20 +817,27 @@ public class ComputeOps : IDisposable
                     if (k is VulkanComputeKernel vk)
                         vk.ResetDispatchRing();
             }
-
-            Defer(offsetBuffer);
         }
+
         else
         {
             // Chunked dispatch — split into multiple dispatches.
-            // Each chunk gets its OWN offset buffer pre-initialized with the correct
-            // elementOffset. This eliminates the CPU-GPU race on the shared buffer.
+            // CRITICAL FIX: Use a SINGLE reusable offset buffer that is rewritten
+            // between chunks, with a Flush+DeviceWaitIdle between each chunk.
+            // This avoids creating N temporary buffers (which causes GPUVM faults
+            // on AMD RADV due to TCP descriptor caching).
+            //
+            // The sequence per chunk is:
+            //   1. Write new elementOffset to the shared buffer (CPU write)
+            //   2. Dispatch the chunk
+            //   3. Flush (DeviceWaitIdle) — guarantees GPU is done reading the buffer
+            //   4. Go to next chunk — safe to rewrite the buffer now
             //
             // IMPORTANT: Chunks are aligned to 256-element boundaries (1 workgroup).
             // This ensures byte offsets are correct for quantized formats where
             // bytes-per-element is fractional (e.g. Q4_K = 0.5 bytes/element).
             // 256 elements = 1 superblock for all K-quant formats.
-            var offsetBuffers = new IComputeBuffer[numChunks];
+            var reusableOffsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
 
             _logger.LogDebug("[DBG_OPS] DequantizeInto chunked: totalElements={Total} totalGroups={Groups} " +
                 "chunks={Chunks} maxGroups={Max}",
@@ -765,15 +850,15 @@ public class ComputeOps : IDisposable
                 uint chunkGroups = chunkEndGroup - chunkStartGroup;
                 uint elementOffset = chunkStartGroup * SuperblockElements;
 
-                // Create and initialize a dedicated offset buffer for this chunk
-                var offBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+                // Write the new elementOffset to the reusable buffer.
+                // This is safe because the previous chunk's Flush guaranteed the GPU
+                // is done reading the old value.
                 uint[] offsetData = { elementOffset };
-                offBuf.Write(offsetData);
-                offsetBuffers[chunk] = offBuf;
+                reusableOffsetBuf.Write(offsetData);
 
                 kernel.SetArgument(0, quantized.Buffer);
                 kernel.SetArgument(1, target.Buffer);
-                kernel.SetArgument(2, offBuf);
+                kernel.SetArgument(2, reusableOffsetBuf);
                 _queue.Dispatch(kernel, new[] { chunkGroups }, null);
 
                 // CRITICAL FIX: Flush after EACH chunk, not just InsertMemoryBarrier.
@@ -782,6 +867,9 @@ public class ComputeOps : IDisposable
                 // TDR (Timeout Detection Recovery) and ErrorDeviceLost.
                 // Flushing after each chunk gives the GPU time to complete each chunk
                 // before the next one is submitted, avoiding the timeout.
+                // The DeviceWaitIdle inside Flush() also guarantees the GPU is done
+                // reading the reusable offset buffer, so we can safely rewrite it
+                // for the next chunk.
                 if (!_batchMode)
                 {
                     _queue.Flush();
@@ -807,11 +895,10 @@ public class ComputeOps : IDisposable
                         vk.ResetDispatchRing();
             }
 
-
-            // Defer all offset buffers for disposal
-            foreach (var ob in offsetBuffers)
-                Defer(ob);
+            // Dispose the single reusable offset buffer
+            Defer(reusableOffsetBuf);
         }
+
 
     }
 
@@ -1541,9 +1628,17 @@ public class ComputeOps : IDisposable
             kernel.Dispose();
 
         _kernelCache.Clear();
+
+        // Dispose the persistent zero-offset buffer created in the constructor.
+        // This buffer lives as long as ComputeOps itself to avoid the create/dispose
+        // cycle that triggers GPUVM faults on AMD RADV.
+        if (_persistentOffsetInitialized)
+            _persistentZeroOffset.Dispose();
+
         _queue.Dispose();
         _disposed = true;
     }
+
 }
 
 

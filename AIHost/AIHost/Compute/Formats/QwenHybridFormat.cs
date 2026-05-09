@@ -102,10 +102,15 @@ public class QwenHybridFormat : ITransformerFormat
     private static Tensor ApplyLayerTypeB(TransformerBase transformer, Tensor x, int g, int layerIdx, uint position, KVCache? kvCache)
     {
         var ops = transformer.Ops;
+        int seqLen = x.Shape[0];
+        bool useBatch = seqLen > 1; // Batch mode for prefill
+
+        if (useBatch)
+            ops.BeginBatch();
 
         // 1. Pre-attention RMSNorm
         var xNorm = ops.Clone(x, "attn_norm_in");
-        { var (wAN, sAN) = transformer.TempF32Named($"blk.{g}.attn_norm.weight"); ops.LayerNorm(xNorm, wAN); if (!sAN) wAN.Dispose(); }
+        { var (wAN, sAN) = transformer.TempF32Named($"blk.{g}.attn_norm.weight"); ops.LayerNorm(xNorm, wAN); if (!sAN) ops.DeferExternal(wAN); }
 
         // 2. Separate Q, K, V projections
         var (wQ, sQ) = transformer.TempF32Named($"blk.{g}.attn_q.weight");
@@ -114,8 +119,8 @@ public class QwenHybridFormat : ITransformerFormat
         var rawQ = ops.MatMulWeights(xNorm, wQ, "rawQ");
         var K = ops.MatMulWeights(xNorm, wK, "K");
         var V = ops.MatMulWeights(xNorm, wV, "V");
-        if (!sQ) wQ.Dispose(); if (!sK) wK.Dispose(); if (!sV) wV.Dispose();
-        xNorm.Dispose();
+        if (!sQ) ops.DeferExternal(wQ); if (!sK) ops.DeferExternal(wK); if (!sV) ops.DeferExternal(wV);
+        if (useBatch) ops.DeferExternal(xNorm); else xNorm.Dispose();
 
         // 3. Gated Q detection via attn_gate.weight presence
         int kvDim = K.Shape[1];
@@ -141,10 +146,11 @@ public class QwenHybridFormat : ITransformerFormat
         {
             var qProj = ops.SliceCols(rawQ, 0, qDim, "q_proj");
             var qGate = ops.SliceCols(rawQ, qDim, qDim, "q_gate");
-            rawQ.Dispose();
+            if (useBatch) ops.DeferExternal(rawQ); else rawQ.Dispose();
             ops.SiLU(qGate);
             gatedQ = ops.Multiply(qProj, qGate, "gated_q");
-            qProj.Dispose(); qGate.Dispose();
+            if (useBatch) ops.DeferExternal(qProj); else qProj.Dispose();
+            if (useBatch) ops.DeferExternal(qGate); else qGate.Dispose();
             nQH = qDim / headDim;
             qEffectiveDim = qDim;
         }
@@ -201,25 +207,30 @@ public class QwenHybridFormat : ITransformerFormat
                 $"TypeB Layer {g}: cannot project attnOut [{attnOut.Shape[0]}×{attnOut.Shape[1]}] " +
                 $"with W_o [{wO.Shape[0]}×{wO.Shape[1]}]");
         }
-        if (!sO) wO.Dispose();
-        attnOut.Dispose();
+        if (!sO) ops.DeferExternal(wO);
+        if (useBatch) ops.DeferExternal(attnOut); else attnOut.Dispose();
 
         var x1 = ops.Add(x, attnProj, "x_after_attn_B");
-        attnProj.Dispose();
+        if (useBatch) ops.DeferExternal(attnProj); else attnProj.Dispose();
 
         // 8. Post-attention norm → FFN
         var x1Norm = ops.Clone(x1, "post_attn_norm_in");
-        { var (wPN, sPN) = transformer.TempF32Named($"blk.{g}.post_attention_norm.weight"); ops.LayerNorm(x1Norm, wPN); if (!sPN) wPN.Dispose(); }
+        { var (wPN, sPN) = transformer.TempF32Named($"blk.{g}.post_attention_norm.weight"); ops.LayerNorm(x1Norm, wPN); if (!sPN) ops.DeferExternal(wPN); }
 
         var (wG, sG) = transformer.TempF32Named($"blk.{g}.ffn_gate.weight");
         var (wU, sU) = transformer.TempF32Named($"blk.{g}.ffn_up.weight");
         var (wD, sD) = transformer.TempF32Named($"blk.{g}.ffn_down.weight");
         var ffnOut = ops.FeedForward(x1Norm, wG, wU, wD, "ffn_B");
-        if (!sG) wG.Dispose(); if (!sU) wU.Dispose(); if (!sD) wD.Dispose();
-        x1Norm.Dispose();
+        if (!sG) ops.DeferExternal(wG); if (!sU) ops.DeferExternal(wU); if (!sD) ops.DeferExternal(wD);
+        if (useBatch) ops.DeferExternal(x1Norm); else x1Norm.Dispose();
 
         var output = ops.Add(x1, ffnOut, "layer_out_B");
-        x1.Dispose(); ffnOut.Dispose(); x.Dispose();
+        if (useBatch) ops.DeferExternal(x1); else x1.Dispose();
+        if (useBatch) ops.DeferExternal(ffnOut); else ffnOut.Dispose();
+        if (useBatch) ops.DeferExternal(x); else x.Dispose();
+
+        if (useBatch)
+            ops.Flush();
         return output;
     }
 
@@ -245,10 +256,15 @@ public class QwenHybridFormat : ITransformerFormat
     ///   5. output = x2 + ffn_out
     /// </summary>
     private static Tensor ApplyLayerCombinedQKV(TransformerBase transformer, Tensor x, int g, int layerIdx, uint position,
-                                          KVCache? kvCache, TensorNameMapper nm,
-                                          SSMState? ssmState)
+                                           KVCache? kvCache, TensorNameMapper nm,
+                                           SSMState? ssmState)
     {
         var ops = transformer.Ops;
+        int seqLen = x.Shape[0];
+        bool useBatch = seqLen > 1; // Batch mode for prefill to reduce Flush/DeviceWaitIdle count
+
+        if (useBatch)
+            ops.BeginBatch();
 
         // ── Attention branch ────────────────────────────────────────────────
 
@@ -256,12 +272,12 @@ public class QwenHybridFormat : ITransformerFormat
         var xNorm = ops.Clone(x, "attn_norm_in");
         var (wAN, sAN) = transformer.TempF32(nm.AttnNorm(g));
         ops.LayerNorm(xNorm, wAN);
-        if (!sAN) wAN.Dispose();
+        if (!sAN) ops.DeferExternal(wAN);
 
         // 2. Combined QKV projection
         var (wQKV, sQKV) = transformer.TempF32(nm.AttnQKV(g));
         var qkv = ops.MatMulWeights(xNorm, wQKV, "qkv");
-        if (!sQKV) wQKV.Dispose();
+        if (!sQKV) ops.DeferExternal(wQKV);
 
         int totalQKV = qkv.Shape[1];
 
@@ -290,16 +306,16 @@ public class QwenHybridFormat : ITransformerFormat
             ops.SiLU(qGate);
             var qGateTiled = ops.Concat(qGate, qGate, 1, "q_gate_tiled_2x");
             qGateTiled = ops.Concat(qGateTiled, qGate, 1, "q_gate_tiled_3x");
-            qGate.Dispose();
+            if (useBatch) ops.DeferExternal(qGate); else qGate.Dispose();
             gatedQ = ops.Multiply(Q, qGateTiled, "gated_q");
-            Q.Dispose();
-            qGateTiled.Dispose();
+            if (useBatch) ops.DeferExternal(Q); else Q.Dispose();
+            if (useBatch) ops.DeferExternal(qGateTiled); else qGateTiled.Dispose();
         }
         else
         {
             gatedQ = Q;
         }
-        qkv.Dispose();
+        if (useBatch) ops.DeferExternal(qkv); else qkv.Dispose();
 
         // 5. RoPE
         ops.ApplyRoPEFull(gatedQ, position, transformer._numHeads, headDim, transformer._ropeFreqBase);
@@ -334,28 +350,46 @@ public class QwenHybridFormat : ITransformerFormat
             throw new InvalidOperationException(
                 $"TypeA Layer {g}: cannot project attnOut [{attnOut.Shape[0]}×{attnOut.Shape[1]}] " +
                 $"with W_o [{wAO.Shape[0]}×{wAO.Shape[1]}]");
-        if (!sAO) wAO.Dispose();
-        attnOut.Dispose();
-        xNorm.Dispose();
+        if (!sAO) ops.DeferExternal(wAO);
+        if (useBatch) ops.DeferExternal(attnOut); else attnOut.Dispose();
+        if (useBatch) ops.DeferExternal(xNorm); else xNorm.Dispose();
 
         // 8. Residual: x1 = x + attn_proj
         var x1 = ops.Add(x, attnProj, "x_after_attn");
-        attnProj.Dispose();
+        if (useBatch) ops.DeferExternal(attnProj); else attnProj.Dispose();
 
         // ── Post-attention norm (shared for SSM and FFN) ────────────────────
         var x1Norm = ops.Clone(x1, "post_attn_norm_in");
         var (wFN, sFN) = transformer.TempF32(nm.FfnNorm(g));
         ops.LayerNorm(x1Norm, wFN);
-        if (!sFN) wFN.Dispose();
+        if (!sFN) ops.DeferExternal(wFN);
 
         // ── Gated Delta Net (SSM) branch ────────────────────────────────────
         // SSM recurrence runs on CPU. Weights are cached via TempF32Named (scratch buffers).
+        // For prefill (seqLen>1): SSM is skipped (returns xResidual directly).
+        // For decode (seqLen==1): SSM runs on CPU, needs GPU data → flush first.
         Tensor x2;
         if (ssmState != null && HasSSMWeights(transformer, g))
         {
-            var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, x1Norm.Shape[0]);
-            x1.Dispose();
-            x2 = ssmOut;
+            if (useBatch)
+            {
+                // Prefill: SSM is skipped, but we still need to flush the batch
+                // before the FFN part. Actually for prefill SSM returns xResidual,
+                // so we can continue in batch mode.
+                var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, seqLen);
+                if (useBatch) ops.DeferExternal(x1); else x1.Dispose();
+                x2 = ssmOut;
+            }
+            else
+            {
+                // Decode: flush attention batch first, then run SSM on CPU
+                ops.Flush();
+                var ssmOut = ApplySSMRecurrence(transformer, x1, x1Norm, g, ssmState, seqLen);
+                x1.Dispose();
+                x2 = ssmOut;
+                // Start a new batch for FFN
+                ops.BeginBatch();
+            }
         }
         else
         {
@@ -367,12 +401,17 @@ public class QwenHybridFormat : ITransformerFormat
         var (wU, sU) = transformer.TempF32(nm.FfnUp(g));
         var (wD, sD) = transformer.TempF32(nm.FfnDown(g));
         var ffnOut = ops.FeedForward(x1Norm, wG, wU, wD, "ffn_out");
-        if (!sG) wG.Dispose(); if (!sU) wU.Dispose(); if (!sD) wD.Dispose();
-        x1Norm.Dispose();
+        if (!sG) ops.DeferExternal(wG); if (!sU) ops.DeferExternal(wU); if (!sD) ops.DeferExternal(wD);
+        if (useBatch) ops.DeferExternal(x1Norm); else x1Norm.Dispose();
 
         var output = ops.Add(x2, ffnOut, "layer_out");
         if (!ReferenceEquals(x1, x2)) { /* x1 already disposed */ }
-        x2.Dispose(); ffnOut.Dispose(); x.Dispose();
+        if (useBatch) ops.DeferExternal(x2); else x2.Dispose();
+        if (useBatch) ops.DeferExternal(ffnOut); else ffnOut.Dispose();
+        if (useBatch) ops.DeferExternal(x); else x.Dispose();
+
+        if (useBatch)
+            ops.Flush();
         return output;
     }
 
