@@ -364,6 +364,11 @@ public class TransformerBase : IDisposable
             names.Add(_nameMapper.AttnOutput(refLayer));
             // ssm_out.weight is used as output projection for Type A layers
             names.Add($"blk.{refLayer}.ssm_out.weight");
+            // SSM/GDN weights (Qwen3.6 Type A layers)
+            names.Add($"blk.{refLayer}.ssm_alpha.weight");
+            names.Add($"blk.{refLayer}.ssm_beta.weight");
+            names.Add($"blk.{refLayer}.ssm_conv1d.weight");
+            names.Add($"blk.{refLayer}.attn_gate.weight");
             names.Add(_nameMapper.FfnNorm(refLayer));
             names.Add(_nameMapper.FfnGate(refLayer));
             names.Add(_nameMapper.FfnUp(refLayer));

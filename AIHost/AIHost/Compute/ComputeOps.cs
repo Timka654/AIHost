@@ -671,9 +671,12 @@ public class ComputeOps : IDisposable
 
         uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
         _queue.Dispatch(kernel, globalWorkSize, null);
-        // No barrier here — independent weight dequants can run in parallel on GPU.
-        // Caller must insert a barrier after ALL weight dequants are dispatched.
-        if (!_batchMode) _queue.Flush();
+        // In batch mode: insert a barrier so subsequent dispatches see the dequantized data.
+        // In non-batch mode: flush immediately (synchronous).
+        if (_batchMode)
+            _queue.InsertMemoryBarrier();
+        else
+            _queue.Flush();
     }
 
     /// <summary>
@@ -1280,6 +1283,82 @@ public class ComputeOps : IDisposable
         Defer(paramsBuffer);
 
         return result;
+    }
+
+    #endregion
+
+    #region SSM/GDN Operations
+
+    /// <summary>
+    /// Gated Delta Net (SSM) decode for ONE token.
+    /// Two dispatches with a memory barrier between them:
+    ///   Part 1 (ssm_gdn_decode): computes z, beta, alpha, gate, qkv_mixed, conv1d, SiLU → scratch
+    ///   Part 2 (ssm_gdn_recur):  reads scratch, L2 norm, Delta Net, Gated norm → output
+    ///
+    /// Dispatch: 48 workgroups × 128 threads for both parts.
+    ///
+    /// Input buffers:
+    ///   xNorm [DMODEL] — normalized input for this token
+    ///   convW [CONV_KERNEL * CONV_DIM] — conv1d weights
+    ///   convState [CONV_STATE_LEN * CONV_DIM] — sliding window (in/out)
+    ///   wQKV [DMODEL * CONV_DIM] — attn_qkv.weight
+    ///   wZ [DMODEL * VALUE_DIM] — attn_gate.weight
+    ///   wBeta [DMODEL * N_V_HEADS] — ssm_beta.weight
+    ///   wAlpha [DMODEL * N_V_HEADS] — ssm_alpha.weight
+    ///   dtBias [N_V_HEADS] — ssm_dt.bias
+    ///   ssA [N_V_HEADS] — ssm_a (A_NOSCAN)
+    ///   scratch [CONV_DIM + VALUE_DIM + N_V_HEADS*3] — scratch buffer (in/out)
+    ///   ssmState [HEAD_V_DIM * HEAD_V_DIM * N_V_HEADS] — recurrent state (in/out)
+    ///   ssmNorm [HEAD_V_DIM] — per-group RMSNorm weight
+    ///
+    /// Output:
+    ///   output [VALUE_DIM] — SSM output for this token
+    /// </summary>
+    public void SsmGdnDecode(
+        Tensor xNorm,
+        Tensor convW,
+        Tensor convState,
+        Tensor wQKV,
+        Tensor wZ,
+        Tensor wBeta,
+        Tensor wAlpha,
+        Tensor dtBias,
+        Tensor ssA,
+        Tensor scratch,
+        Tensor ssmState,
+        Tensor ssmNorm,
+        Tensor output)
+    {
+        // ── Part 1: conv1d ───────────────────────────────────────────────────
+        var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", ComputeShaders.SsmGdnDecode);
+        kernelDecode.SetArgument(0, xNorm.Buffer);
+        kernelDecode.SetArgument(1, convW.Buffer);
+        kernelDecode.SetArgument(2, convState.Buffer);
+        kernelDecode.SetArgument(3, wQKV.Buffer);
+        kernelDecode.SetArgument(4, wZ.Buffer);
+        kernelDecode.SetArgument(5, wBeta.Buffer);
+        kernelDecode.SetArgument(6, wAlpha.Buffer);
+        kernelDecode.SetArgument(7, dtBias.Buffer);
+        kernelDecode.SetArgument(8, ssA.Buffer);
+        kernelDecode.SetArgument(9, scratch.Buffer);
+
+        // 48 workgroups × 128 threads
+        _queue.Dispatch(kernelDecode, new[] { 48u }, null);
+
+        // Memory barrier between part 1 and part 2
+        _queue.InsertMemoryBarrier();
+
+        // ── Part 2: recurrence ───────────────────────────────────────────────
+        var kernelRecur = GetOrCreateKernel("ssm_gdn_recur", ComputeShaders.SsmGdnRecur);
+        kernelRecur.SetArgument(0, scratch.Buffer);
+        kernelRecur.SetArgument(1, ssmState.Buffer);
+        kernelRecur.SetArgument(2, ssmNorm.Buffer);
+        kernelRecur.SetArgument(3, output.Buffer);
+
+        // 48 workgroups × 128 threads
+        _queue.Dispatch(kernelRecur, new[] { 48u }, null);
+
+        MaybeFlush();
     }
 
     #endregion

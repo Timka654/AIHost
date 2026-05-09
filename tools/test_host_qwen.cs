@@ -2,12 +2,12 @@ using System.Text;
 using System.Text.Encodings;
 
 using var http = new HttpClient();
-
+http.Timeout = TimeSpan.FromMinutes(10);
 
 var request = new HttpRequestMessage(HttpMethod.Post, $"http://192.168.88.201:11434/manage/chat");
 
 request.Content = new StringContent(
-"{\"model_name\":\"example-model\",\"message\":\"Who are you?\",\"system_message\":null,\"temperature\":0.7,\"max_tokens\":512,\"stream\":true}", Encoding.UTF8, "application/json");
+"{\"model_name\":\"example-model\",\"message\":\"Hi\",\"system_message\":null,\"temperature\":0.7,\"max_tokens\":512,\"stream\":true}", Encoding.UTF8, "application/json");
 
 var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 

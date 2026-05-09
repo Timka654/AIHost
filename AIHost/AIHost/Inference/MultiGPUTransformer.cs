@@ -58,6 +58,8 @@ public class MultiGPUTransformer : IDisposable
     public int TotalLayers   => _transformers[0].LayerCount;
     /// <summary>GGUF reader from device-0 model; use to load the tokenizer.</summary>
     public IGGUFModel PrimaryModel => _models[0];
+    /// <summary>Primary GPU device (device 0).</summary>
+    public IComputeDevice PrimaryDevice => _devices[0];
 
     // ── Constructors ─────────────────────────────────────────────────────────
 

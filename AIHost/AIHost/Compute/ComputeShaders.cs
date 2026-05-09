@@ -63,6 +63,15 @@ public static class ComputeShaders
     // Dispatch: globalWorkSize = { numQHeads } (one workgroup per Q head, 256 threads each)
     public static readonly string FusedMHAGenerate = TryLoadOrInline("fused_mha_generate", _inlineFusedMHAGenerate);
 
+    // ── SSM/GDN shaders ─────────────────────────────────────────────────────
+    // Part 1: conv1d — computes z, beta, alpha, gate, qkv_mixed, conv1d, SiLU → scratch
+    // Dispatch: 48 workgroups × 128 threads
+    public static readonly string SsmGdnDecode = TryLoadOrInline("ssm_gdn_decode", _inlineSsmGdnDecode);
+
+    // Part 2: recurrence — reads scratch, L2 norm, Delta Net, Gated norm → output
+    // Dispatch: 48 workgroups × 128 threads
+    public static readonly string SsmGdnRecur = TryLoadOrInline("ssm_gdn_recur", _inlineSsmGdnRecur);
+
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {
         try
@@ -722,5 +731,174 @@ void main() {
     }
 }
 ";
-}
 
+    // ── SSM/GDN Part 1: conv1d ──────────────────────────────────────────────
+    // Computes: z, beta, alpha, gate, qkv_mixed, conv1d, SiLU → writes to scratch.
+    // Dispatch: 48 workgroups × 128 threads
+    private const string _inlineSsmGdnDecode = @"
+#version 450
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+const uint HEAD_V_DIM = 128u;
+const uint N_V_HEADS  = 48u;
+const uint N_K_HEADS  = 16u;
+const uint KEY_DIM    = 2048u;
+const uint VALUE_DIM  = 6144u;
+const uint CONV_DIM   = 10240u;
+const uint CONV_KERNEL = 4u;
+const uint CONV_STATE_LEN = 3u;
+const uint DMODEL     = 5120u;
+layout(set = 0, binding = 0)  readonly  buffer XNormBuf     { float data[]; } xNorm;
+layout(set = 0, binding = 1)  readonly  buffer ConvWBuf     { float data[]; } convW;
+layout(set = 0, binding = 2)  coherent  buffer ConvStateBuf  { float data[]; } convState;
+layout(set = 0, binding = 3)  readonly  buffer WQKVBuf       { float data[]; } wQKV;
+layout(set = 0, binding = 4)  readonly  buffer WZBuf         { float data[]; } wZ;
+layout(set = 0, binding = 5)  readonly  buffer WBetaBuf      { float data[]; } wBeta;
+layout(set = 0, binding = 6)  readonly  buffer WAlphaBuf     { float data[]; } wAlpha;
+layout(set = 0, binding = 7)  readonly  buffer DtBiasBuf     { float data[]; } dtBias;
+layout(set = 0, binding = 8)  readonly  buffer SsABuf        { float data[]; } ssA;
+layout(set = 0, binding = 9)  coherent  buffer ScratchBuf    { float data[]; } scratch;
+float silu(float x) { return x / (1.0 + exp(-x)); }
+void main() {
+    uint n = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint qkvIdx = n * HEAD_V_DIM + d;
+    float zVal = 0.0;
+    for (uint k = 0u; k < DMODEL; k++)
+        zVal += xNorm.data[k] * wZ.data[k + qkvIdx * DMODEL];
+    float betaSum = 0.0;
+    for (uint k = 0u; k < DMODEL; k++)
+        betaSum += xNorm.data[k] * wBeta.data[k + n * DMODEL];
+    float beta = 1.0 / (1.0 + exp(-betaSum));
+    float alphaSum = 0.0;
+    for (uint k = 0u; k < DMODEL; k++)
+        alphaSum += xNorm.data[k] * wAlpha.data[k + n * DMODEL];
+    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n]));
+    float gate = alpha * ssA.data[n];
+    float qkvVal = 0.0;
+    if (qkvIdx < CONV_DIM) {
+        for (uint k = 0u; k < DMODEL; k++)
+            qkvVal += xNorm.data[k] * wQKV.data[k + qkvIdx * DMODEL];
+    }
+    float convOut = 0.0;
+    if (qkvIdx < CONV_DIM) {
+        convOut += convState.data[0u * CONV_DIM + qkvIdx] * convW.data[0u * CONV_DIM + qkvIdx];
+        convOut += convState.data[1u * CONV_DIM + qkvIdx] * convW.data[1u * CONV_DIM + qkvIdx];
+        convOut += convState.data[2u * CONV_DIM + qkvIdx] * convW.data[2u * CONV_DIM + qkvIdx];
+        convOut += qkvVal * convW.data[3u * CONV_DIM + qkvIdx];
+    }
+    float siluVal = silu(convOut);
+    if (qkvIdx < CONV_DIM)
+        scratch.data[qkvIdx] = siluVal;
+    scratch.data[CONV_DIM + qkvIdx] = zVal;
+    if (d == 0u) {
+        scratch.data[CONV_DIM + VALUE_DIM + n] = beta;
+        scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n] = gate;
+    }
+    if (qkvIdx < CONV_DIM) {
+        convState.data[0u * CONV_DIM + qkvIdx] = convState.data[1u * CONV_DIM + qkvIdx];
+        convState.data[1u * CONV_DIM + qkvIdx] = convState.data[2u * CONV_DIM + qkvIdx];
+        convState.data[2u * CONV_DIM + qkvIdx] = qkvVal;
+    }
+}
+";
+
+    // ── SSM/GDN Part 2: recurrence ──────────────────────────────────────────
+    // Reads from scratch, computes L2 norm, Delta Net, Gated norm → output.
+    // Dispatch: 48 workgroups × 128 threads
+    private const string _inlineSsmGdnRecur = @"
+#version 450
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+const uint HEAD_V_DIM = 128u;
+const uint N_V_HEADS  = 48u;
+const uint N_K_HEADS  = 16u;
+const uint KEY_DIM    = 2048u;
+const uint VALUE_DIM  = 6144u;
+const uint CONV_DIM   = 10240u;
+const float EPS       = 1e-5;
+const float SCALE     = 0.08838834764831845;
+layout(set = 0, binding = 0) readonly  buffer ScratchBuf   { float data[]; } scratch;
+layout(set = 0, binding = 1) coherent buffer SsmStateBuf   { float data[]; } ssmState;
+layout(set = 0, binding = 2) readonly  buffer SsmNormBuf   { float data[]; } ssmNorm;
+layout(set = 0, binding = 3) writeonly buffer OutputBuf    { float data[]; } output;
+shared float sharedMem[128];
+float silu(float x) { return x / (1.0 + exp(-x)); }
+void main() {
+    uint n = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint h = n % N_K_HEADS;
+    uint qkvIdx = n * HEAD_V_DIM + d;
+    float zVal = scratch.data[CONV_DIM + qkvIdx];
+    float beta = scratch.data[CONV_DIM + VALUE_DIM + n];
+    float gate = scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n];
+    uint qkIdx = h * HEAD_V_DIM + d;
+    float qConvVal = 0.0, kConvVal = 0.0;
+    if (qkIdx < KEY_DIM) {
+        qConvVal = scratch.data[qkIdx];
+        kConvVal = scratch.data[KEY_DIM + qkIdx];
+    }
+    float vConvVal = scratch.data[2u * KEY_DIM + qkvIdx];
+    float localSumSqQ = qConvVal * qConvVal;
+    float localSumSqK = kConvVal * kConvVal;
+    sharedMem[d] = localSumSqQ;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (d < s) sharedMem[d] += sharedMem[d + s];
+        barrier();
+    }
+    float sumSqQ = sharedMem[0];
+    barrier();
+    sharedMem[d] = localSumSqK;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (d < s) sharedMem[d] += sharedMem[d + s];
+        barrier();
+    }
+    float sumSqK = sharedMem[0];
+    barrier();
+    float normQ = sqrt(sumSqQ + EPS);
+    float normK = sqrt(sumSqK + EPS);
+    float qNorm = qConvVal / normQ;
+    float kNorm = kConvVal / normK;
+    uint stateBase = n * HEAD_V_DIM * HEAD_V_DIM;
+    float gExp = exp(gate);
+    for (uint i = d; i < HEAD_V_DIM; i += 128u) {
+        uint rowBase = stateBase + i * HEAD_V_DIM;
+        for (uint j = 0u; j < HEAD_V_DIM; j++)
+            ssmState.data[rowBase + j] *= gExp;
+    }
+    barrier();
+    sharedMem[d] = kNorm;
+    barrier();
+    float sk = 0.0;
+    uint rowBaseD = stateBase + d * HEAD_V_DIM;
+    for (uint j = 0u; j < HEAD_V_DIM; j++)
+        sk += ssmState.data[rowBaseD + j] * sharedMem[j];
+    barrier();
+    float dVec = (vConvVal - sk) * beta;
+    sharedMem[d] = dVec;
+    barrier();
+    for (uint j = 0u; j < HEAD_V_DIM; j++)
+        ssmState.data[rowBaseD + j] += kNorm * sharedMem[j];
+    barrier();
+    sharedMem[d] = qNorm;
+    barrier();
+    float oVal = 0.0;
+    for (uint j = 0u; j < HEAD_V_DIM; j++)
+        oVal += ssmState.data[rowBaseD + j] * sharedMem[j];
+    oVal *= SCALE;
+    float zSilu = silu(zVal);
+    sharedMem[d] = oVal * oVal;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (d < s) sharedMem[d] += sharedMem[d + s];
+        barrier();
+    }
+    float sumSq = sharedMem[0];
+    barrier();
+    float rms = sqrt(sumSq / float(HEAD_V_DIM) + EPS);
+    float rmsInv = 1.0 / rms;
+    float yVal = oVal * rmsInv * ssmNorm.data[d] * zSilu;
+    output.data[qkvIdx] = yVal;
+}
+";
+}

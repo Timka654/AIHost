@@ -124,7 +124,7 @@ public class MultiGPUInferenceEngine : IInferenceEngine
     {
         // Create local KV cache and SSM state for this generation
         using var kvCache = config.UseKVCache ? _model.CreateKVCache() : null;
-        using var ssmState = config.UseKVCache ? new SSMState() : null;
+        using var ssmState = config.UseKVCache ? new SSMState(_model.PrimaryDevice) : null;
 
         if (config.Seed >= 0)
         {

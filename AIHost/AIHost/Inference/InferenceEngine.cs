@@ -216,7 +216,7 @@ public class InferenceEngine : IInferenceEngine
     {
         // Create local KV cache and SSM state for this generation
         using var kvCache = config.UseKVCache ? new KVCache(_ops) : null;
-        using var ssmState = config.UseKVCache ? new SSMState() : null;
+        using var ssmState = config.UseKVCache ? new SSMState(_ops.Device) : null;
 
         int eosToken = _tokenizer.EosToken;
 

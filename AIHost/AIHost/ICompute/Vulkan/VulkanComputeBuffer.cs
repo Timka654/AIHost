@@ -422,15 +422,16 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
     {
         if (_disposed) return;
 
+        // Get memory requirements BEFORE destroying the buffer
+        MemoryRequirements req;
+        _vk.GetBufferMemoryRequirements(_device, _buffer, &req);
+
         if (_mappedPointer != IntPtr.Zero)
             _vk.UnmapMemory(_device, _memory);
 
-        _vk.FreeMemory(_device, _memory, null);
         _vk.DestroyBuffer(_device, _buffer, null);
+        _vk.FreeMemory(_device, _memory, null);
 
-        // Узнаем реальный размер аллокации через memory requirements
-        MemoryRequirements req;
-        _vk.GetBufferMemoryRequirements(_device, _buffer, &req);
         TrackFree(req.Size);
 
         _disposed = true;
