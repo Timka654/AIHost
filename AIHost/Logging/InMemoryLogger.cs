@@ -13,7 +13,8 @@ public class InMemoryLogger : ILogger
     private readonly int _maxEntries;
     private readonly ConcurrentQueue<LogEntry> _entries = new();
 
-    public InMemoryLogger(string categoryName, int maxEntries = 5000)
+    public InMemoryLogger(string categoryName, int maxEntries = 50000)
+
     {
         _categoryName = categoryName;
         _maxEntries = maxEntries;
@@ -71,7 +72,8 @@ public class InMemoryLoggerProvider : ILoggerProvider
     private readonly ConcurrentDictionary<string, InMemoryLogger> _loggers = new();
     private readonly int _maxEntries;
 
-    public InMemoryLoggerProvider(int maxEntries = 5000)
+    public InMemoryLoggerProvider(int maxEntries = 50000)
+
     {
         _maxEntries = maxEntries;
     }

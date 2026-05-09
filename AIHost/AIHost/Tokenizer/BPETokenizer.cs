@@ -10,17 +10,19 @@ public class BPETokenizer
     private readonly int _bosToken;
     private readonly int _eosToken;
     private readonly int _unknownToken;
+    private readonly bool _isSentencePiece;
 
     public int VocabSize => _tokens.Length;
     public int BosToken => _bosToken;
     public int EosToken => _eosToken;
 
-    public BPETokenizer(string[] tokens, int bosToken = 1, int eosToken = 2, int unknownToken = 0)
+    public BPETokenizer(string[] tokens, int bosToken = 1, int eosToken = 2, int unknownToken = 0, bool isSentencePiece = true)
     {
         _tokens = tokens;
         _bosToken = bosToken;
         _eosToken = eosToken;
         _unknownToken = unknownToken;
+        _isSentencePiece = isSentencePiece;
 
         // Build token -> id lookup
         _tokenToId = new Dictionary<string, int>();
@@ -29,6 +31,7 @@ public class BPETokenizer
             _tokenToId[tokens[i]] = i;
         }
     }
+
 
     /// <summary>
     /// Load tokenizer from GGUF model metadata
@@ -51,10 +54,20 @@ public class BPETokenizer
         if (reader.Metadata.TryGetValue<int>("tokenizer.ggml.unknown_token_id", out var unk))
             unknownToken = unk;
 
-        Console.WriteLine($"Loaded tokenizer: {tokens.Length} tokens, BOS={bosToken}, EOS={eosToken}");
+        // Determine tokenizer type: "gpt2" = BPE/tiktoken (no ▁ prefix), "llama" or "sentencepiece" = SentencePiece
+        bool isSentencePiece = true;
+        if (reader.Metadata.TryGetValue<string>("tokenizer.ggml.model", out var modelType))
+        {
+            isSentencePiece = modelType.Equals("llama", StringComparison.OrdinalIgnoreCase)
+                           || modelType.Equals("sentencepiece", StringComparison.OrdinalIgnoreCase);
+            Console.WriteLine($"Tokenizer model type: '{modelType}' → isSentencePiece={isSentencePiece}");
+        }
 
-        return new BPETokenizer(tokens, bosToken, eosToken, unknownToken);
+        Console.WriteLine($"Loaded tokenizer: {tokens.Length} tokens, BOS={bosToken}, EOS={eosToken}, model={modelType ?? "unknown"}");
+
+        return new BPETokenizer(tokens, bosToken, eosToken, unknownToken, isSentencePiece);
     }
+
 
     /// <summary>
     /// Encode text to token IDs (simplified greedy matching).
@@ -123,9 +136,10 @@ public class BPETokenizer
                 // Direct lookup — no SentencePiece normalisation
                 tokens.Add(_tokenToId[segment]);
             }
-            else
+            else if (_isSentencePiece)
             {
                 // SentencePiece BPE tokenisation with ▁ prefix
+                // Used by LLaMA, Mistral, TinyLlama, etc.
                 string normalized = "▁" + segment.Replace(" ", "▁");
                 int pos = 0;
                 while (pos < normalized.Length)
@@ -161,7 +175,49 @@ public class BPETokenizer
                     }
                 }
             }
+            else
+            {
+                // BPE/tiktoken style (Qwen, GPT-2, etc.)
+                // No ▁ prefix, no space replacement.
+                // Tokens may contain spaces as part of the token (e.g. " Hello").
+                // Use greedy longest-match directly on the raw text.
+                int pos = 0;
+                while (pos < segment.Length)
+                {
+                    int bestMatchLen = 0;
+                    int bestTokenId = _unknownToken;
+
+                    for (int len = Math.Min(segment.Length - pos, 50); len > 0; len--)
+                    {
+                        string substr = segment.Substring(pos, len);
+                        if (_tokenToId.TryGetValue(substr, out int tokenId))
+                        {
+                            bestMatchLen = len;
+                            bestTokenId = tokenId;
+                            break;
+                        }
+                    }
+
+                    if (bestMatchLen > 0)
+                    {
+                        tokens.Add(bestTokenId);
+                        pos += bestMatchLen;
+                    }
+                    else
+                    {
+                        // Try single character
+                        char c = segment[pos];
+                        string charStr = c.ToString();
+                        if (_tokenToId.TryGetValue(charStr, out int charTokenId))
+                            tokens.Add(charTokenId);
+                        else
+                            tokens.Add(_unknownToken);
+                        pos++;
+                    }
+                }
+            }
         }
+
 
         if (addEos)
             tokens.Add(_eosToken);
@@ -183,15 +239,27 @@ public class BPETokenizer
                 if (tokenId == _bosToken || tokenId == _eosToken)
                     continue;
 
-                // SentencePiece: ▁ marks word boundary (space before word)
-                result.Append(_tokens[tokenId].Replace('▁', ' '));
+                if (_isSentencePiece)
+                {
+                    // SentencePiece: ▁ marks word boundary (space before word)
+                    result.Append(_tokens[tokenId].Replace('▁', ' '));
+                }
+                else
+                {
+                    // BPE/tiktoken: tokens are raw text (may contain spaces)
+                    result.Append(_tokens[tokenId]);
+                }
             }
         }
 
-        // Leading space is an artifact of the ▁ prepended during encoding
-        return result.Length > 0 && result[0] == ' '
-            ? result.ToString(1, result.Length - 1)
-            : result.ToString();
+        if (_isSentencePiece)
+        {
+            // Leading space is an artifact of the ▁ prepended during encoding
+            return result.Length > 0 && result[0] == ' '
+                ? result.ToString(1, result.Length - 1)
+                : result.ToString();
+        }
+        return result.ToString();
     }
 
     /// <summary>
@@ -200,9 +268,14 @@ public class BPETokenizer
     public string GetToken(int tokenId)
     {
         if (tokenId >= 0 && tokenId < _tokens.Length)
-            return _tokens[tokenId].Replace('▁', ' ');
+        {
+            if (_isSentencePiece)
+                return _tokens[tokenId].Replace('▁', ' ');
+            return _tokens[tokenId];
+        }
         return "<unk>";
     }
+
 
     /// <summary>
     /// Direct vocabulary lookup — returns the token ID for an exact vocab entry,

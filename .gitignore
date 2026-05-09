@@ -6,3 +6,4 @@ bin/
 *.csproj.user
 *.pubxml.user
 /publish/
+/publish_output
