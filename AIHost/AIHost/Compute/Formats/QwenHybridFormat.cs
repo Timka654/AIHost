@@ -580,14 +580,17 @@ public class QwenHybridFormat : ITransformerFormat
             float[] curConvState;
             lock (ssmState) { curConvState = (float[])ssmState.GetConvState(g).Clone(); }
 
+            // convW shape in GGUF: [CONV_KERNEL=4, CONV_DIM=10240] column-major
+            // Element (k,c) is at index k + c * CONV_KERNEL
+            // convWindow is row-major: [CONV_KERNEL * CONV_DIM], element (k,c) at k*CONV_DIM + c
             var convOut = new float[CONV_DIM];
             for (int c = 0; c < CONV_DIM; c++)
             {
                 float sum = 0;
-                sum += curConvState[0 * CONV_DIM + c] * convW[0 * CONV_DIM + c];
-                sum += curConvState[1 * CONV_DIM + c] * convW[1 * CONV_DIM + c];
-                sum += curConvState[2 * CONV_DIM + c] * convW[2 * CONV_DIM + c];
-                sum += pt.qkvMixed[c] * convW[3 * CONV_DIM + c];
+                sum += curConvState[0 * CONV_DIM + c] * convW[0 + c * CONV_KERNEL];
+                sum += curConvState[1 * CONV_DIM + c] * convW[1 + c * CONV_KERNEL];
+                sum += curConvState[2 * CONV_DIM + c] * convW[2 + c * CONV_KERNEL];
+                sum += pt.qkvMixed[c] * convW[3 + c * CONV_KERNEL];
                 convOut[c] = sum;
             }
 
