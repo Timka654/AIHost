@@ -148,20 +148,18 @@ public sealed class SSMState : IDisposable
         int convDim = CONV_DIM;
         int stateLen = CONV_STATE_LEN;
 
-        // Shift conv state: remove oldest, keep last (stateLen-1)
-        Buffer.BlockCopy(convState, convDim * sizeof(float),
-                         convState, 0,
-                         (stateLen - 1) * convDim * sizeof(float));
-
-        // Copy new input to the last slot
-        Buffer.BlockCopy(newInput, 0,
-                         convState, (stateLen - 1) * convDim * sizeof(float),
-                         convDim * sizeof(float));
-
-        // Build full window: [convState (3, convDim), newInput (1, convDim)]
+        // Build full window BEFORE shift: [old_0, old_1, old_2, newInput]
         var fullWindow = new float[CONV_KERNEL * convDim];
         Buffer.BlockCopy(convState, 0, fullWindow, 0, stateLen * convDim * sizeof(float));
         Buffer.BlockCopy(newInput, 0, fullWindow, stateLen * convDim * sizeof(float), convDim * sizeof(float));
+
+        // Shift conv state: [old_0, old_1, old_2] → [old_1, old_2, newInput]
+        Buffer.BlockCopy(convState, convDim * sizeof(float),
+                         convState, 0,
+                         (stateLen - 1) * convDim * sizeof(float));
+        Buffer.BlockCopy(newInput, 0,
+                         convState, (stateLen - 1) * convDim * sizeof(float),
+                         convDim * sizeof(float));
 
         return fullWindow;
     }
