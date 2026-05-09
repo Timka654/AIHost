@@ -23,6 +23,7 @@ public static class QuantizationFormats
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
@@ -34,7 +35,7 @@ uint readU8(uint off) { return (inBuf.data[off / 4u] >> ((off % 4u) * 8u)) & 0xF
 uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + offBuf.elementOffset;
     uint blk = gid / 256u;
     uint e   = gid % 256u;
     uint off = blk * 84u;           // 84 bytes per block
@@ -71,6 +72,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
@@ -82,7 +84,7 @@ uint readU8(uint off) { return (inBuf.data[off / 4u] >> ((off % 4u) * 8u)) & 0xF
 uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + offBuf.elementOffset;
     uint blk = gid / 256u;
     uint e   = gid % 256u;
     uint off = blk * 110u;
@@ -132,12 +134,15 @@ void main() {
     /// Q4_K: 256 elements, 144 bytes/block
     ///   d(f16) | dmin(f16) | scales[12] | qs[128]
     ///   scales[12] encodes 8 (6-bit scale, 6-bit min) pairs via K_SCALE format
+    ///
+    /// Supports elementOffset (binding=2) for chunked dispatch of large tensors.
     /// </summary>
     public const string DequantizeQ4K_Correct = @"
 #version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
@@ -160,7 +165,7 @@ void get_scale_min_k4(uint j, uint sc_off, out float sc_out, out float min_out) 
 }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + offBuf.elementOffset;
     uint blk = gid / 256u;
     uint e   = gid % 256u;   // element within block (0..255)
     uint off = blk * 144u;   // 144 bytes per block
@@ -190,6 +195,7 @@ void main() {
 }
 ";
 
+
     /// <summary>
     /// Q5_K: 256 elements, 176 bytes/block
     ///   d(f16) | dmin(f16) | scales[12] | qh[32] | qs[128]
@@ -199,6 +205,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
@@ -220,7 +227,7 @@ void get_scale_min_k4(uint j, uint sc_off, out float sc_out, out float min_out) 
 }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + offBuf.elementOffset;
     uint blk = gid / 256u;
     uint e   = gid % 256u;
     uint off = blk * 176u;          // 176 bytes per block
@@ -264,6 +271,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
@@ -276,7 +284,7 @@ int readI8(uint off) { uint v = readU8(off); int sv = int(v); return (v >= 128u)
 uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + offBuf.elementOffset;
     uint blk = gid / 256u;
     uint e   = gid % 256u;   // element within block (0..255)
     uint off = blk * 210u;   // 210 bytes per block

@@ -59,18 +59,40 @@ public class ComputeOps : IDisposable
     private void MaybeFlush()
     {
         if (_batchMode)
+        {
+            _logger.LogDebug("[DBG_OPS] MaybeFlush batchMode barrier");
             _queue.InsertMemoryBarrier();
+        }
         else
+        {
+            _logger.LogDebug("[DBG_OPS] MaybeFlush non-batch flush");
             _queue.Flush();
+            // Reset dispatch ring after every non-batch flush.
+            // In non-batch mode, _dispatchIndex grows unboundedly and after 64 dispatches
+            // starts overwriting descriptor sets that the GPU may still have cached in
+            // the Texture Cache Parser (TCP). This causes GPUVM faults on AMD RADV.
+            // DeviceWaitIdle inside _queue.Flush() guarantees the GPU has fully completed
+            // all work referencing the descriptor sets, so it's safe to reset now.
+            foreach (var kernel in _kernelCache.Values)
+                if (kernel is VulkanComputeKernel vk)
+                    vk.ResetDispatchRing();
+        }
     }
+
 
     /// <summary>In batch mode: defer disposal until Flush(). Otherwise dispose now.</summary>
     private void Defer(IDisposable d)
     {
         if (_batchMode)
+        {
+            _logger.LogDebug("[DBG_OPS] Defer batchMode add");
             _deferred.Add(d);
+        }
         else
+        {
+            _logger.LogDebug("[DBG_OPS] Defer non-batch dispose now");
             d.Dispose();
+        }
     }
 
     /// <summary>
@@ -639,6 +661,17 @@ public class ComputeOps : IDisposable
 
     /// <summary>
     /// Dequantize into a pre-allocated F32 tensor (avoids vkAllocateMemory per call).
+    /// For large tensors, splits the dispatch into chunks of at most MaxGroupsPerDispatch
+    /// workgroups to avoid GPUVM faults on AMD RADV caused by excessively long-running
+    /// dispatches (>10 seconds) that trigger TDR or memory access violations.
+    ///
+    /// Each chunk passes an elementOffset via a small offset buffer (binding=2) so the
+    /// shader computes gid = gl_GlobalInvocationID.x + offBuf.elementOffset, allowing
+    /// the same input/output buffers to be reused across chunks without aliasing.
+    ///
+    /// Chunks are aligned to superblock boundaries (256 elements = 1 workgroup) to
+    /// ensure correct byte offsets for quantized formats where bytes-per-element is
+    /// fractional (e.g. Q4_K = 0.5 bytes/element).
     /// </summary>
     public void DequantizeInto(Tensor quantized, Tensor target)
     {
@@ -666,17 +699,120 @@ public class ComputeOps : IDisposable
         };
 
         var kernel = GetOrCreateKernel(kernelName, shaderSource);
-        kernel.SetArgument(0, quantized.Buffer);
-        kernel.SetArgument(1, target.Buffer);
 
-        uint[] globalWorkSize = { (uint)((quantized.Shape.TotalElements + 255) / 256) };
-        _queue.Dispatch(kernel, globalWorkSize, null);
-        // In batch mode: insert a barrier so subsequent dispatches see the dequantized data.
-        // In non-batch mode: flush immediately (synchronous).
-        if (_batchMode)
-            _queue.InsertMemoryBarrier();
+        uint totalElements = (uint)quantized.Shape.TotalElements;
+        uint totalGroups = (totalElements + 255) / 256;
+
+        // AMD RADV can hang or fault on dispatches with >~65535 workgroups
+        // (especially on large tensors like 89M elements = 348160 groups).
+        // Split into chunks of at most MaxGroupsPerDispatch groups.
+        const uint MaxGroupsPerDispatch = 32768;
+
+        // Create per-chunk offset buffers (1 uint each) so each chunk gets its own
+        // buffer. This avoids a CPU-GPU race condition where the CPU writes a new
+        // elementOffset into a shared buffer while the GPU is still reading the old
+        // value from its L2 cache (Texture Cache Parser on AMD RADV).
+        // Binding=2: the shader reads offBuf.elementOffset and adds it to
+        // gl_GlobalInvocationID.x to compute the global element index.
+        const uint SuperblockElements = 256;
+        uint groupsPerChunk = MaxGroupsPerDispatch;
+        uint numChunks = (totalGroups + groupsPerChunk - 1) / groupsPerChunk;
+
+        if (totalGroups <= MaxGroupsPerDispatch)
+        {
+            // Single dispatch — fast path, offset = 0
+            var offsetBuffer = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+            uint[] zeroOffset = { 0u };
+            offsetBuffer.Write(zeroOffset);
+
+            kernel.SetArgument(0, quantized.Buffer);
+            kernel.SetArgument(1, target.Buffer);
+            kernel.SetArgument(2, offsetBuffer);
+            _queue.Dispatch(kernel, new[] { totalGroups }, null);
+
+            if (_batchMode)
+                _queue.InsertMemoryBarrier();
+            else
+            {
+                _queue.Flush();
+                foreach (var k in _kernelCache.Values)
+                    if (k is VulkanComputeKernel vk)
+                        vk.ResetDispatchRing();
+            }
+
+            Defer(offsetBuffer);
+        }
         else
-            _queue.Flush();
+        {
+            // Chunked dispatch — split into multiple dispatches.
+            // Each chunk gets its OWN offset buffer pre-initialized with the correct
+            // elementOffset. This eliminates the CPU-GPU race on the shared buffer.
+            //
+            // IMPORTANT: Chunks are aligned to 256-element boundaries (1 workgroup).
+            // This ensures byte offsets are correct for quantized formats where
+            // bytes-per-element is fractional (e.g. Q4_K = 0.5 bytes/element).
+            // 256 elements = 1 superblock for all K-quant formats.
+            var offsetBuffers = new IComputeBuffer[numChunks];
+
+            _logger.LogDebug("[DBG_OPS] DequantizeInto chunked: totalElements={Total} totalGroups={Groups} " +
+                "chunks={Chunks} maxGroups={Max}",
+                totalElements, totalGroups, numChunks, MaxGroupsPerDispatch);
+
+            for (uint chunk = 0; chunk < numChunks; chunk++)
+            {
+                uint chunkStartGroup = chunk * groupsPerChunk;
+                uint chunkEndGroup = Math.Min(chunkStartGroup + groupsPerChunk, totalGroups);
+                uint chunkGroups = chunkEndGroup - chunkStartGroup;
+                uint elementOffset = chunkStartGroup * SuperblockElements;
+
+                // Create and initialize a dedicated offset buffer for this chunk
+                var offBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+                uint[] offsetData = { elementOffset };
+                offBuf.Write(offsetData);
+                offsetBuffers[chunk] = offBuf;
+
+                kernel.SetArgument(0, quantized.Buffer);
+                kernel.SetArgument(1, target.Buffer);
+                kernel.SetArgument(2, offBuf);
+                _queue.Dispatch(kernel, new[] { chunkGroups }, null);
+
+                // CRITICAL FIX: Flush after EACH chunk, not just InsertMemoryBarrier.
+                // On AMD RADV, submitting 7 chunks × 32768 groups = 229376 groups in a
+                // single command buffer causes the GPU to run for 10+ seconds, triggering
+                // TDR (Timeout Detection Recovery) and ErrorDeviceLost.
+                // Flushing after each chunk gives the GPU time to complete each chunk
+                // before the next one is submitted, avoiding the timeout.
+                if (!_batchMode)
+                {
+                    _queue.Flush();
+                    foreach (var k in _kernelCache.Values)
+                        if (k is VulkanComputeKernel vk)
+                            vk.ResetDispatchRing();
+                }
+                else
+                {
+                    _queue.InsertMemoryBarrier();
+                }
+            }
+
+            _logger.LogDebug("[DBG_OPS] DequantizeInto chunked done");
+
+            // In non-batch mode: already flushed per-chunk above.
+            // In batch mode: flush once at the end.
+            if (_batchMode)
+            {
+                _queue.Flush();
+                foreach (var k in _kernelCache.Values)
+                    if (k is VulkanComputeKernel vk)
+                        vk.ResetDispatchRing();
+            }
+
+
+            // Defer all offset buffers for disposal
+            foreach (var ob in offsetBuffers)
+                Defer(ob);
+        }
+
     }
 
     /// <summary>
@@ -1370,6 +1506,9 @@ public class ComputeOps : IDisposable
     /// </summary>
     public Tensor Clone(Tensor input, string? resultName = null)
     {
+        _logger.LogDebug("[DBG_OPS] Clone start name={Name} shape={Shape} total={Total}",
+            resultName ?? "?", input.Shape, input.Shape.TotalElements);
+
         var result = Tensor.Create(_device, input.Shape, DataType.F32, resultName);
 
         uint[] paramsData = { (uint)input.Shape.TotalElements };
@@ -1383,9 +1522,12 @@ public class ComputeOps : IDisposable
 
         uint total = (uint)input.Shape.TotalElements;
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
+        _logger.LogDebug("[DBG_OPS] Clone dispatch done, calling MaybeFlush");
         MaybeFlush();
+        _logger.LogDebug("[DBG_OPS] Clone MaybeFlush done, deferring paramsBuffer");
 
         Defer(paramsBuffer);
+        _logger.LogDebug("[DBG_OPS] Clone done name={Name}", resultName ?? "?");
         return result;
     }
 

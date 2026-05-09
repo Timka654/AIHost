@@ -118,7 +118,7 @@ if (args.Contains("--manual"))
 var builder = WebApplication.CreateBuilder(args);
 
 // Locate server.json — prefer data/config, fall back to config/ for backward compat.
-var configPath = Path.Combine(AppContext.BaseDirectory, "data", "config", "server.json");
+var configPath = Path.Combine(AppContext.BaseDirectory, "data", "config", "server.config.json");
 if (!File.Exists(configPath))
     configPath = Path.Combine(AppContext.BaseDirectory, "config", "server.json");
 

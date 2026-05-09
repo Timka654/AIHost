@@ -121,10 +121,13 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             MemoryTypeIndex = memTypeIdx
         };
 
-        if (_vk.AllocateMemory(_device, &allocInfo, null, out _memory) != Result.Success)
-            throw new InvalidOperationException("Failed to allocate Vulkan memory");
+        var allocResult = _vk.AllocateMemory(_device, &allocInfo, null, out _memory);
+        if (allocResult != Result.Success)
+            throw new InvalidOperationException($"Failed to allocate Vulkan memory: {allocResult}");
 
-        _vk.BindBufferMemory(_device, _buffer, _memory, 0);
+        var bindResult = _vk.BindBufferMemory(_device, _buffer, _memory, 0);
+        if (bindResult != Result.Success)
+            throw new InvalidOperationException($"Failed to bind buffer memory: {bindResult}");
     }
 
     // ── Public API ──────────────────────────────────────────────────────────────
@@ -279,6 +282,11 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             _vk.FreeMemory(_device, stagingMem, null);
             _vk.DestroyBuffer(_device, stagingBuf, null);
         }
+        // DeviceWaitIdle ensures the staging copy is fully visible to all queues
+        // before any subsequent dispatch on a different queue reads this buffer.
+        // Without this, a dispatch on queue 1 may read stale data if the staging
+        // copy was submitted on queue 0 (different queue, no implicit ordering).
+        _vk.DeviceWaitIdle(_device);
     }
 
     private void DownloadStaging(byte* dst, ulong byteCount)
@@ -311,7 +319,8 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             SharingMode = SharingMode.Exclusive
         };
 
-        _vk.CreateBuffer(_device, &bufInfo, null, out var stagingBuf);
+        if (_vk.CreateBuffer(_device, &bufInfo, null, out var stagingBuf) != Result.Success)
+            throw new InvalidOperationException("Failed to create staging buffer");
 
         MemoryRequirements req;
         _vk.GetBufferMemoryRequirements(_device, stagingBuf, &req);
@@ -329,11 +338,15 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             MemoryTypeIndex = typeIdx
         };
 
-        _vk.AllocateMemory(_device, &allocInfo, null, out var stagingMem);
-        _vk.BindBufferMemory(_device, stagingBuf, stagingMem, 0);
+        if (_vk.AllocateMemory(_device, &allocInfo, null, out var stagingMem) != Result.Success)
+            throw new InvalidOperationException("Failed to allocate staging memory");
+
+        if (_vk.BindBufferMemory(_device, stagingBuf, stagingMem, 0) != Result.Success)
+            throw new InvalidOperationException("Failed to bind staging buffer memory");
 
         void* ptr;
-        _vk.MapMemory(_device, stagingMem, 0, size, 0, &ptr);
+        if (_vk.MapMemory(_device, stagingMem, 0, size, 0, &ptr) != Result.Success)
+            throw new InvalidOperationException("Failed to map staging memory");
 
         return (stagingBuf, stagingMem, (IntPtr)ptr);
     }
@@ -438,4 +451,6 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
     }
 
     internal VkBuffer VkBuffer => _buffer;
+
+
 }

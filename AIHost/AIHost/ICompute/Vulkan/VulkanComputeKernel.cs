@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Silk.NET.Vulkan;
 using Silk.NET.Shaderc;
 
@@ -8,6 +9,7 @@ namespace AIHost.ICompute.Vulkan;
 /// </summary>
 internal unsafe class VulkanComputeKernel : ComputeKernelBase
 {
+    private readonly ILogger _logger = AppLogger.Create<VulkanComputeKernel>();
     private readonly Vk _vk;
     private readonly Device _device;
     private readonly string _source;
@@ -19,7 +21,12 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
     private DescriptorPool _descriptorPool;
     // Ring of descriptor sets — one per dispatch within a batch.
     // Each Dispatch() uses the next slot; ResetDispatchRing() rewinds after Flush().
-    private const int DescriptorPoolSize = 64;
+    // Increased from 64 to 256 to accommodate models with many dispatches per layer
+    // (e.g. Qwen3.6-27B with chunked DequantizeInto + SSM + FFN = ~30+ dispatches per layer).
+    // With 256 slots, even if ResetDispatchRing() is delayed or missed, we have
+    // enough headroom to avoid overwriting descriptor sets that the GPU is still using.
+    private const int DescriptorPoolSize = 256;
+
     private DescriptorSet[] _descriptorSets = [];
     private int _dispatchIndex;
     private readonly List<IComputeBuffer> _bufferArguments = new();
@@ -389,6 +396,8 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         }
 
         _vk.UpdateDescriptorSets(_device, (uint)_bufferArguments.Count, writeDescriptorSets, 0, null);
+        _logger.LogDebug("[DBG_KERNEL] UpdateDescriptorSets kernel={Name} slot={Slot} dispatchIdx={Idx} bindings={Bindings}",
+            _entryPoint, slot, _dispatchIndex, _bufferArguments.Count);
         return currentSet;
     }
 

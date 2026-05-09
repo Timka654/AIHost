@@ -2,6 +2,7 @@
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
@@ -23,7 +24,7 @@ void get_scale_min_k4(uint j, uint sc_off, out float sc_out, out float min_out) 
 }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x + offBuf.elementOffset;
     uint blk = gid / 256u;
     uint loc = gid % 256u;
     uint off = blk * 144u;

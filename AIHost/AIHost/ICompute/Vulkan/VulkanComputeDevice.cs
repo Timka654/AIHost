@@ -105,7 +105,9 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
         DeviceIndex = deviceIndex;
 
         // Получаем глобальный контекст устройства (создаёт VkInstance и VkDevice при первом вызове)
-        _deviceContext = VulkanGlobalContext.AcquireDeviceContext(deviceIndex, queueCount: 2);
+        // Используем 1 очередь для предотвращения cross-queue synchronization issues
+        // (staging uploads on queue 0 vs dispatches on queue 1 causing GPUVM faults).
+        _deviceContext = VulkanGlobalContext.AcquireDeviceContext(deviceIndex, queueCount: 1);
 
         // Получение свойств устройства
         PhysicalDeviceProperties props;

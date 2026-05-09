@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Silk.NET.Vulkan;
 
 namespace AIHost.ICompute.Vulkan;
@@ -12,6 +13,7 @@ namespace AIHost.ICompute.Vulkan;
 /// </summary>
 internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 {
+    private readonly ILogger _logger = AppLogger.Create<VulkanComputeCommandQueue>();
     private readonly Vk _vk;
     private readonly Device _device;
     private readonly VulkanDeviceContext _deviceContext;
@@ -130,6 +132,7 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
             throw new InvalidOperationException("Failed to begin command buffer");
 
         t_isRecording = true;
+        _logger.LogDebug("[DBG_QUEUE] BeginSlotRecording slot={Slot}", slot);
         return cb;
     }
 
@@ -212,6 +215,9 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
                 : globalWorkSize[2])
             : 1;
 
+        _logger.LogDebug("[DBG_QUEUE] Dispatch kernel={Kernel} slot={Slot} groups=({GX},{GY},{GZ})",
+            vkKernel.Name, slot, groupCountX, groupCountY, groupCountZ);
+
         _vk.CmdDispatch(cb, groupCountX, groupCountY, groupCountZ);
     }
 
@@ -249,8 +255,6 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (!t_isRecording)
             return; // ничего не записывали
 
-        t_isRecording = false;
-
         int slot = GetSlot();
         var cb = _commandBuffers[slot];
         var fence = _fences[slot];
@@ -274,6 +278,11 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         if (submitResult != Result.Success)
             throw new InvalidOperationException($"vkQueueSubmit failed: {submitResult}");
 
+        // Сбрасываем флаг записи ТОЛЬКО после успешного QueueSubmit.
+        // Если QueueSubmit выбрасывает ErrorDeviceLost, t_isRecording остаётся true,
+        // и следующий Dispatch() не вызовет BeginSlotRecording() (который зависнет на WaitForFences).
+        t_isRecording = false;
+
         // Ожидаем завершения fence — это гарантирует, что последующий QueueSubmit
         // на этой же очереди не перезапишет текущий. Без этого ожидания два
         // параллельных Flush() на одной очереди вызывают ErrorDeviceLost.
@@ -281,6 +290,27 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         {
             _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
         }
+
+        _logger.LogDebug("[DBG_QUEUE] Flush slot={Slot} submitResult={Result}", slot, submitResult);
+
+        // DeviceWaitIdle after every flush to ensure all GPU operations are fully
+        // complete before any subsequent buffer allocation/deallocation.
+        // This prevents GPUVM faults caused by use-after-free patterns where
+        // a buffer is destroyed while the GPU still has pending references.
+        _vk.DeviceWaitIdle(_device);
+        _logger.LogDebug("[DBG_QUEUE] Flush done slot={Slot} deviceWaitIdle=OK", slot);
+
+        // Reset dispatch ring for all kernels after flush.
+        // In non-batch mode, _dispatchIndex grows unboundedly and after 64 dispatches
+        // starts overwriting descriptor sets that the GPU may still have cached in
+        // the Texture Cache Parser (TCP). This causes GPUVM faults on AMD RADV.
+        // Resetting here ensures descriptor sets are only reused after DeviceWaitIdle
+        // guarantees the GPU has fully completed all work referencing them.
+        // Note: this is a best-effort reset. The VulkanComputeKernel instances are
+        // not directly accessible from here, so we rely on ComputeOps.Flush() for
+        // the actual reset. The key fix is that ComputeOps.MaybeFlush() in non-batch
+        // mode now also resets the dispatch ring.
+
     }
 
     public override void Dispose()
