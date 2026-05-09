@@ -101,31 +101,31 @@ void main() {
     }
     barrier();
 
-    // 8b. Broadcast kNorm, compute sk[d]
+    // 8b. sk = S^T @ k  (llama.cpp: mul(s,k) + sum_rows → sk[j]=sum_i S[i,j]*k[i])
     sharedMem[d] = kNorm;
     barrier();
     float sk = 0.0;
-    uint rowBaseD = stateBase + d * HEAD_V_DIM;
-    for (uint j = 0u; j < HEAD_V_DIM; j++)
-        sk += ssmState.data[rowBaseD + j] * sharedMem[j];
+    for (uint i = 0u; i < HEAD_V_DIM; i++)
+        sk += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
     barrier();
 
     // 8c. dVec[d] = (vConvVal - sk) * beta
     float dVec = (vConvVal - sk) * beta;
 
-    // 8d. s[d, :, n] += kNorm[d] * dVec[:]
+    // 8d. S[i,j] += k[i] * dv[j]  (outer product k ⊗ dv)
     sharedMem[d] = dVec;
     barrier();
+    uint rowBaseD = stateBase + d * HEAD_V_DIM;
     for (uint j = 0u; j < HEAD_V_DIM; j++)
         ssmState.data[rowBaseD + j] += kNorm * sharedMem[j];
     barrier();
 
-    // 8e. Broadcast qNorm, compute output
+    // 8e. output = S^T @ q  (llama.cpp: mul(s,q) + sum_rows → o[j]=sum_i S[i,j]*q[i])
     sharedMem[d] = qNorm;
     barrier();
     float oVal = 0.0;
-    for (uint j = 0u; j < HEAD_V_DIM; j++)
-        oVal += ssmState.data[rowBaseD + j] * sharedMem[j];
+    for (uint i = 0u; i < HEAD_V_DIM; i++)
+        oVal += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
     oVal *= SCALE;
 
     // ── Step 9: Gated norm ──────────────────────────────────────────────────

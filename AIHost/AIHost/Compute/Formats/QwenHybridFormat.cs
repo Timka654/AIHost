@@ -122,14 +122,22 @@ public class QwenHybridFormat : ITransformerFormat
             var z=new float[VD];Array.Copy(zA,zt,z,0,VD);var beta=new float[NVH];Array.Copy(bA,bt,beta,0,NVH);var gate=new float[NVH];Array.Copy(gA,gt,gate,0,NVH);var qm=new float[CD];Array.Copy(qA,qt,qm,0,CD);
             var cw=ss.UpdateConvState(g,qm);var cv=new float[CD];
             for(int c=0;c<CD;c++){float s=0;s+=cw[0*CD+c]*cW[0*CD+c];s+=cw[1*CD+c]*cW[1*CD+c];s+=cw[2*CD+c]*cW[2*CD+c];s+=cw[3*CD+c]*cW[3*CD+c];cv[c]=s;}
+            // SiLU activation on conv output (llama.cpp: ggml_silu(conv_output_proper))
+            for(int c=0;c<CD;c++){float f=cv[c];cv[c]=f/(1f+MathF.Exp(-f));}
+            // q_conv, k_conv, v_conv are slices of SiLU-ed conv output (no additional activation)
             var qc=new float[KD];var kc=new float[KD];var vc=new float[VD];
-            for(int i=0;i<KD;i++){float f=cv[i];qc[i]=f/(1f+MathF.Exp(-f));}
-            for(int i=0;i<KD;i++){float f=cv[KD+i];kc[i]=f/(1f+MathF.Exp(-f));}
-            for(int i=0;i<VD;i++){float f=cv[2*KD+i];vc[i]=f/(1f+MathF.Exp(-f));}
+            Array.Copy(cv,0,qc,0,KD);Array.Copy(cv,KD,kc,0,KD);Array.Copy(cv,2*KD,vc,0,VD);
             for(int h=0;h<NKH;h++){int b_=h*HVD;float q2=0,k2=0;for(int d=0;d<HVD;d++){q2+=qc[b_+d]*qc[b_+d];k2+=kc[b_+d]*kc[b_+d];}float nq=MathF.Sqrt(q2+ep),nk=MathF.Sqrt(k2+ep);for(int d=0;d<HVD;d++){qc[b_+d]/=nq;kc[b_+d]/=nk;}}
             var yt=new float[VD];
-            for(int n=0;n<NVH;n++){int h=n%NKH,sB=n*HVD*HVD,vB=n*HVD,kB=h*HVD,qB=h*HVD;float gE=MathF.Exp(gate[n]);for(int i=0;i<HVD;i++){int rB=sB+i*HVD;for(int j=0;j<HVD;j++)st[rB+j]*=gE;}var sk=new float[HVD];for(int d=0;d<HVD;d++){float sm=0;int rB=sB+d*HVD;for(int j=0;j<HVD;j++)sm+=st[rB+j]*kc[kB+j];sk[d]=sm;}var dv=new float[HVD];for(int d=0;d<HVD;d++)dv[d]=(vc[vB+d]-sk[d])*beta[n];for(int i=0;i<HVD;i++){int rB=sB+i*HVD;float ki=kc[kB+i];for(int j=0;j<HVD;j++)st[rB+j]+=ki*dv[j];}for(int d=0;d<HVD;d++){float sm=0;int rB=sB+d*HVD;for(int j=0;j<HVD;j++)sm+=st[rB+j]*qc[qB+j];yt[vB+d]=sm*sc;}}
-            for(int n=0;n<NVH;n++){int gB=n*HVD;float s2=0;for(int d=0;d<HVD;d++){float vv=yt[gB+d];s2+=vv*vv;}float ri=1f/MathF.Sqrt(s2/HVD+1e-5f);float zs=z[gB]/(1f+MathF.Exp(-z[gB]));for(int d=0;d<HVD;d++)yt[gB+d]=yt[gB+d]*ri*sNw[d]*zs;}
+            for(int n=0;n<NVH;n++){int h=n%NKH,sB=n*HVD*HVD,vB=n*HVD,kB=h*HVD,qB=h*HVD;float gE=MathF.Exp(gate[n]);for(int i=0;i<HVD;i++){int rB=sB+i*HVD;for(int j=0;j<HVD;j++)st[rB+j]*=gE;}// decay: s *= exp(gate)
+            // sk = S^T @ k  (llama.cpp: mul(s,k) + sum_rows → sk[j]=sum_i S[i,j]*k[i])
+            var sk=new float[HVD];for(int d=0;d<HVD;d++){float sm=0;for(int i=0;i<HVD;i++)sm+=st[sB+i*HVD+d]*kc[kB+i];sk[d]=sm;}
+            var dv=new float[HVD];for(int d=0;d<HVD;d++)dv[d]=(vc[vB+d]-sk[d])*beta[n];// delta = (v - sk) * beta
+            for(int i=0;i<HVD;i++){int rB=sB+i*HVD;float ki=kc[kB+i];for(int j=0;j<HVD;j++)st[rB+j]+=ki*dv[j];}// S += k ⊗ dv
+            // output = S^T @ q  (llama.cpp: mul(s,q) + sum_rows → o[j]=sum_i S[i,j]*q[i])
+            for(int d=0;d<HVD;d++){float sm=0;for(int i=0;i<HVD;i++)sm+=st[sB+i*HVD+d]*qc[qB+i];yt[vB+d]=sm*sc;}}
+            // Gated RMS-norm: self.norm(output, z) where z is SiLU(z) element-wise (llama.cpp: build_norm_gated → ggml_silu + mul)
+            for(int n=0;n<NVH;n++){int gB=n*HVD;float s2=0;for(int d=0;d<HVD;d++){float vv=yt[gB+d];s2+=vv*vv;}float ri=1f/MathF.Sqrt(s2/HVD+1e-5f);for(int d=0;d<HVD;d++){float zs=z[gB+d]/(1f+MathF.Exp(-z[gB+d]));yt[gB+d]=yt[gB+d]*ri*sNw[d]*zs;}}
             Buffer.BlockCopy(yt,0,ys,ti*VD*sizeof(float),VD*sizeof(float));
         }
 
