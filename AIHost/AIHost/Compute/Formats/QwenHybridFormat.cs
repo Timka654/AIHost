@@ -187,12 +187,14 @@ public class QwenHybridFormat : ITransformerFormat
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
         var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
 
-        var result = Tensor.Create(o.Device, new TensorShape(new[]{sl, dm}), DataType.F32, "ssm_out");
+        // SsmGdnDecode writes per-token output [VD]; collect into [sl, VD].
+        var perTokenOutputs = new Tensor[sl];
         var scratch = Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
 
         for (int ti = 0; ti < sl; ti++)
         {
             var x1nRow = o.Clone(xn);
+            var tokenOut = Tensor.Create(o.Device, new TensorShape(new[]{VD}), DataType.F32, $"ssm_tok{ti}");
 
             o.SsmGdnDecode(
                 x1nRow,
@@ -200,10 +202,14 @@ public class QwenHybridFormat : ITransformerFormat
                 scratch,
                 ssmStateTensor,
                 normF32,
-                result);
+                tokenOut);
 
+            perTokenOutputs[ti] = tokenOut;
             if (sl > 1 && ti < sl - 1) x1nRow.Dispose();
         }
+
+        var result = o.Concat(perTokenOutputs, 0, "ssm_concat");
+        foreach (var t in perTokenOutputs) t.Dispose();
 
         // Phase 3: output projection (matmulT) + residual
         var projected = o.MatMulWeightsT(result, wOut, "ssm_proj");
