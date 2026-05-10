@@ -163,6 +163,7 @@ public class TransformerBase : IDisposable
     /// </summary>
     public Tensor ForwardHead(Tensor x)
     {
+        var _ts = GlobalProfiler.Start();
         var (normF32, normScratch) = TempF32(_nameMapper!.OutputNorm);
         _ops.LayerNorm(x, normF32);
         if (!normScratch) normF32.Dispose();
@@ -181,6 +182,7 @@ public class TransformerBase : IDisposable
         var logits = _ops.MatMulWeights(x, outF32, "logits");
         if (!outScratch) outF32.Dispose();
         x.Dispose();
+        GlobalProfiler.End(_ts, "Fwd.Head.Detail");
         return logits;
     }
 

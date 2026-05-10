@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using AIHost.Compute;
 using AIHost.Config;
 using AIHost.ICompute;
 using AIHost.Logging;
@@ -343,6 +344,30 @@ public class ManagementController : ControllerBase
         catch (Exception ex)
         {
             return StatusCode(500, new { error = $"Failed to clear debug logs: {ex.Message}" });
+        }
+    }
+
+    /// <summary>
+    /// Get compute profiling summary (GPU/CPU operation timings).
+    /// Query: ?clear=true to reset counters after reading.
+    /// Enable/disable is controlled via server.config.json → profiling_enabled.
+    /// </summary>
+    [HttpGet("profile")]
+    public IActionResult GetProfilingSummary([FromQuery] bool? clear = null)
+    {
+        try
+        {
+            var summary = GlobalProfiler.GetSummary();
+            var results = GlobalProfiler.GetResults();
+
+            if (clear == true)
+                GlobalProfiler.Clear();
+
+            return Ok(new { enabled = GlobalProfiler.Enabled, summary, results });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = $"Failed to get profiling data: {ex.Message}" });
         }
     }
 

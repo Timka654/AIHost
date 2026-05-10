@@ -130,23 +130,38 @@ public class MultiGPUTransformer : IDisposable
     public Tensor Forward(int[] tokenIds, uint startPosition, MultiDeviceKVCache? kvCache = null,
                            SSMState? ssmState = null)
     {
+        var _tsFwd = GlobalProfiler.Start();
         // 1. Embedding on device 0
+        var _tsE = GlobalProfiler.Start();
         Tensor x = _transformers[0].ForwardEmbedding(tokenIds);
+        GlobalProfiler.End(_tsE, "Fwd.Embedding");
 
         // 2. Layers: each device runs its slice
+        var _tsL = GlobalProfiler.Start();
         for (int d = 0; d < _devices.Length; d++)
         {
+            long _tsX = 0;
             if (d > 0)
+            {
+                _tsX = GlobalProfiler.Start();
                 x = TransferTensor(x, _transformers[d].Ops);
+                GlobalProfiler.End(_tsX, "Fwd.Transfer");
+            }
 
             x = _transformers[d].ForwardLayers(x, startPosition, kvCache?.ForDevice(d), ssmState);
         }
+        GlobalProfiler.End(_tsL, "Fwd.Layers");
 
         // 3. Head always on device 0: transfer back if we ended up on another device
         if (_devices.Length > 1)
             x = TransferTensor(x, _transformers[0].Ops);
 
-        return _transformers[0].ForwardHead(x);
+        var _tsH = GlobalProfiler.Start();
+        var result = _transformers[0].ForwardHead(x);
+        GlobalProfiler.End(_tsH, "Fwd.Head");
+        GlobalProfiler.End(_tsFwd, "Fwd.Total");
+
+        return result;
     }
 
     /// <summary>Create a fresh KV-cache sized for this model's devices.</summary>

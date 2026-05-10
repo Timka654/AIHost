@@ -12,11 +12,15 @@ public class QwenHybridFormat : ITransformerFormat
 
     public Tensor ApplyLayer(TransformerBase t, Tensor x, int li, uint pos, KVCache? kvc, SSMState? ss)
     {
+        var _ts = GlobalProfiler.Start();
         int g = t.GlobalLayer(li); var nm = t._nameMapper!;
         bool hc = t.HasWeight($"blk.{g}.attn_qkv.weight"), hs = t.HasWeight($"blk.{g}.attn_q.weight");
-        if (!hc && !hs) return Fallback(t, x, g, nm);
-        if (hs) return TypeB(t, x, g, li, pos, kvc);
-        return TypeA(t, x, g, li, pos, kvc, nm, ss);
+        Tensor result;
+        if (!hc && !hs) result = Fallback(t, x, g, nm);
+        else if (hs) result = TypeB(t, x, g, li, pos, kvc);
+        else result = TypeA(t, x, g, li, pos, kvc, nm, ss);
+        GlobalProfiler.End(_ts, "Qwen.ApplyLayer");
+        return result;
     }
 
     // Transpose GGUF row-major [dm, d2] → SIMD [d2, dm]

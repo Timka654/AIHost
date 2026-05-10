@@ -1,4 +1,5 @@
 using AIHost;
+using AIHost.Compute;
 using AIHost.Config;
 using AIHost.ICompute;
 using AIHost.ICompute.Vulkan;
@@ -140,6 +141,10 @@ else
     await File.WriteAllTextAsync(configPath, defaultJson);
     Console.WriteLine($"✓ Created default config at {configPath}");
 }
+
+// Initialize profiling from server config
+GlobalProfiler.Enabled = serverConfig.ProfilingEnabled;
+Console.WriteLine($"  Profiling: {(GlobalProfiler.Enabled ? "enabled" : "disabled")}");
 
 // Also wire server.json into the IConfiguration pipeline so that services can
 // access it via IConfiguration and it participates in the standard config chain.

@@ -74,6 +74,7 @@ public class ComputeOps : IDisposable
     /// </summary>
     public void Flush()
     {
+        var _ts = GlobalProfiler.Start();
         try
         {
             _queue.Flush();
@@ -88,6 +89,7 @@ public class ComputeOps : IDisposable
             _batchMode = false;
             throw; // rethrow — caller must handle ErrorDeviceLost
         }
+        GlobalProfiler.End(_ts, "ComputeOps.Flush");
         foreach (var d in _deferred) d.Dispose();
         _deferred.Clear();
         _batchMode = false;
@@ -753,6 +755,7 @@ public class ComputeOps : IDisposable
     /// </summary>
     public void DequantizeInto(Tensor quantized, Tensor target)
     {
+        var _ts = GlobalProfiler.Start();
         if (target.DataType != DataType.F32)
             throw new ArgumentException("Target must be F32");
 
@@ -817,6 +820,7 @@ public class ComputeOps : IDisposable
                     if (k is VulkanComputeKernel vk)
                         vk.ResetDispatchRing();
             }
+            GlobalProfiler.End(_ts, "ComputeOps.DequantizeInto");
         }
 
         else
@@ -875,6 +879,7 @@ public class ComputeOps : IDisposable
             // All chunks already flushed individually above.
             // Dispose the reusable offset buffer (GPU is idle after the last Flush).
             Defer(reusableOffsetBuf);
+            GlobalProfiler.End(_ts, "ComputeOps.DequantizeInto");
         }
 
 

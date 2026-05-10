@@ -350,4 +350,11 @@ public class ServerConfig
     /// </summary>
     [JsonPropertyName("rate_limit_requests_per_minute")]
     public int RateLimitRequestsPerMinute { get; set; } = 60;
+
+    /// <summary>
+    /// Enable compute profiling (default false). When enabled, every GPU/CPU op
+    /// records timing data viewable via GET /manage/profile.
+    /// </summary>
+    [JsonPropertyName("profiling_enabled")]
+    public bool ProfilingEnabled { get; set; } = false;
 }
