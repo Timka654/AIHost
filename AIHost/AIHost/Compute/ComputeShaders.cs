@@ -805,7 +805,7 @@ const float SCALE     = 0.08838834764831845;
 layout(set = 0, binding = 0) readonly  buffer ScratchBuf { float data[]; } scratch;
 layout(set = 0, binding = 1)          buffer SsmStateBuf { float data[]; } ssmState;
 layout(set = 0, binding = 2) readonly  buffer SsmNormBuf { float data[]; } ssmNorm;
-layout(set = 0, binding = 3) writeonly buffer OutputBuf  { float data[]; } output;
+layout(set = 0, binding = 3) writeonly buffer OutputBuf  { float data[]; } outBuf;
 shared float sharedMem[128];
 float silu(float x) { return x / (1.0 + exp(-x)); }
 void main() {
@@ -860,7 +860,7 @@ void main() {
     float sumSq = sharedMem[0]; barrier();
     float rmsInv = 1.0 / sqrt(sumSq / float(HEAD_V_DIM) + EPS);
     float yVal = oVal * rmsInv * ssmNorm.data[d] * zSilu;
-    output.data[qkvIdx] = yVal;
+    outBuf.data[qkvIdx] = yVal;
 }
 ";
 }

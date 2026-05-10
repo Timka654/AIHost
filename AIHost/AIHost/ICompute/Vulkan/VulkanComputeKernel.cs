@@ -199,31 +199,22 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
 
     private byte[] CompileGLSLToSPIRV(string glslSource, string entryPoint)
     {
-        // Try Silk.NET.Shaderc first (requires libshaderc_shared at runtime).
-        // If the native library isn't present, fall back to glslangValidator CLI which
-        // is available via the glslang-tools / vulkan-tools package on all major distros.
         try
         {
             return CompileWithShaderc(glslSource, entryPoint);
         }
         catch (Exception ex)
         {
-            // Shaderc may fail for many reasons: missing native library,
-            // GLSL compilation errors (InvalidOperationException), etc.
-            // Fall back to CLI compilers for any failure.
-            Console.WriteLine($"[Shaderc] Failed ({ex.GetType().Name}): {ex.Message}");
-            return CompileWithGlslangValidator(glslSource, entryPoint);
+            _logger.LogWarning(ex, "[Shader] Shaderc failed, falling back to CLI compilers");
+            return CompileWithCliCompilers(glslSource, entryPoint);
         }
     }
 
-    private static byte[] CompileWithGlslangValidator(string glslSource, string entryPoint)
+    private byte[] CompileWithCliCompilers(string glslSource, string entryPoint)
     {
-        // glslangValidator is in glslang-tools or vulkan-tools (Linux) / Vulkan SDK (Windows).
         string glslangExe = System.OperatingSystem.IsWindows()
-            ? "glslangValidator.exe"
-            : "glslangValidator";
+            ? "glslangValidator.exe" : "glslangValidator";
 
-        // Also try glslc (from shaderc, often available in vulkan-tools)
         foreach (var compiler in new[] { glslangExe, "glslc" })
         {
             try
@@ -234,16 +225,12 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Shaderc] {compiler} failed: {ex.Message}");
+                _logger.LogWarning(ex, "[Shader] {Compiler} failed", compiler);
             }
         }
 
         throw new InvalidOperationException(
-            "No GLSL compiler available. Install one of:\n" +
-            "  • libshaderc-dev  (Debian/Ubuntu)\n" +
-            "  • glslang-tools   (Debian/Ubuntu: apt install glslang-tools)\n" +
-            "  • vulkan-tools    (includes glslc)\n" +
-            "  • Vulkan SDK      (https://vulkan.lunarg.com/)");
+            "No GLSL compiler available. Install libshaderc-dev, glslang-tools, or vulkan-tools.");
     }
 
     private static byte[] CompileWithGlslangCli(string glslSource, string exe, string entryPoint)
@@ -263,10 +250,17 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
             };
             using var proc = System.Diagnostics.Process.Start(psi)
                 ?? throw new InvalidOperationException($"Could not start {exe}");
+            // Read both streams BEFORE WaitForExit to avoid deadlocks
+            var stdout = proc.StandardOutput.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
             proc.WaitForExit(30_000);
             if (proc.ExitCode != 0)
-                throw new InvalidOperationException(
-                    $"glslangValidator error: {proc.StandardError.ReadToEnd()}");
+            {
+                string detail = !string.IsNullOrWhiteSpace(stderr) ? stderr
+                    : !string.IsNullOrWhiteSpace(stdout) ? stdout
+                    : "(no output)";
+                throw new InvalidOperationException($"{exe}: {detail}");
+            }
             return File.ReadAllBytes(spvFile);
         }
         finally
@@ -293,10 +287,16 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
             };
             using var proc = System.Diagnostics.Process.Start(psi)
                 ?? throw new InvalidOperationException($"Could not start {exe}");
+            var stdout = proc.StandardOutput.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
             proc.WaitForExit(30_000);
             if (proc.ExitCode != 0)
-                throw new InvalidOperationException(
-                    $"glslc error: {proc.StandardError.ReadToEnd()}");
+            {
+                string detail = !string.IsNullOrWhiteSpace(stderr) ? stderr
+                    : !string.IsNullOrWhiteSpace(stdout) ? stdout
+                    : "(no output)";
+                throw new InvalidOperationException($"{exe}: {detail}");
+            }
             return File.ReadAllBytes(spvFile);
         }
         finally
