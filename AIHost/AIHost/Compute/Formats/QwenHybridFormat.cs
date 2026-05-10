@@ -177,9 +177,9 @@ public class QwenHybridFormat : ITransformerFormat
         var normF32 = t.GetOrBuildTiledNorm($"blk.{g}.ssm_norm.weight", HVD, VD);
         if (normF32 == null) { normF32 = t.TempF32Named($"blk.{g}.ssm_norm.weight").tensor; }
 
-        // Get output projection weight
-        string ok = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : $"blk.{g}.attn_output.weight";
-        var (wOut,  _) = t.TempF32Named(ok);
+        // Output projection: always ssm_out.weight [dm, VD] (GGUF row-major).
+        // CPU SSM transposes and matvecs; GPU uses MatMulWeightsT (A=[sl,VD], B=[dm,VD]^T)
+        var (wOut,  _) = t.TempF32Named($"blk.{g}.ssm_out.weight");
 
         // Wrap GPU state buffers as Tensors for SsmGdnDecode
         var convStateBuf = ss.GetGpuConvBuffer(g);
@@ -187,14 +187,14 @@ public class QwenHybridFormat : ITransformerFormat
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
         var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
 
-        // SsmGdnDecode writes per-token output [VD]; collect into [sl, VD].
-        var perTokenOutputs = new Tensor[sl];
+        // SsmGdnDecode writes per-token output [VD]; chain-concatenate into [sl, VD].
         var scratch = Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
+        Tensor? result = null;
 
         for (int ti = 0; ti < sl; ti++)
         {
             var x1nRow = o.Clone(xn);
-            var tokenOut = Tensor.Create(o.Device, new TensorShape(new[]{VD}), DataType.F32, $"ssm_tok{ti}");
+            var tokenOut = Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti}");
 
             o.SsmGdnDecode(
                 x1nRow,
@@ -204,15 +204,20 @@ public class QwenHybridFormat : ITransformerFormat
                 normF32,
                 tokenOut);
 
-            perTokenOutputs[ti] = tokenOut;
+            if (result == null)
+                result = tokenOut;
+            else
+            {
+                result = o.Concat(result, tokenOut, 0, "ssm_cat");
+                tokenOut.Dispose();
+            }
             if (sl > 1 && ti < sl - 1) x1nRow.Dispose();
         }
-
-        var result = o.Concat(perTokenOutputs, 0, "ssm_concat");
-        foreach (var t in perTokenOutputs) t.Dispose();
+        result ??= Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, "ssm_empty");
 
         // Phase 3: output projection (matmulT) + residual
-        var projected = o.MatMulWeightsT(result, wOut, "ssm_proj");
+        // result=[sl,VD], ssm_out.weight stored as [VD,dm] — regular matmul
+        var projected = o.MatMulWeights(result, wOut, "ssm_proj");
         var residual = o.Add(xr, projected, "ssm_out");
         result.Dispose(); projected.Dispose(); scratch.Dispose();
         return residual;
