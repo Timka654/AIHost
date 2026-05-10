@@ -206,11 +206,12 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         {
             return CompileWithShaderc(glslSource, entryPoint);
         }
-        catch (Exception ex) when (ex is System.IO.FileNotFoundException or DllNotFoundException
-                                        or System.IO.IOException)
+        catch (Exception ex)
         {
-            Console.WriteLine($"[Shaderc] Native library unavailable ({ex.GetType().Name}), " +
-                              "falling back to glslangValidator CLI...");
+            // Shaderc may fail for many reasons: missing native library,
+            // GLSL compilation errors (InvalidOperationException), etc.
+            // Fall back to CLI compilers for any failure.
+            Console.WriteLine($"[Shaderc] Failed ({ex.GetType().Name}): {ex.Message}");
             return CompileWithGlslangValidator(glslSource, entryPoint);
         }
     }
@@ -231,9 +232,9 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
                     ? CompileWithGlslc(glslSource, compiler)
                     : CompileWithGlslangCli(glslSource, compiler, entryPoint);
             }
-            catch (Exception ex) when (ex is not InvalidOperationException)
+            catch (Exception ex)
             {
-                Console.WriteLine($"[Shaderc] {compiler} not found: {ex.Message}");
+                Console.WriteLine($"[Shaderc] {compiler} failed: {ex.Message}");
             }
         }
 

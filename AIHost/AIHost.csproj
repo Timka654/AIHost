@@ -24,15 +24,45 @@
 		<PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.23.0" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <None Update="Shaders\CUDA\activations.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\CUDA\basic_ops.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\CUDA\elementwise.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\CUDA\matmul.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\CUDA\normalization.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\CUDA\softmax.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\CUDA\tensor_ops.cu">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\Vulkan\concat_axis0.glsl">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\Vulkan\ssm_gdn_decode.glsl">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	  <None Update="Shaders\Vulkan\ssm_gdn_recur.glsl">
+	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	</ItemGroup>
+
 	<!-- Generate BuildInfo.cs with UTC build timestamp before every compile. -->
 	<Target Name="GenerateBuildInfo" BeforeTargets="BeforeCompile">
 		<PropertyGroup>
 			<_BuildTs>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss"))z UTC</_BuildTs>
 		</PropertyGroup>
-		<WriteLinesToFile
-			File="$(IntermediateOutputPath)BuildInfo.g.cs"
-			Lines="// Auto-generated — do not edit.%0Anamespace AIHost%3B%0Ainternal static class BuildInfo%0A{%0A    public const string Date = %22$(_BuildTs)%22%3B%0A}"
-			Overwrite="true" />
+		<WriteLinesToFile File="$(IntermediateOutputPath)BuildInfo.g.cs" Lines="// Auto-generated — do not edit.%0Anamespace AIHost%3B%0Ainternal static class BuildInfo%0A{%0A    public const string Date = %22$(_BuildTs)%22%3B%0A}" Overwrite="true" />
 		<ItemGroup>
 			<Compile Include="$(IntermediateOutputPath)BuildInfo.g.cs" />
 		</ItemGroup>
