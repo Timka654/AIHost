@@ -237,6 +237,8 @@ public class ModelManager : IDisposable
             config.BatchSize?.ToString() ?? "8",
             config.EnableMmap, config.EnableMlock);
 
+        _logger.LogInformation("[LoadModel] Step 1/4: reading GGUF file at {Path}", modelPath);
+
         if (config.EnableMlock && !config.EnableMmap)
             _logger.LogWarning("enable_mlock requires enable_mmap to be true");
 
@@ -268,20 +270,15 @@ public class ModelManager : IDisposable
         }
         else
         {
-            // ── Single-GPU path — uses MultiGPUTransformer with 1 device ──────
-            // Unifies the forward-pass logic: ForwardHead always performs
-            // chunked matmul for large output.weight tensors, avoiding the
-            // per-token full dequantization that exhausts VRAM on AMD RADV.
-            var xfm = new MultiGPUTransformer(
-                devices: new[] { device },
-                modelFactory: d => new AIHost.GGUF.LazyGGUFModel(
-                    modelPath, d, config.EnableMmap, config.EnableMlock,
-                    requireDeviceLocal: !config.AllowSharedMemory),
-                layerSplit: null); // all layers on device 0
-
-            engine = new MultiGPUInferenceEngine(
-                xfm, BPETokenizer.FromGGUF(xfm.PrimaryModel.Reader),
-                batchSize, config.MaxConcurrency);
+            // ── Single-GPU path ───────────────────────────────────────────
+            IGGUFModel ggufModel = new AIHost.GGUF.LazyGGUFModel(
+                modelPath, device,
+                config.EnableMmap, config.EnableMlock,
+                requireDeviceLocal: !config.AllowSharedMemory);
+            var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
+            var transformer = TransformerFactory.Create(device, ggufModel);
+            transformer.LoadWeights();
+            engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize, config.MaxConcurrency);
         }
 
         var systemMessages = await LoadSystemMessagesAsync(config);

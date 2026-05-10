@@ -4,7 +4,7 @@ using System.Net.Http;
 
 using (var http = new HttpClient())
 {
-    http.Timeout = TimeSpan.FromMinutes(3);
+    http.Timeout = TimeSpan.FromMinutes(7);
 
     var request = new HttpRequestMessage(HttpMethod.Post, $"http://192.168.88.201:11434/manage/chat");
 

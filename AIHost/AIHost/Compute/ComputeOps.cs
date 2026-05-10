@@ -825,30 +825,9 @@ public class ComputeOps : IDisposable
 
         else
         {
-            // Chunked dispatch — split into multiple dispatches.
-            //
-            // CRITICAL: ALWAYS Flush between chunks, regardless of batch mode.
-            // Buffering multiple chunks (each up to 32768 workgroups) into a single
-            // Vulkan command buffer causes GPUVM faults on AMD RADV. Even with
-            // per-chunk offset buffers, the total dispatch volume in one submit
-            // triggers memory access violations (CLIENT_ID=TCP, PERMISSION_FAULTS).
-            //
-            // Each chunk uses a single reusable offset buffer (created once).
-            // Sequence per chunk: write offset → dispatch → Flush (DeviceWaitIdle).
-            // The Flush guarantees the GPU completes before CPU rewrites the offset
-            // buffer for the next chunk.
-            //
-            // For batch-mode callers, this means we temporarily exit the batch by
-            // flushing; subsequent Dispatch() calls will start a new command buffer
-            // automatically. This is acceptable because chunked tensors are large
-            // and the fence overhead is amortised over the chunk work.
-            //
-            // Chunks are aligned to 256-element boundaries (1 workgroup = 1 superblock).
             var reusableOffsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
-
-            _logger.LogDebug("[DBG_OPS] DequantizeInto chunked: totalElements={Total} totalGroups={Groups} " +
-                "chunks={Chunks} maxGroups={Max} batch={Batch}",
-                totalElements, totalGroups, numChunks, MaxGroupsPerDispatch, _batchMode);
+            _logger.LogDebug("[DBG_OPS] DequantizeInto chunked: totalElements={Total} totalGroups={Groups} chunks={Chunks}",
+                totalElements, totalGroups, numChunks);
 
             for (uint chunk = 0; chunk < numChunks; chunk++)
             {
@@ -856,7 +835,6 @@ public class ComputeOps : IDisposable
                 uint chunkEndGroup = Math.Min(chunkStartGroup + groupsPerChunk, totalGroups);
                 uint chunkGroups = chunkEndGroup - chunkStartGroup;
                 uint elementOffset = chunkStartGroup * SuperblockElements;
-
                 uint[] offsetData = { elementOffset };
                 reusableOffsetBuf.Write(offsetData);
 
@@ -865,19 +843,11 @@ public class ComputeOps : IDisposable
                 kernel.SetArgument(2, reusableOffsetBuf);
                 _queue.Dispatch(kernel, new[] { chunkGroups }, null);
 
-                // Always flush between chunks — do NOT buffer them in a single
-                // command buffer regardless of _batchMode. This prevents GPUVM
-                // faults on AMD RADV caused by excessively large dispatches.
                 _queue.Flush();
                 foreach (var k in _kernelCache.Values)
-                    if (k is VulkanComputeKernel vk)
-                        vk.ResetDispatchRing();
+                    if (k is VulkanComputeKernel vk) vk.ResetDispatchRing();
             }
-
             _logger.LogDebug("[DBG_OPS] DequantizeInto chunked done");
-
-            // All chunks already flushed individually above.
-            // Dispose the reusable offset buffer (GPU is idle after the last Flush).
             Defer(reusableOffsetBuf);
             GlobalProfiler.End(_ts, "ComputeOps.DequantizeInto");
         }

@@ -90,9 +90,10 @@ public class TransformerBase : IDisposable
     /// </summary>
     public void LoadWeights()
     {
-        _logger.LogInformation("Loading model weights...");
+        _logger.LogInformation("[LOAD] Loading model weights...");
         _nameMapper = new TensorNameMapper(_model);
 
+        _logger.LogInformation("[LOAD] Caching embed/norm/output weights");
         CacheWeight(_nameMapper.TokenEmbd);
         CacheWeight(_nameMapper.OutputNorm);
         CacheWeight(_nameMapper.OutputWeight);
@@ -101,15 +102,18 @@ public class TransformerBase : IDisposable
         {
             CacheLayerWeights(i);
             if ((i + 1) % 5 == 0 || i == _numLayers - 1)
-                _logger.LogDebug("Uploaded layer {Current}/{Total}", i + 1, _numLayers);
+                _logger.LogInformation("[LOAD] Uploaded layer {Current}/{Total}", i + 1, _numLayers);
         }
 
-        _logger.LogInformation("Weights loaded: {Count} tensors, quantized in VRAM", _weightCache.Count);
+        _logger.LogInformation("[LOAD] Weights loaded: {Count} tensors, quantized in VRAM", _weightCache.Count);
 
+        _logger.LogInformation("[LOAD] Allocating scratch buffers...");
         AllocateScratchWeights(_numLayers > 0 ? _nameMapper.AttnNorm(0) : null);
         TryAllocateScratchHead();
-        _logger.LogDebug("F32 scratch buffers allocated: {Count} tensors", _scratchF32.Count);
+        _logger.LogInformation("[LOAD] F32 scratch buffers allocated: {Count} tensors", _scratchF32.Count);
+        _logger.LogInformation("[LOAD] Running CPU reference layer 0...");
         RunCpuReferenceLayer0();
+        _logger.LogInformation("[LOAD] LoadWeights COMPLETE");
     }
 
     /// <summary>
@@ -192,15 +196,34 @@ public class TransformerBase : IDisposable
     public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null,
                            SSMState? ssmState = null)
     {
+        _logger.LogInformation("[FWD] Forward BEGIN tokens={Count} pos={Pos} kvCache={HasKV} ssm={HasSSM}",
+            tokenIds.Length, startPosition, kvCache != null, ssmState != null);
+
         if (_nameMapper == null)
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
 
         // 1. Token embedding
+        _logger.LogInformation("[FWD] EmbeddingLookup...");
         Tensor x = EmbeddingLookupOptimized(tokenIds);
+        _logger.LogInformation("[FWD] EmbeddingLookup OK shape=[{D0},{D1}]", x.Shape[0], x.Shape[1]);
 
         // 2. All transformer layers
+        _logger.LogInformation("[FWD] Entering layer loop ({Count} layers)", _numLayers);
         for (int i = 0; i < _numLayers; i++)
-            x = _format.ApplyLayer(this, x, i, startPosition, kvCache, ssmState);
+        {
+            _logger.LogInformation("[FWD] Layer {Layer} start", i);
+            try
+            {
+                x = _format.ApplyLayer(this, x, i, startPosition, kvCache, ssmState);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FWD] Layer {Layer} FAILED", i);
+                throw;
+            }
+            _logger.LogInformation("[FWD] Layer {Layer} OK", i);
+        }
+        _logger.LogInformation("[FWD] Layer loop done");
 
         // 3. Final layer norm
         {
@@ -408,12 +431,16 @@ public class TransformerBase : IDisposable
     {
         try
         {
-            var embQ = _weightCache["token_embd.weight"];
-            var (embF32, _) = TempF32("token_embd.weight");
+            // BUGFIX: TempF32 returns scratch buffer (owned by _scratchF32).
+            // Disposing it destroys the scratch, causing Use-After-Free on next inference.
+            var (embF32, isScratch) = TempF32("token_embd.weight");
             float[] emb = embF32.Buffer.ReadRange<float>(1 * 2048 * 4UL, 2048);
-            embF32.Dispose();
+            if (!isScratch) embF32.Dispose();
 
-            var normW = _weightCache["blk.0.attn_norm.weight"].Buffer.Read<float>();
+            // BUGFIX: norm weight is quantized in _weightCache — must dequantize first, not read raw bytes as floats.
+            var (normF32, normIsScratch) = TempF32("blk.0.attn_norm.weight");
+            float[] normW = normF32.Buffer.Read<float>();
+            if (!normIsScratch) normF32.Dispose();
             float sumSq = 0f; foreach (var v in emb) sumSq += v * v;
             float rms = MathF.Sqrt(sumSq / 2048 + 1e-5f);
             float[] xn = new float[2048];

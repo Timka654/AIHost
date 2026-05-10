@@ -282,16 +282,11 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
 
             _logger.LogDebug("[DBG_QUEUE] Flush slot={Slot} submitResult={Result}", slot, submitResult);
 
-            // Ждём завершения fence — это гарантирует, что все команды из этого
-            // сабмита выполнены. DeviceWaitIdle не нужен: fence wait уже даёт
-            // полную гарантию для операций на этой очереди (single-queue setup).
-            // Deferred dispose после WaitForFences безопасен — GPU завершил чтение
-            // всех буферов из этого сабмита.
             fixed (Fence* pFence = &_fences[slot])
             {
                 _vk.WaitForFences(_device, 1, pFence, true, ulong.MaxValue);
             }
-            _logger.LogDebug("[DBG_QUEUE] Flush done slot={Slot} fenceWait=OK", slot);
+            _logger.LogDebug("[DBG_QUEUE] Flush slot={Slot} fenceWait=OK", slot);
         }
         catch (Exception ex)
         {
@@ -326,6 +321,9 @@ internal unsafe class VulkanComputeCommandQueue : ComputeCommandQueueBase
         // mode now also resets the dispatch ring.
 
     }
+
+    /// <summary>Ensure all GPU operations are fully complete across all queues.</summary>
+    public void DeviceWaitIdle() => _vk.DeviceWaitIdle(_device);
 
     public override void Dispose()
     {

@@ -247,7 +247,9 @@ public class InferenceEngine : IInferenceEngine
             // their forward passes while this one does CPU work.
             float[] lastLogits;
             {
+                _logger.LogInformation("[INF] Acquiring GPU lock...");
                 _gpuLock.Wait(cancellationToken);
+                _logger.LogInformation("[INF] GPU lock acquired");
                 try
                 {
                     uint startPos = kvCache != null ? (uint)kvCache.SequenceLength : 0;
@@ -255,8 +257,10 @@ public class InferenceEngine : IInferenceEngine
                         ? new[] { tokens[^1] }
                         : tokens.ToArray();
 
+                    _logger.LogInformation("[INF] Calling _model.Forward tokens={Cnt} pos={Pos}", inputTokens.Length, startPos);
                     var iterSw = System.Diagnostics.Stopwatch.StartNew();
                     var logits = _model.Forward(inputTokens, startPos, kvCache, ssmState);
+                    _logger.LogInformation("[INF] _model.Forward done in {Ms}ms", iterSw.ElapsedMilliseconds);
                     lastLogits = ExtractLastToken(logits);
                     logits.Dispose();
 

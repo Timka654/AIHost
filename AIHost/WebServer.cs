@@ -14,6 +14,19 @@ using System.Text.Json;
 // ── Build info ───────────────────────────────────────────────────────────────
 Console.WriteLine($"AIHost build: {BuildInfo.Date}");
 
+AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+{
+    var ex = args.ExceptionObject as Exception;
+    Console.Error.WriteLine($"[FATAL] Unhandled: {ex?.Message}\n{ex?.StackTrace}");
+    try { AppLogger.Create<object>().LogCritical(ex!, "[FATAL] Unhandled exception"); } catch { }
+};
+TaskScheduler.UnobservedTaskException += (_, args) =>
+{
+    Console.Error.WriteLine($"[FATAL] Unobserved task: {args.Exception?.Message}");
+    try { AppLogger.Create<object>().LogCritical(args.Exception!, "[FATAL] Unobserved task"); } catch { }
+    args.SetObserved();
+};
+
 // ── Silk.NET.Shaderc native library resolver ─────────────────────────────────
 // Silk.NET.Shaderc tries to load "shaderc_shared" or "libshaderc_shared" at runtime
 // for GLSL→SPIR-V compilation. On Linux the installed library may only exist as
@@ -346,7 +359,13 @@ Console.WriteLine($"   Ollama: http://{serverConfig.Host}:{serverConfig.Port}/ap
 Console.WriteLine($"   OpenAI: http://{serverConfig.Host}:{serverConfig.Port}/v1/chat/completions");
 Console.WriteLine($"   Swagger: http://{serverConfig.Host}:{serverConfig.Port}/swagger\n");
 
-await app.RunAsync();
+try { await app.RunAsync(); }
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"[FATAL] Host crashed: {ex}");
+    try { AppLogger.Create<object>().LogCritical(ex, "[FATAL] Web host crash"); } catch { }
+    throw;
+}
 
 // Cleanup
 modelManager.Dispose();
