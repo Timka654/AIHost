@@ -822,26 +822,29 @@ public class ComputeOps : IDisposable
         else
         {
             // Chunked dispatch — split into multiple dispatches.
-            // CRITICAL FIX: Use a SINGLE reusable offset buffer that is rewritten
-            // between chunks, with a Flush+DeviceWaitIdle between each chunk.
-            // This avoids creating N temporary buffers (which causes GPUVM faults
-            // on AMD RADV due to TCP descriptor caching).
             //
-            // The sequence per chunk is:
-            //   1. Write new elementOffset to the shared buffer (CPU write)
-            //   2. Dispatch the chunk
-            //   3. Flush (DeviceWaitIdle) — guarantees GPU is done reading the buffer
-            //   4. Go to next chunk — safe to rewrite the buffer now
+            // CRITICAL: ALWAYS Flush between chunks, regardless of batch mode.
+            // Buffering multiple chunks (each up to 32768 workgroups) into a single
+            // Vulkan command buffer causes GPUVM faults on AMD RADV. Even with
+            // per-chunk offset buffers, the total dispatch volume in one submit
+            // triggers memory access violations (CLIENT_ID=TCP, PERMISSION_FAULTS).
             //
-            // IMPORTANT: Chunks are aligned to 256-element boundaries (1 workgroup).
-            // This ensures byte offsets are correct for quantized formats where
-            // bytes-per-element is fractional (e.g. Q4_K = 0.5 bytes/element).
-            // 256 elements = 1 superblock for all K-quant formats.
+            // Each chunk uses a single reusable offset buffer (created once).
+            // Sequence per chunk: write offset → dispatch → Flush (DeviceWaitIdle).
+            // The Flush guarantees the GPU completes before CPU rewrites the offset
+            // buffer for the next chunk.
+            //
+            // For batch-mode callers, this means we temporarily exit the batch by
+            // flushing; subsequent Dispatch() calls will start a new command buffer
+            // automatically. This is acceptable because chunked tensors are large
+            // and the fence overhead is amortised over the chunk work.
+            //
+            // Chunks are aligned to 256-element boundaries (1 workgroup = 1 superblock).
             var reusableOffsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
 
             _logger.LogDebug("[DBG_OPS] DequantizeInto chunked: totalElements={Total} totalGroups={Groups} " +
-                "chunks={Chunks} maxGroups={Max}",
-                totalElements, totalGroups, numChunks, MaxGroupsPerDispatch);
+                "chunks={Chunks} maxGroups={Max} batch={Batch}",
+                totalElements, totalGroups, numChunks, MaxGroupsPerDispatch, _batchMode);
 
             for (uint chunk = 0; chunk < numChunks; chunk++)
             {
@@ -850,9 +853,6 @@ public class ComputeOps : IDisposable
                 uint chunkGroups = chunkEndGroup - chunkStartGroup;
                 uint elementOffset = chunkStartGroup * SuperblockElements;
 
-                // Write the new elementOffset to the reusable buffer.
-                // This is safe because the previous chunk's Flush guaranteed the GPU
-                // is done reading the old value.
                 uint[] offsetData = { elementOffset };
                 reusableOffsetBuf.Write(offsetData);
 
@@ -861,41 +861,19 @@ public class ComputeOps : IDisposable
                 kernel.SetArgument(2, reusableOffsetBuf);
                 _queue.Dispatch(kernel, new[] { chunkGroups }, null);
 
-                // CRITICAL FIX: Flush after EACH chunk, not just InsertMemoryBarrier.
-                // On AMD RADV, submitting 7 chunks × 32768 groups = 229376 groups in a
-                // single command buffer causes the GPU to run for 10+ seconds, triggering
-                // TDR (Timeout Detection Recovery) and ErrorDeviceLost.
-                // Flushing after each chunk gives the GPU time to complete each chunk
-                // before the next one is submitted, avoiding the timeout.
-                // The DeviceWaitIdle inside Flush() also guarantees the GPU is done
-                // reading the reusable offset buffer, so we can safely rewrite it
-                // for the next chunk.
-                if (!_batchMode)
-                {
-                    _queue.Flush();
-                    foreach (var k in _kernelCache.Values)
-                        if (k is VulkanComputeKernel vk)
-                            vk.ResetDispatchRing();
-                }
-                else
-                {
-                    _queue.InsertMemoryBarrier();
-                }
-            }
-
-            _logger.LogDebug("[DBG_OPS] DequantizeInto chunked done");
-
-            // In non-batch mode: already flushed per-chunk above.
-            // In batch mode: flush once at the end.
-            if (_batchMode)
-            {
+                // Always flush between chunks — do NOT buffer them in a single
+                // command buffer regardless of _batchMode. This prevents GPUVM
+                // faults on AMD RADV caused by excessively large dispatches.
                 _queue.Flush();
                 foreach (var k in _kernelCache.Values)
                     if (k is VulkanComputeKernel vk)
                         vk.ResetDispatchRing();
             }
 
-            // Dispose the single reusable offset buffer
+            _logger.LogDebug("[DBG_OPS] DequantizeInto chunked done");
+
+            // All chunks already flushed individually above.
+            // Dispose the reusable offset buffer (GPU is idle after the last Flush).
             Defer(reusableOffsetBuf);
         }
 
