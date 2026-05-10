@@ -36,28 +36,95 @@ public class QwenHybridFormat : ITransformerFormat
     static Tensor TypeA(TransformerBase t, Tensor x, int g, int li, uint pos, KVCache? kvc, TensorNameMapper nm, SSMState? ss)
     {
         var o = t.Ops; int sl = x.Shape[0]; bool b = sl > 1;
+        var _ts = GlobalProfiler.Start();
+
+        // --- Load weights (dequant) ---
         var a = t.TempF32(nm.AttnNorm(g)); var qkw = t.TempF32(nm.AttnQKV(g));
         string ak = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : nm.AttnOutput(g);
-        var aoW = t.TempF32Named(ak); var fn = t.TempF32(nm.FfnNorm(g)); var wg = t.TempF32(nm.FfnGate(g)); var wu = t.TempF32(nm.FfnUp(g)); var wd = t.TempF32(nm.FfnDown(g));
+        var aoW = t.TempF32Named(ak); var fn = t.TempF32(nm.FfnNorm(g));
+        var wg = t.TempF32(nm.FfnGate(g)); var wu = t.TempF32(nm.FfnUp(g));
+        var wd = t.TempF32(nm.FfnDown(g));
+        GlobalProfiler.End(_ts, "LayerA.LoadW");
+
         if (b) o.BeginBatch();
-        var xn = o.Clone(x, "an"); o.LayerNorm(xn, a.tensor); if (!a.isScratch) o.DeferExternal(a.tensor);
-        var qkv = o.MatMulWeights(xn, qkw.tensor, "qkv"); if (!qkw.isScratch) o.DeferExternal(qkw.tensor);
+
+        // --- Attn norm + QKV matmul ---
+        var _ts2 = GlobalProfiler.Start();
+        var xn = o.Clone(x, "an"); o.LayerNorm(xn, a.tensor);
+        if (!a.isScratch) o.DeferExternal(a.tensor);
+        var qkv = o.MatMulWeights(xn, qkw.tensor, "qkv");
+        if (!qkw.isScratch) o.DeferExternal(qkw.tensor);
+        GlobalProfiler.End(_ts2, "LayerA.AttnMatMul");
+
         int hd = 256, qd = t._numHeads * hd, kd = t._numKVHeads * hd;
         int tq = qkv.Shape[1], eb = qd + 2 * kd; bool hg = tq > eb; int qgd = hg ? tq - eb : 0;
         var Q = o.SliceCols(qkv, 0, qd, "Q"); var K = o.SliceCols(qkv, qd, kd, "K"); var V = o.SliceCols(qkv, qd + kd, kd, "V");
         Tensor gq; if (hg) { var qg = o.SliceCols(qkv, qd + 2 * kd, qgd, "qg"); o.SiLU(qg); var qt = o.Concat(qg, qg, 1, "qt2"); qt = o.Concat(qt, qg, 1, "qt3"); if (b) o.DeferExternal(qg); else qg.Dispose(); gq = o.Multiply(Q, qt, "gq"); if (b) o.DeferExternal(Q); else Q.Dispose(); if (b) o.DeferExternal(qt); else qt.Dispose(); } else { gq = Q; }
         if (b) o.DeferExternal(qkv); else qkv.Dispose();
-        o.ApplyRoPEFull(gq, pos, t._numHeads, hd, t._ropeFreqBase); o.ApplyRoPEFull(K, pos, t._numKVHeads, hd, t._ropeFreqBase);
-        Tensor ao; if (kvc != null) { kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li); ao = o.MultiHeadAttention(gq, ck!, cv!, t._numHeads, pos, "ao"); o.DeferExternal(gq); }
-        else { ao = o.MultiHeadAttention(gq, K, V, t._numHeads, pos, "ao"); o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V); }
-        Tensor ap = aoW.tensor.Shape[0] == ao.Shape[1] ? o.MatMulWeights(ao, aoW.tensor, "ap") : o.MatMulWeightsT(ao, aoW.tensor, "ap");
-        if (!aoW.isScratch) o.DeferExternal(aoW.tensor); if (b) o.DeferExternal(ao); else ao.Dispose(); if (b) o.DeferExternal(xn); else xn.Dispose();
-        var x1 = o.Add(x, ap, "xa"); if (b) o.DeferExternal(ap); else ap.Dispose();
-        var x1n = o.Clone(x1, "pn"); o.LayerNorm(x1n, fn.tensor); if (!fn.isScratch) o.DeferExternal(fn.tensor);
-        Tensor x2; if (ss != null && t.HasWeight($"blk.{g}.ssm_a")) { o.Flush(); var so = SSM(t, x1, x1n, g, ss, sl); x1.Dispose(); x2 = so; o.BeginBatch(); } else { x2 = x1; }
-        var fo = o.FeedForward(x1n, wg.tensor, wu.tensor, wd.tensor, "ff"); if (!wg.isScratch) o.DeferExternal(wg.tensor); if (!wu.isScratch) o.DeferExternal(wu.tensor); if (!wd.isScratch) o.DeferExternal(wd.tensor);
-        if (b) o.DeferExternal(x1n); else x1n.Dispose(); var ou = o.Add(x2, fo, "lo"); if (b) o.DeferExternal(x2); else x2.Dispose(); if (b) o.DeferExternal(fo); else fo.Dispose(); if (b) o.DeferExternal(x); else x.Dispose();
-        if (b) o.Flush(); return ou;
+
+        // --- RoPE + Attention ---
+        var _ts3 = GlobalProfiler.Start();
+        o.ApplyRoPEFull(gq, pos, t._numHeads, hd, t._ropeFreqBase);
+        o.ApplyRoPEFull(K, pos, t._numKVHeads, hd, t._ropeFreqBase);
+        Tensor ao; if (kvc != null) {
+            kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li);
+            ao = o.MultiHeadAttention(gq, ck!, cv!, t._numHeads, pos, "ao");
+            o.DeferExternal(gq);
+        } else {
+            ao = o.MultiHeadAttention(gq, K, V, t._numHeads, pos, "ao");
+            o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V);
+        }
+        GlobalProfiler.End(_ts3, "LayerA.Attn");
+
+        // --- Output projection ---
+        var _ts4 = GlobalProfiler.Start();
+        Tensor ap = aoW.tensor.Shape[0] == ao.Shape[1]
+            ? o.MatMulWeights(ao, aoW.tensor, "ap")
+            : o.MatMulWeightsT(ao, aoW.tensor, "ap");
+        if (!aoW.isScratch) o.DeferExternal(aoW.tensor);
+        if (b) o.DeferExternal(ao); else ao.Dispose();
+        if (b) o.DeferExternal(xn); else xn.Dispose();
+        GlobalProfiler.End(_ts4, "LayerA.OutProj");
+
+        var x1 = o.Add(x, ap, "xa");
+        if (b) o.DeferExternal(ap); else ap.Dispose();
+
+        // --- FFN norm ---
+        var _ts5 = GlobalProfiler.Start();
+        var x1n = o.Clone(x1, "pn"); o.LayerNorm(x1n, fn.tensor);
+        if (!fn.isScratch) o.DeferExternal(fn.tensor);
+        GlobalProfiler.End(_ts5, "LayerA.FfnNorm");
+
+        // --- SSM on GPU ---
+        var _ts6 = GlobalProfiler.Start();
+        Tensor x2;
+        if (ss != null && t.HasWeight($"blk.{g}.ssm_a"))
+        {
+            x2 = SSM_Gpu(t, o, x1, x1n, g, ss, sl);
+            x1.Dispose();
+        }
+        else { x2 = x1; }
+        GlobalProfiler.End(_ts6, "LayerA.SSM");
+
+        // --- FeedForward ---
+        var _ts7 = GlobalProfiler.Start();
+        var fo = o.FeedForward(x1n, wg.tensor, wu.tensor, wd.tensor, "ff");
+        if (!wg.isScratch) o.DeferExternal(wg.tensor);
+        if (!wu.isScratch) o.DeferExternal(wu.tensor);
+        if (!wd.isScratch) o.DeferExternal(wd.tensor);
+        GlobalProfiler.End(_ts7, "LayerA.FFN");
+
+        if (b) o.DeferExternal(x1n); else x1n.Dispose();
+        var ou = o.Add(x2, fo, "lo");
+        if (b) o.DeferExternal(x2); else x2.Dispose();
+        if (b) o.DeferExternal(fo); else fo.Dispose();
+        if (b) o.DeferExternal(x); else x.Dispose();
+
+        var _ts8 = GlobalProfiler.Start();
+        if (b) o.Flush();
+        GlobalProfiler.End(_ts8, "LayerA.Flush");
+
+        return ou;
     }
 
     // ─── Type B ────────────────────────────────────────────────────────
@@ -88,6 +155,61 @@ public class QwenHybridFormat : ITransformerFormat
         var fo = o.FeedForward(x1n, gW.tensor, uW.tensor, dW.tensor, "ffB"); if (!gW.isScratch) o.DeferExternal(gW.tensor); if (!uW.isScratch) o.DeferExternal(uW.tensor); if (!dW.isScratch) o.DeferExternal(dW.tensor);
         if (b) o.DeferExternal(x1n); else x1n.Dispose(); var ou = o.Add(x1, fo, "loB"); if (b) o.DeferExternal(x1); else x1.Dispose(); if (b) o.DeferExternal(fo); else fo.Dispose(); if (b) o.DeferExternal(x); else x.Dispose();
         if (b) o.Flush(); return ou;
+    }
+
+    // ─── SSM recurrence on GPU ────────────────────────────────────────
+    static Tensor SSM_Gpu(TransformerBase t, ComputeOps o, Tensor xr, Tensor xn, int g, SSMState ss, int sl)
+    {
+        const int HVD=128, NVH=48, NKH=16, KD=NKH*HVD, VD=NVH*HVD, CD=2*KD+VD;
+        int dm = xn.Shape[1];
+
+        // All SSM weights must be pre-dequantized (scratch) for GPU access.
+        // TempF32Named returns (tensor, isScratch) — scratch tensors live on GPU.
+        var (convW,  _) = t.TempF32Named($"blk.{g}.ssm_conv1d.weight");
+        var (wQKV,   _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
+        var (wZ,     _) = t.TempF32Named($"blk.{g}.attn_gate.weight");
+        var (wBeta,  _) = t.TempF32Named($"blk.{g}.ssm_beta.weight");
+        var (wAlpha, _) = t.TempF32Named($"blk.{g}.ssm_alpha.weight");
+        var (dtBias, _) = t.TempF32Named($"blk.{g}.ssm_dt.bias");
+        var (ssA,    _) = t.TempF32Named($"blk.{g}.ssm_a");
+
+        // Get GPU scratch for norm weight
+        var normF32 = t.GetOrBuildTiledNorm($"blk.{g}.ssm_norm.weight", HVD, VD);
+        if (normF32 == null) { normF32 = t.TempF32Named($"blk.{g}.ssm_norm.weight").tensor; }
+
+        // Get output projection weight
+        string ok = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : $"blk.{g}.attn_output.weight";
+        var (wOut,  _) = t.TempF32Named(ok);
+
+        // Wrap GPU state buffers as Tensors for SsmGdnDecode
+        var convStateBuf = ss.GetGpuConvBuffer(g);
+        var convStateTensor = new Tensor(convStateBuf, new TensorShape(new[]{SSMState.CONV_STATE_DIM}), DataType.F32);
+        var ssmStateBuf = ss.GetGpuStateBuffer(g);
+        var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
+
+        var result = Tensor.Create(o.Device, new TensorShape(new[]{sl, dm}), DataType.F32, "ssm_out");
+        var scratch = Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
+
+        for (int ti = 0; ti < sl; ti++)
+        {
+            var x1nRow = o.Clone(xn);
+
+            o.SsmGdnDecode(
+                x1nRow,
+                convW, convStateTensor, wQKV, wZ, wBeta, wAlpha, dtBias, ssA,
+                scratch,
+                ssmStateTensor,
+                normF32,
+                result);
+
+            if (sl > 1 && ti < sl - 1) x1nRow.Dispose();
+        }
+
+        // Phase 3: output projection (matmulT) + residual
+        var projected = o.MatMulWeightsT(result, wOut, "ssm_proj");
+        var residual = o.Add(xr, projected, "ssm_out");
+        result.Dispose(); projected.Dispose(); scratch.Dispose();
+        return residual;
     }
 
     // ─── SSM recurrence (Gated Delta Net) ──────────────────────────────
