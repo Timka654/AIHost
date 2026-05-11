@@ -2,6 +2,7 @@ using AIHost.Compute;
 using AIHost.ICompute;
 using AIHost.Inference;
 using Microsoft.Extensions.Logging;
+using System.Buffers;
 using System.Numerics;
 
 namespace AIHost.Compute.Formats;
@@ -31,7 +32,6 @@ public class QwenHybridFormat : ITransformerFormat
         t._logger.LogInformation("[TypeA] Layer {Layer} START sl={SeqLen}", g, sl);
         var _ts = GlobalProfiler.Start();
 
-        // --- Load weights (dequant) ---
         var a = t.TempF32(nm.AttnNorm(g)); var qkw = t.TempF32(nm.AttnQKV(g));
         string ak = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : nm.AttnOutput(g);
         var aoW = t.TempF32Named(ak); var fn = t.TempF32(nm.FfnNorm(g));
@@ -41,7 +41,6 @@ public class QwenHybridFormat : ITransformerFormat
 
         if (b) o.BeginBatch();
 
-        // --- Attn norm + QKV matmul ---
         var _ts2 = GlobalProfiler.Start();
         var xn = o.Clone(x, "an"); o.LayerNorm(xn, a.tensor);
         if (!a.isScratch) o.DeferExternal(a.tensor);
@@ -55,7 +54,6 @@ public class QwenHybridFormat : ITransformerFormat
         Tensor gq; if (hg) { var qg = o.SliceCols(qkv, qd + 2 * kd, qgd, "qg"); o.SiLU(qg); var qt = o.Concat(qg, qg, 1, "qt2"); qt = o.Concat(qt, qg, 1, "qt3"); if (b) o.DeferExternal(qg); else qg.Dispose(); gq = o.Multiply(Q, qt, "gq"); if (b) o.DeferExternal(Q); else Q.Dispose(); if (b) o.DeferExternal(qt); else qt.Dispose(); } else { gq = Q; }
         if (b) o.DeferExternal(qkv); else qkv.Dispose();
 
-        // --- RoPE + Attention ---
         var _ts3 = GlobalProfiler.Start();
         o.ApplyRoPEFull(gq, pos, t._numHeads, hd, t._ropeFreqBase);
         o.ApplyRoPEFull(K, pos, t._numKVHeads, hd, t._ropeFreqBase);
@@ -69,7 +67,6 @@ public class QwenHybridFormat : ITransformerFormat
         }
         GlobalProfiler.End(_ts3, "LayerA.Attn");
 
-        // --- Output projection ---
         var _ts4 = GlobalProfiler.Start();
         Tensor ap = aoW.tensor.Shape[0] == ao.Shape[1]
             ? o.MatMulWeights(ao, aoW.tensor, "ap")
@@ -82,13 +79,11 @@ public class QwenHybridFormat : ITransformerFormat
         var x1 = o.Add(x, ap, "xa");
         if (b) o.DeferExternal(ap); else ap.Dispose();
 
-        // --- FFN norm ---
         var _ts5 = GlobalProfiler.Start();
         var x1n = o.Clone(x1, "pn"); o.LayerNorm(x1n, fn.tensor);
         if (!fn.isScratch) o.DeferExternal(fn.tensor);
         GlobalProfiler.End(_ts5, "LayerA.FfnNorm");
 
-        // --- SSM on GPU ---
         var _ts6 = GlobalProfiler.Start();
         Tensor x2;
         if (ss != null && t.HasWeight($"blk.{g}.ssm_a"))
@@ -107,7 +102,6 @@ public class QwenHybridFormat : ITransformerFormat
         else { x2 = x1; }
         GlobalProfiler.End(_ts6, "LayerA.SSM");
 
-        // --- FeedForward ---
         var _ts7 = GlobalProfiler.Start();
         var fo = o.FeedForward(x1n, wg.tensor, wu.tensor, wd.tensor, "ff");
         if (!wg.isScratch) o.DeferExternal(wg.tensor);
@@ -158,16 +152,18 @@ public class QwenHybridFormat : ITransformerFormat
         if (b) o.Flush(); return ou;
     }
 
-    // ─── SSM recurrence on GPU ────────────────────────────────────────
+    // ─── SSM recurrence on GPU (sub-batch + ArrayPool for CPU padding) ─
     static Tensor SSM_Gpu(TransformerBase t, ComputeOps o, Tensor xr, Tensor xn, int g, SSMState ss, int sl)
     {
         const int HVD=128, NVH=48, NKH=16, KD=NKH*HVD, VD=NVH*HVD, CD=2*KD+VD;
+        const int SUB_BATCH = 8; // tokens per GPU submit
         int dm = xn.Shape[1];
+        bool b = sl > 1;
 
         var (convW,  _) = t.TempF32Named($"blk.{g}.ssm_conv1d.weight");
         var (wQKV,   _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
 
-        // SSM z-projection: shader expects [dModel, VD=6144].
+        // ── z-projection ──────────────────────────────────────────────
         string wzName = "";
         foreach (var c in new[] { "ssm_gate.weight","ssm_z.weight","ssm_in.weight",
             "ssm_in_proj.weight","ssm_a_proj.weight","attn_gate.weight" })
@@ -189,17 +185,23 @@ public class QwenHybridFormat : ITransformerFormat
         if (wZRaw.Shape[1] == VD)
         {
             wZ = wZRaw;
-            t._logger.LogInformation("[SSM_GPU] wZ='{Name}' shape=[{D0},{D1}] OK", wzName, wZ.Shape[0], wZ.Shape[1]);
+            t._logger.LogInformation("[SSM_GPU] wZ='{Name}' shape=[{D0},{D1}] OK", wzName, wZRaw.Shape[0], wZRaw.Shape[1]);
         }
         else
         {
-            t._logger.LogWarning("[SSM_GPU] Padding wZ='{Name}' {D0}x{D1} → {D0}x{VD}",
+            // CPU pad wZ to [dModel, VD]. Use ArrayPool<float> to avoid LOH allocation.
+            t._logger.LogWarning("[SSM_GPU] Padding wZ='{Name}' {D0}x{D1} -> {D0}x{VD}",
                 wzName, wZRaw.Shape[0], wZRaw.Shape[1], wZRaw.Shape[0], VD);
             var cpuData = wZRaw.Buffer.Read<float>();
-            var padded = new float[wZRaw.Shape[0] * VD];
+            int paddedLen = wZRaw.Shape[0] * VD;
+            float[] padded = ArrayPool<float>.Shared.Rent(paddedLen);
+            var paddedSpan = padded.AsSpan(0, paddedLen);
+            paddedSpan.Clear(); // zero-fill
             for (int r = 0; r < wZRaw.Shape[0]; r++)
-                Array.Copy(cpuData, r * wZRaw.Shape[1], padded, r * VD, wZRaw.Shape[1]);
+                cpuData.AsSpan(r * wZRaw.Shape[1], wZRaw.Shape[1])
+                    .CopyTo(paddedSpan.Slice(r * VD, wZRaw.Shape[1]));
             wZ = Tensor.FromData(o.Device, padded, TensorShape.Matrix(wZRaw.Shape[0], VD), "ssm_wz_padded");
+            ArrayPool<float>.Shared.Return(padded);
             if (!wZScratch) wZRaw.Dispose();
         }
 
@@ -218,38 +220,60 @@ public class QwenHybridFormat : ITransformerFormat
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
         var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
 
+        // ── Lazy-init channel pools (once per ComputeOps lifetime) ────
+        o.ScratchPool ??= new ChannelBufferPool(4, (ulong)((CD + VD + NVH*3) * sizeof(float)), o.Device);
+
         var _tsP = GlobalProfiler.Start();
-        t._logger.LogInformation("[SSM_GPU] Layer {Layer} sl={SeqLen} dm={DModel}", g, sl, dm);
-        bool b = sl > 1;
-        var scratch = Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
+        t._logger.LogInformation("[SSM_GPU] Layer {Layer} sl={SeqLen} dm={DModel} subBatch={Sub}", g, sl, dm, SUB_BATCH);
+        var scratchBuf = o.ScratchPool.Rent();
+        var scratch = new Tensor(scratchBuf, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
         Tensor? result = null;
 
-        for (int ti = 0; ti < sl; ti++)
+        for (int ti = 0; ti < sl; ti += SUB_BATCH)
         {
-            var _tsTi = GlobalProfiler.Start();
-            t._logger.LogInformation("[SSM_GPU] Token {Token}/{Total}", ti, sl);
-            var x1nRow = o.Clone(xn);
-            var tokenOut = Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti}");
+            int end = Math.Min(ti + SUB_BATCH, sl);
+            Tensor? subResult = null;
 
-            o.SsmGdnDecode(
-                x1nRow,
-                convW, convStateTensor, wQKV, wZ, wBeta, wAlpha, dtBias, ssA,
-                scratch,
-                ssmStateTensor,
-                normF32,
-                tokenOut);
+            // Dispatch SSM for each token in the sub-batch
+            for (int i = 0; i < end - ti; i++)
+            {
+                var _tsTi = GlobalProfiler.Start();
+                var x1nRow = o.Clone(xn);
+                var tokenOut = Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti+i}");
 
-            // Flush after each SSM token to keep command buffers small
-            o.Flush();
-            GlobalProfiler.End(_tsTi, "SSM_GPU.Token");
+                o.SsmGdnDecode(
+                    x1nRow,
+                    convW, convStateTensor, wQKV, wZ, wBeta, wAlpha, dtBias, ssA,
+                    scratch,
+                    ssmStateTensor,
+                    normF32,
+                    tokenOut);
+
+                GlobalProfiler.End(_tsTi, "SSM_GPU.Token");
+
+                if (subResult == null)
+                    subResult = tokenOut;
+                else
+                {
+                    subResult = o.Concat(subResult, tokenOut, 0, "ssm_subcat");
+                    if (b) o.DeferExternal(tokenOut); else tokenOut.Dispose();
+                }
+                if (b) o.DeferExternal(x1nRow); else x1nRow.Dispose();
+            }
+
+            subResult ??= Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, "ssm_empty_sub");
+
+            // Merge with global result
             if (result == null)
-                result = tokenOut;
+                result = subResult;
             else
             {
-                result = o.Concat(result, tokenOut, 0, "ssm_cat");
-                tokenOut.Dispose();
+                result = o.Concat(result, subResult, 0, "ssm_cat");
+                if (b) o.DeferExternal(subResult); else subResult.Dispose();
             }
-            x1nRow.Dispose();
+
+            // Flush the sub-batch so GPU finishes this group before next
+            if (b) o.Flush();
         }
         GlobalProfiler.End(_tsP, "SSM_GPU.Total");
         result ??= Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, "ssm_empty");
@@ -257,7 +281,9 @@ public class QwenHybridFormat : ITransformerFormat
         var _tsP2 = GlobalProfiler.Start();
         var projected = o.MatMulWeights(result, wOut, "ssm_proj");
         var residual = o.Add(xr, projected, "ssm_out");
-        result.Dispose(); projected.Dispose(); scratch.Dispose();
+        if (b) { o.DeferExternal(result); o.DeferExternal(projected); }
+        else { result.Dispose(); projected.Dispose(); }
+        o.ScratchPool.Return(scratchBuf);
         GlobalProfiler.End(_tsP2, "SSM_GPU.OutProj");
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} done", g);
         return residual;

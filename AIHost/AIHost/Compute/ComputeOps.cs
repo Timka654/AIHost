@@ -25,6 +25,11 @@ public class ComputeOps : IDisposable
     internal bool _dbgLayer0 = true;
     private readonly ILogger<ComputeOps> _logger = AppLogger.Create<ComputeOps>();
 
+    // ── Channel-based VRAM buffer pools (created lazily) ──────────────────────
+    internal ChannelBufferPool? TokenOutPool;  // [1, VD=6144] = 24 KB
+    internal ChannelBufferPool? ClonePool;     // [1, dm=5120] = 20 KB
+    internal ChannelBufferPool? ScratchPool;   // [CD+VD+NVH*3=16528] = 66 KB
+
     // ── Persistent offset buffer for K-quant dequantization ──────────────────
     // CRITICAL FIX: On AMD RADV, creating and destroying a small buffer for every
     // DequantizeQ*K call causes GPUVM faults (PERMISSION_FAULTS with CLIENT_ID=TCP).
@@ -1930,6 +1935,9 @@ public class ComputeOps : IDisposable
             _persistentZeroOffset.Dispose();
 
         _queue.Dispose();
+        TokenOutPool?.Dispose();
+        ClonePool?.Dispose();
+        ScratchPool?.Dispose();
         _disposed = true;
     }
 
