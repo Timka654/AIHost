@@ -388,7 +388,7 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
             bufferInfos[i] = new DescriptorBufferInfo
             {
                 Buffer = vkBuffer.VkBuffer,
-                Offset = 0,
+                Offset = vkBuffer.ArenaOffset, // 0 for regular buffers, actual offset for arena views
                 Range = vkBuffer.Size
             };
 
