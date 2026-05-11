@@ -48,7 +48,7 @@ public class QwenHybridFormat : ITransformerFormat
         if (!qkw.isScratch) o.DeferExternal(qkw.tensor);
         GlobalProfiler.End(_ts2, "LayerA.AttnMatMul");
 
-        int hd = 256, qd = t._numHeads * hd, kd = t._numKVHeads * hd;
+        int hd = t._headDim, qd = t._numHeads * hd, kd = t._numKVHeads * hd;
         int tq = qkv.Shape[1], eb = qd + 2 * kd; bool hg = tq > eb; int qgd = hg ? tq - eb : 0;
         var Q = o.SliceCols(qkv, 0, qd, "Q"); var K = o.SliceCols(qkv, qd, kd, "K"); var V = o.SliceCols(qkv, qd + kd, kd, "V");
         Tensor gq; if (hg) { var qg = o.SliceCols(qkv, qd + 2 * kd, qgd, "qg"); o.SiLU(qg); var qt = o.Concat(qg, qg, 1, "qt2"); qt = o.Concat(qt, qg, 1, "qt3"); if (b) o.DeferExternal(qg); else qg.Dispose(); gq = o.Multiply(Q, qt, "gq"); if (b) o.DeferExternal(Q); else Q.Dispose(); if (b) o.DeferExternal(qt); else qt.Dispose(); } else { gq = Q; }
@@ -57,11 +57,14 @@ public class QwenHybridFormat : ITransformerFormat
         var _ts3 = GlobalProfiler.Start();
         o.ApplyRoPEFull(gq, pos, t._numHeads, hd, t._ropeFreqBase);
         o.ApplyRoPEFull(K, pos, t._numKVHeads, hd, t._ropeFreqBase);
-        Tensor ao; if (kvc != null) {
+        Tensor ao; if (kvc != null)
+        {
             kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li);
             ao = o.MultiHeadAttention(gq, ck!, cv!, t._numHeads, pos, "ao");
             o.DeferExternal(gq);
-        } else {
+        }
+        else
+        {
             ao = o.MultiHeadAttention(gq, K, V, t._numHeads, pos, "ao");
             o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V);
         }
@@ -134,7 +137,7 @@ public class QwenHybridFormat : ITransformerFormat
         var rq = o.MatMulWeights(xn, qW.tensor, "rqB"); var K = o.MatMulWeights(xn, kW.tensor, "KB"); var V = o.MatMulWeights(xn, vW.tensor, "VB");
         if (!qW.isScratch) o.DeferExternal(qW.tensor); if (!kW.isScratch) o.DeferExternal(kW.tensor); if (!vW.isScratch) o.DeferExternal(vW.tensor);
         if (b) o.DeferExternal(xn); else xn.Dispose();
-        int kd = K.Shape[1], qtd = rq.Shape[1], hd = 256; bool ig = t.HasWeight($"blk.{g}.attn_gate.weight");
+        int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim; bool ig = t.HasWeight($"blk.{g}.attn_gate.weight");
         int qd = t.HasWeight($"blk.{g}.attn_output.weight") ? t._weightCache[$"blk.{g}.attn_output.weight"].Shape[0] : qtd;
         Tensor gq; int nqh;
         if (ig || qtd > qd) { var qp = o.SliceCols(rq, 0, qd, "qpB"); var qg = o.SliceCols(rq, qd, qd, "qgB"); if (b) o.DeferExternal(rq); else rq.Dispose(); o.SiLU(qg); gq = o.Multiply(qp, qg, "gqB"); if (b) o.DeferExternal(qp); else qp.Dispose(); if (b) o.DeferExternal(qg); else qg.Dispose(); nqh = qd / hd; } else { gq = rq; nqh = qtd / hd; }
@@ -155,13 +158,13 @@ public class QwenHybridFormat : ITransformerFormat
     // ─── SSM recurrence on GPU (sub-batch + ArrayPool for CPU padding) ─
     static Tensor SSM_Gpu(TransformerBase t, ComputeOps o, Tensor xr, Tensor xn, int g, SSMState ss, int sl)
     {
-        const int HVD=128, NVH=48, NKH=16, KD=NKH*HVD, VD=NVH*HVD, CD=2*KD+VD;
+        const int HVD = 128, NVH = 48, NKH = 16, KD = NKH * HVD, VD = NVH * HVD, CD = 2 * KD + VD;
         const int SUB_BATCH = 8; // tokens per GPU submit
         int dm = xn.Shape[1];
         bool b = sl > 1;
 
-        var (convW,  _) = t.TempF32Named($"blk.{g}.ssm_conv1d.weight");
-        var (wQKV,   _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
+        var (convW, _) = t.TempF32Named($"blk.{g}.ssm_conv1d.weight");
+        var (wQKV, _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
 
         // ── z-projection ──────────────────────────────────────────────
         string wzName = "";
@@ -205,20 +208,20 @@ public class QwenHybridFormat : ITransformerFormat
             if (!wZScratch) wZRaw.Dispose();
         }
 
-        var (wBeta,  _) = t.TempF32Named($"blk.{g}.ssm_beta.weight");
+        var (wBeta, _) = t.TempF32Named($"blk.{g}.ssm_beta.weight");
         var (wAlpha, _) = t.TempF32Named($"blk.{g}.ssm_alpha.weight");
         var (dtBias, _) = t.TempF32Named($"blk.{g}.ssm_dt.bias");
-        var (ssA,    _) = t.TempF32Named($"blk.{g}.ssm_a");
+        var (ssA, _) = t.TempF32Named($"blk.{g}.ssm_a");
 
         var normF32 = t.GetOrBuildTiledNorm($"blk.{g}.ssm_norm.weight", HVD, VD);
         if (normF32 == null) { normF32 = t.TempF32Named($"blk.{g}.ssm_norm.weight").tensor; }
 
-        var (wOut,  _) = t.TempF32Named($"blk.{g}.ssm_out.weight");
+        var (wOut, _) = t.TempF32Named($"blk.{g}.ssm_out.weight");
 
         var convStateBuf = ss.GetGpuConvBuffer(g);
-        var convStateTensor = new Tensor(convStateBuf, new TensorShape(new[]{SSMState.CONV_STATE_DIM}), DataType.F32);
+        var convStateTensor = new Tensor(convStateBuf, new TensorShape(new[] { SSMState.CONV_STATE_DIM }), DataType.F32);
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
-        var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
+        var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[] { SSMState.STATE_DIM }), DataType.F32);
 
         var _tsP = GlobalProfiler.Start();
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} sl={SeqLen} dm={DModel} subBatch={Sub}", g, sl, dm, SUB_BATCH);
@@ -233,8 +236,8 @@ public class QwenHybridFormat : ITransformerFormat
             // CRITICAL: scratch must be allocated AFTER arena Reset (from previous Flush).
             // Allocating inside the sub-batch loop guarantees it won't overlap with
             // tokenOut buffers from the previous sub-batch.
-            Tensor scratch = o.AllocTempTensor(new TensorShape(new[]{CD + VD + NVH*3}), "ssm_scratch")
-                ?? Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
+            Tensor scratch = o.AllocTempTensor(new TensorShape(new[] { CD + VD + NVH * 3 }), "ssm_scratch")
+                ?? Tensor.Create(o.Device, new TensorShape(new[] { CD + VD + NVH * 3 }), DataType.F32, "ssm_scratch");
 
             // Dispatch SSM for each token in the sub-batch
             for (int i = 0; i < end - ti; i++)
@@ -242,8 +245,8 @@ public class QwenHybridFormat : ITransformerFormat
                 var _tsTi = GlobalProfiler.Start();
                 var x1nRow = o.Clone(xn);
                 // Arena tokenOut (0 vkAllocateMemory when arena active)
-                var tokenOut = o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{ti+i}")
-                    ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti+i}");
+                var tokenOut = o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{ti + i}")
+                    ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti + i}");
 
                 o.SsmGdnDecode(
                     x1nRow,
@@ -296,5 +299,69 @@ public class QwenHybridFormat : ITransformerFormat
 
 
     // ─── Fallback ──────────────────────────────────────────────────────
-    static Tensor Fallback(TransformerBase t,Tensor x,int g,TensorNameMapper nm){var o=t.Ops;var xn=o.Clone(x,"an_fb");var(wa,sa)=t.TempF32(nm.AttnNorm(g));o.LayerNorm(xn,wa);if(!sa)wa.Dispose();Tensor ao;if(t.HasWeight(nm.AttnQKV(g))){var(w,s_)=t.TempF32(nm.AttnQKV(g));var q=o.MatMulWeights(xn,w,"q_fb");if(!s_)w.Dispose();int qd=t._numHeads*256,kd=t._numKVHeads*256;var Q=o.SliceCols(q,0,qd,"Q_fb");var K=o.SliceCols(q,qd,kd,"K_fb");var V=o.SliceCols(q,qd+kd,kd,"V_fb");q.Dispose();o.ApplyRoPEFull(Q,0,t._numHeads,256,t._ropeFreqBase);o.ApplyRoPEFull(K,0,t._numKVHeads,256,t._ropeFreqBase);ao=o.MultiHeadAttention(Q,K,V,t._numHeads,0,"a_fb");o.DeferExternal(Q);o.DeferExternal(K);o.DeferExternal(V);}else{var(wq,sq)=t.TempF32(nm.AttnQ(g));var(wk,sk)=t.TempF32(nm.AttnK(g));var(wv,sv)=t.TempF32(nm.AttnV(g));var Q=o.MatMulWeights(xn,wq,"Q_fb");var K=o.MatMulWeights(xn,wk,"K_fb");var V=o.MatMulWeights(xn,wv,"V_fb");if(!sq)wq.Dispose();if(!sk)wk.Dispose();if(!sv)wv.Dispose();o.ApplyRoPEFull(Q,0,t._numHeads,256,t._ropeFreqBase);o.ApplyRoPEFull(K,0,t._numKVHeads,256,t._ropeFreqBase);ao=o.MultiHeadAttention(Q,K,V,t._numHeads,0,"a_fb");o.DeferExternal(Q);o.DeferExternal(K);o.DeferExternal(V);}xn.Dispose();var(wo,so)=t.TempF32(nm.AttnOutput(g));Tensor ap=wo.Shape[0]==ao.Shape[1]?o.MatMulWeights(ao,wo,"ap_fb"):o.MatMulWeightsT(ao,wo,"ap_fb");if(!so)wo.Dispose();ao.Dispose();var x1=o.Add(x,ap,"xa_fb");ap.Dispose();var x1n=o.Clone(x1,"pn_fb");var(wp,sp)=t.TempF32(nm.FfnNorm(g));o.LayerNorm(x1n,wp);if(!sp)wp.Dispose();var(wg,sg)=t.TempF32(nm.FfnGate(g));var(wu,su)=t.TempF32(nm.FfnUp(g));var(wd,sd)=t.TempF32(nm.FfnDown(g));var fo=o.FeedForward(x1n,wg,wu,wd,"ff_fb");if(!sg)wg.Dispose();if(!su)wu.Dispose();if(!sd)wd.Dispose();x1n.Dispose();var ou=o.Add(x1,fo,"lo_fb");x1.Dispose();fo.Dispose();x.Dispose();return ou;}
+    static Tensor Fallback(TransformerBase t, Tensor x, int g, TensorNameMapper nm)
+    {
+        var o = t.Ops; var xn = o.Clone(x, "an_fb");
+        var (wa, sa) = t.TempF32(nm.AttnNorm(g));
+        o.LayerNorm(xn, wa);
+        if (!sa) wa.Dispose();
+        Tensor ao; int hd = t._headDim; if (t.HasWeight(nm.AttnQKV(g)))
+        {
+            var (w, s_) = t.TempF32(nm.AttnQKV(g));
+            var q = o.MatMulWeights(xn, w, "q_fb");
+            if (!s_) w.Dispose();
+            int qd = t._numHeads * hd, kd = t._numKVHeads * hd; var Q = o.SliceCols(q, 0, qd, "Q_fb");
+            var K = o.SliceCols(q, qd, kd, "K_fb");
+            var V = o.SliceCols(q, qd + kd, kd, "V_fb");
+            q.Dispose();
+            o.ApplyRoPEFull(Q, 0, t._numHeads, hd, t._ropeFreqBase);
+            o.ApplyRoPEFull(K, 0, t._numKVHeads, hd, t._ropeFreqBase);
+            ao = o.MultiHeadAttention(Q, K, V, t._numHeads, 0, "a_fb");
+            o.DeferExternal(Q);
+            o.DeferExternal(K);
+            o.DeferExternal(V);
+        }
+        else
+        {
+            var (wq, sq) = t.TempF32(nm.AttnQ(g));
+            var (wk, sk) = t.TempF32(nm.AttnK(g));
+            var (wv, sv) = t.TempF32(nm.AttnV(g));
+            var Q = o.MatMulWeights(xn, wq, "Q_fb");
+            var K = o.MatMulWeights(xn, wk, "K_fb");
+            var V = o.MatMulWeights(xn, wv, "V_fb");
+            if (!sq) wq.Dispose();
+            if (!sk) wk.Dispose();
+            if (!sv) wv.Dispose();
+            o.ApplyRoPEFull(Q, 0, t._numHeads, hd, t._ropeFreqBase);
+            o.ApplyRoPEFull(K, 0, t._numKVHeads, hd, t._ropeFreqBase);
+            ao = o.MultiHeadAttention(Q, K, V, t._numHeads, 0, "a_fb");
+            o.DeferExternal(Q);
+            o.DeferExternal(K);
+            o.DeferExternal(V);
+        }
+        xn.Dispose();
+        var (wo, so) = t.TempF32(nm.AttnOutput(g));
+        Tensor ap = wo.Shape[0] == ao.Shape[1] ? o.MatMulWeights(ao, wo, "ap_fb") : o.MatMulWeightsT(ao, wo, "ap_fb");
+        if (!so) wo.Dispose();
+        ao.Dispose();
+        var x1 = o.Add(x, ap, "xa_fb");
+        ap.Dispose();
+        var x1n = o.Clone(x1, "pn_fb");
+        var (wp, sp) = t.TempF32(nm.FfnNorm(g));
+        o.LayerNorm(x1n, wp);
+        if (!sp) wp.Dispose();
+        var (wg, sg) = t.TempF32(nm.FfnGate(g));
+        var (wu, su) = t.TempF32(nm.FfnUp(g));
+        var (wd, sd) = t.TempF32(nm.FfnDown(g));
+        var fo = o.FeedForward(x1n, wg, wu, wd, "ff_fb");
+        if (!sg) wg.Dispose();
+        if (!su) wu.Dispose();
+        if (!sd) wd.Dispose();
+        x1n.Dispose();
+        var ou = o.Add(x1, fo, "lo_fb");
+        x1.Dispose();
+        fo.Dispose();
+        x.Dispose();
+        return ou;
+    }
 }

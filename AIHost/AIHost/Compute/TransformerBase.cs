@@ -19,6 +19,7 @@ public class TransformerBase : IDisposable
     protected internal readonly int _dModel;
     protected internal readonly int _numHeads;
     protected internal readonly int _numKVHeads;
+    protected internal readonly int _headDim;
     protected internal readonly float _ropeFreqBase;
     protected bool _disposed;
     protected internal readonly ILogger<TransformerBase> _logger = AppLogger.Create<TransformerBase>();
@@ -74,13 +75,16 @@ public class TransformerBase : IDisposable
         _numHeads = ArchInt("attention.head_count", 32);
         ContextLength = ArchInt("context_length", 0);
 
+        // Read head_dim from GGUF metadata; fall back to d_model/n_heads for legacy models.
+        _headDim = ArchInt("attention.key_length", _dModel / _numHeads);
+
         _ropeFreqBase = ArchFlt("rope.freq_base", 10000.0f);
         var kvHeads = ArchInt("attention.head_count_kv", 4);
         _numKVHeads = kvHeads;
         _localLayerCount = _numLayers;
 
-        _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} ctx={Ctx} rope={Rope}",
-            _numLayers, _dModel, _numHeads, kvHeads, ContextLength, _ropeFreqBase);
+        _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} head_dim={HeadDim} ctx={Ctx} rope={Rope}",
+            _numLayers, _dModel, _numHeads, kvHeads, _headDim, ContextLength, _ropeFreqBase);
     }
 
     // ── Weight loading ────────────────────────────────────────────────────────
