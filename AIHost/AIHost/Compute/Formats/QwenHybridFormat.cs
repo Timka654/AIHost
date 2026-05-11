@@ -220,13 +220,9 @@ public class QwenHybridFormat : ITransformerFormat
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
         var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
 
-        // ── Lazy-init channel pools (once per ComputeOps lifetime) ────
-        o.ScratchPool ??= new ChannelBufferPool(4, (ulong)((CD + VD + NVH*3) * sizeof(float)), o.Device);
-
         var _tsP = GlobalProfiler.Start();
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} sl={SeqLen} dm={DModel} subBatch={Sub}", g, sl, dm, SUB_BATCH);
-        var scratchBuf = o.ScratchPool.Rent();
-        var scratch = new Tensor(scratchBuf, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
+
         Tensor? result = null;
 
         for (int ti = 0; ti < sl; ti += SUB_BATCH)
@@ -234,12 +230,20 @@ public class QwenHybridFormat : ITransformerFormat
             int end = Math.Min(ti + SUB_BATCH, sl);
             Tensor? subResult = null;
 
+            // CRITICAL: scratch must be allocated AFTER arena Reset (from previous Flush).
+            // Allocating inside the sub-batch loop guarantees it won't overlap with
+            // tokenOut buffers from the previous sub-batch.
+            Tensor scratch = o.AllocTempTensor(new TensorShape(new[]{CD + VD + NVH*3}), "ssm_scratch")
+                ?? Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
+
             // Dispatch SSM for each token in the sub-batch
             for (int i = 0; i < end - ti; i++)
             {
                 var _tsTi = GlobalProfiler.Start();
                 var x1nRow = o.Clone(xn);
-                var tokenOut = Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti+i}");
+                // Arena tokenOut (0 vkAllocateMemory when arena active)
+                var tokenOut = o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{ti+i}")
+                    ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti+i}");
 
                 o.SsmGdnDecode(
                     x1nRow,
@@ -273,6 +277,7 @@ public class QwenHybridFormat : ITransformerFormat
             }
 
             // Flush the sub-batch so GPU finishes this group before next
+            // Note: Flush() also calls _arena.Reset() which reclaims all temp arena memory
             if (b) o.Flush();
         }
         GlobalProfiler.End(_tsP, "SSM_GPU.Total");
@@ -283,7 +288,7 @@ public class QwenHybridFormat : ITransformerFormat
         var residual = o.Add(xr, projected, "ssm_out");
         if (b) { o.DeferExternal(result); o.DeferExternal(projected); }
         else { result.Dispose(); projected.Dispose(); }
-        o.ScratchPool.Return(scratchBuf);
+        // Arena scratch is auto-reclaimed by Flush → Reset — no explicit Dispose needed
         GlobalProfiler.End(_tsP2, "SSM_GPU.OutProj");
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} done", g);
         return residual;

@@ -124,6 +124,15 @@ public class ModelConfig
     [JsonPropertyName("max_concurrency")]
     public int MaxConcurrency { get; set; } = 1;
 
+    /// <summary>
+    /// Arena allocator size in MB for temporary GPU buffers during inference.
+    /// null = auto-calculate from model params (context_size + max_tokens + dModel).
+    /// Arena holds per-frame temp buffers + persistent KV cache.
+    /// If insufficient, inference fails at init with a clear error.
+    /// </summary>
+    [JsonPropertyName("arena_size_mb")]
+    public int? ArenaSizeMb { get; set; }
+
     // ── Multi-GPU settings ────────────────────────────────────────────────────
 
     /// <summary>

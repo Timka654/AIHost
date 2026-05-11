@@ -25,10 +25,12 @@ public class ComputeOps : IDisposable
     internal bool _dbgLayer0 = true;
     private readonly ILogger<ComputeOps> _logger = AppLogger.Create<ComputeOps>();
 
-    // ── Channel-based VRAM buffer pools (created lazily) ──────────────────────
-    internal ChannelBufferPool? TokenOutPool;  // [1, VD=6144] = 24 KB
-    internal ChannelBufferPool? ClonePool;     // [1, dm=5120] = 20 KB
-    internal ChannelBufferPool? ScratchPool;   // [CD+VD+NVH*3=16528] = 66 KB
+    // ── Arena allocator (replaces ChannelBufferPool) ──────────────────────────
+    // One giant VkBuffer allocated once per model lifetime. Per-frame temp tensors
+    // are sliced from it via bump-pointer. Reset() is called after Flush() when
+    // the GPU fence signals completion — zero fragmentation, O(1), no vkAllocateMemory.
+    private VulkanArenaAllocator? _arena;
+    public bool HasArena => _arena != null;
 
     // ── Persistent offset buffer for K-quant dequantization ──────────────────
     // CRITICAL FIX: On AMD RADV, creating and destroying a small buffer for every
@@ -102,6 +104,8 @@ public class ComputeOps : IDisposable
         foreach (var kernel in _kernelCache.Values)
             if (kernel is VulkanComputeKernel vk)
                 vk.ResetDispatchRing();
+        // Reclaim arena temp memory — GPU fence already signaled by _queue.Flush()
+        _arena?.Reset();
     }
 
     /// <summary>In batch mode: insert a compute barrier (no submit). Otherwise flush.</summary>
@@ -1919,6 +1923,35 @@ public class ComputeOps : IDisposable
 
     #endregion
 
+    // ── Arena integration ─────────────────────────────────────────────────
+
+    /// <summary>Attach an arena allocator (called once at model load).</summary>
+    internal void AttachArena(VulkanArenaAllocator arena)
+    {
+        _arena = arena;
+    }
+
+    /// <summary>Begin inference frame — snapshot arena cursor for later Reset.</summary>
+    internal void BeginArenaFrame()
+    {
+        _arena?.BeginFrame();
+    }
+
+    /// <summary>
+    /// Allocate a temporary tensor from the arena. The tensor's buffer is an arena view
+    /// (no vkAllocateMemory). Dispose is a no-op — arena reclaims memory on Reset().
+    /// Returns null if arena is not attached (caller should fall back to Tensor.Create).
+    /// </summary>
+    internal Tensor? AllocTempTensor(TensorShape shape, string? name = null)
+    {
+        if (_arena == null) return null;
+
+        ulong bytes = (ulong)shape.TotalElements * sizeof(float);
+        var slice = _arena.Alloc(bytes);
+        var buf = VulkanComputeBuffer.CreateArenaView(slice.Buffer, slice.Offset, slice.Size, DataType.F32);
+        return new Tensor(buf, shape, DataType.F32, name);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -1935,9 +1968,7 @@ public class ComputeOps : IDisposable
             _persistentZeroOffset.Dispose();
 
         _queue.Dispose();
-        TokenOutPool?.Dispose();
-        ClonePool?.Dispose();
-        ScratchPool?.Dispose();
+        _arena?.Dispose();
         _disposed = true;
     }
 

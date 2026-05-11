@@ -278,6 +278,10 @@ public class ModelManager : IDisposable
             var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
             var transformer = TransformerFactory.Create(device, ggufModel);
             transformer.LoadWeights();
+
+            // ── Arena allocator (Vulkan only) ───────────────────────────
+            TryAttachArena(device, transformer, config);
+
             engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize, config.MaxConcurrency);
         }
 
@@ -565,6 +569,65 @@ public class ModelManager : IDisposable
             "rocm" => new AIHost.ICompute.ROCm.ROCmComputeDevice(deviceIndex),
             _ => throw new ArgumentException($"Unknown compute provider: {provider}")
         };
+    }
+
+    /// <summary>
+    /// Create and attach a VulkanArenaAllocator to ComputeOps if the device is Vulkan.
+    /// Arena size: auto-calculated from model params (context_size+max_tokens+dModel) or taken from config.
+    /// Fail-fast: if arena doesn't fit in VRAM, throws InsufficientVramException at init time.
+    /// </summary>
+    private void TryAttachArena(IComputeDevice device, TransformerBase transformer, ModelConfig config)
+    {
+        if (device is not AIHost.ICompute.Vulkan.VulkanComputeDevice vkDev) return;
+
+        int arenaMb = config.ArenaSizeMb ?? CalculateArenaSizeMb(transformer, config);
+        _logger.LogInformation("[Arena] Creating VulkanArenaAllocator ({Size} MB)", arenaMb);
+
+        try
+        {
+            var arena = new VulkanArenaAllocator(vkDev.DeviceContext, (ulong)arenaMb * 1024 * 1024);
+            transformer.Ops.AttachArena(arena);
+            _logger.LogInformation("[Arena] Attached {Size} MB arena to ComputeOps", arenaMb);
+        }
+        catch (Exception ex)
+        {
+            throw new AIHost.ICompute.InsufficientVramException(
+                (ulong)arenaMb * 1024 * 1024,
+                $"Arena allocator: {ex.Message}. Reduce context_size, max_tokens, or arena_size_mb.");
+        }
+    }
+
+    /// <summary>
+    /// Auto-calculate arena size from model parameters.
+    /// Formula: per_frame = wZ_padded + tempPool + scratch + concatBuffer; kvCache = attentionLayers × 2 × (ctx+maxT) × kvHeads × headDim × 4.
+    /// Rounded up to nearest 64 MB with 10% safety margin.
+    /// </summary>
+    private static int CalculateArenaSizeMb(TransformerBase t, ModelConfig config)
+    {
+        const int HVD = 128, NVH = 48, NKH = 16, KD = NKH * HVD, VD = NVH * HVD, CD = 2 * KD + VD;
+        const int SUB_BATCH = 8;
+        int dm = t._dModel;
+        int ctx = config.Parameters.ContextSize;
+        int maxT = config.Parameters.MaxTokens;
+        int kvHeads = t._numKVHeads;
+        int headDim = dm / t._numHeads;
+
+        long perFrame = (long)dm * VD * 4L                     // wZ padded
+                      + SUB_BATCH * (VD + dm) * 4L            // temp pool
+                      + (CD + VD + NVH * 3) * 4L              // scratch
+                      + (long)ctx * VD * 4L;                  // concat buffer
+
+        // Approximate attention layers: assume half of all layers are Type B (attention)
+        // This is a heuristic for Qwen hybrid models.
+        int attnLayers = t._numLayers / 2;
+        long kvCache = (long)attnLayers * 2L
+                     * (ctx + maxT)
+                     * kvHeads * headDim * 4L;
+
+        long total = perFrame + kvCache;
+        // Round to 64 MB with 10% safety margin (rounded is already in MB)
+        long rounded = (long)((total * 1.1 + 64L * 1024 * 1024 - 1) / (64L * 1024 * 1024)) * 64;
+        return (int)Math.Max(64, rounded); // minimum 64 MB
     }
 
     public void Dispose()

@@ -17,9 +17,9 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
     private readonly PhysicalDevice _physicalDevice;
     private readonly Queue _queue;
     private readonly uint _queueFamilyIndex;
-    private readonly ulong _size;
-    private readonly BufferType _type;
-    private readonly DataType _elementType;
+    private ulong _size;
+    private BufferType _type;
+    private DataType _elementType;
 
     private VkBuffer _buffer;
     private DeviceMemory _memory;
@@ -434,6 +434,7 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
     public override void Dispose()
     {
         if (_disposed) return;
+        if (IsArenaView) { _disposed = true; return; } // arena owns the memory
 
         // Get memory requirements BEFORE destroying the buffer
         MemoryRequirements req;
@@ -451,6 +452,28 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
     }
 
     internal VkBuffer VkBuffer => _buffer;
+    internal ulong ArenaOffset { get; private set; }
 
+    /// <summary>
+    /// Create a view into an arena buffer. No memory allocation — just records
+    /// the slice (buffer, offset, size) for descriptor binding via DescriptorBufferInfo.
+    /// Dispose is no-op (arena owns the memory).
+    /// </summary>
+    internal static VulkanComputeBuffer CreateArenaView(VkBuffer arenaBuffer, ulong offset, ulong size, DataType dtype)
+    {
+        return new VulkanComputeBuffer
+        {
+            _buffer = arenaBuffer,
+            _size = size,
+            ArenaOffset = offset,
+            _type = BufferType.Storage,
+            _elementType = dtype,
+        };
+    }
 
+    // Private ctor for arena views — skip all vkCreateBuffer/vkAllocateMemory
+    private VulkanComputeBuffer() { }
+
+    /// <summary>Skip dispose for arena views (memory owned by VulkanArenaAllocator).</summary>
+    public bool IsArenaView => _memory.Handle == 0;
 }
