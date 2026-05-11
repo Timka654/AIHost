@@ -737,9 +737,12 @@ void main() {
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 const uint HEAD_V_DIM = 128u;
 const uint N_V_HEADS  = 48u;
+const uint N_K_HEADS  = 16u;
 const uint KEY_DIM    = 2048u;
 const uint VALUE_DIM  = 6144u;
 const uint CONV_DIM   = 10240u;
+const uint CONV_KERNEL = 4u;
+const uint CONV_STATE_LEN = 3u;
 const uint DMODEL     = 5120u;
 layout(set = 0, binding = 0) readonly  buffer XNormBuf    { float data[]; } xNorm;
 layout(set = 0, binding = 1) readonly  buffer ConvWBuf    { float data[]; } convW;
@@ -763,8 +766,8 @@ void main() {
     float beta = 1.0 / (1.0 + exp(-betaSum));
     float alphaSum = 0.0;
     for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[k] * wAlpha.data[k + n * DMODEL];
-    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n]));
-    float gate = alpha * ssA.data[n];
+    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n % N_K_HEADS]));
+    float gate = alpha * ssA.data[n % N_K_HEADS];
     float qkvVal = 0.0;
     if (qkvIdx < CONV_DIM) {
         for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[k] * wQKV.data[k + qkvIdx * DMODEL];

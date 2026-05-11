@@ -100,7 +100,6 @@ public class QwenHybridFormat : ITransformerFormat
             }
             catch (Exception ex)
             {
-                // Log and rethrow so the error is visible in docker logs
                 t._logger.LogError(ex, "[SSM_GPU] Failed at layer {Layer}", g);
                 throw;
             }
@@ -165,40 +164,70 @@ public class QwenHybridFormat : ITransformerFormat
         const int HVD=128, NVH=48, NKH=16, KD=NKH*HVD, VD=NVH*HVD, CD=2*KD+VD;
         int dm = xn.Shape[1];
 
-        // All SSM weights must be pre-dequantized (scratch) for GPU access.
-        // TempF32Named returns (tensor, isScratch) — scratch tensors live on GPU.
         var (convW,  _) = t.TempF32Named($"blk.{g}.ssm_conv1d.weight");
         var (wQKV,   _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
-        var (wZ,     _) = t.TempF32Named($"blk.{g}.attn_gate.weight");
+
+        // SSM z-projection: shader expects [dModel, VD=6144].
+        string wzName = "";
+        foreach (var c in new[] { "ssm_gate.weight","ssm_z.weight","ssm_in.weight",
+            "ssm_in_proj.weight","ssm_a_proj.weight","attn_gate.weight" })
+        { if (t.HasWeight($"blk.{g}.{c}")) { wzName = $"blk.{g}.{c}"; break; } }
+        if (wzName == "")
+        {
+            var known = new[] { "ssm_gate.weight","ssm_z.weight","ssm_in.weight",
+                "ssm_in_proj.weight","ssm_a_proj.weight","ssm_alpha.weight","ssm_beta.weight",
+                "ssm_conv1d.weight","ssm_dt.bias","ssm_norm.weight","ssm_out.weight","ssm_a",
+                "attn_qkv.weight","attn_norm.weight","attn_gate.weight","attn_output.weight",
+                "attn_q.weight","ffn_gate.weight","ffn_up.weight","ffn_down.weight",
+                "ffn_norm.weight","post_attention_norm.weight" };
+            var found = known.Where(k => t.HasWeight($"blk.{g}.{k}")).ToList();
+            throw new InvalidOperationException(
+                $"Layer {g}: no SSM z-projection weight. Available: [{string.Join(", ", found)}]");
+        }
+        var (wZRaw, wZScratch) = t.TempF32Named(wzName);
+        Tensor wZ;
+        if (wZRaw.Shape[1] == VD)
+        {
+            wZ = wZRaw;
+            t._logger.LogInformation("[SSM_GPU] wZ='{Name}' shape=[{D0},{D1}] OK", wzName, wZ.Shape[0], wZ.Shape[1]);
+        }
+        else
+        {
+            t._logger.LogWarning("[SSM_GPU] Padding wZ='{Name}' {D0}x{D1} → {D0}x{VD}",
+                wzName, wZRaw.Shape[0], wZRaw.Shape[1], wZRaw.Shape[0], VD);
+            var cpuData = wZRaw.Buffer.Read<float>();
+            var padded = new float[wZRaw.Shape[0] * VD];
+            for (int r = 0; r < wZRaw.Shape[0]; r++)
+                Array.Copy(cpuData, r * wZRaw.Shape[1], padded, r * VD, wZRaw.Shape[1]);
+            wZ = Tensor.FromData(o.Device, padded, TensorShape.Matrix(wZRaw.Shape[0], VD), "ssm_wz_padded");
+            if (!wZScratch) wZRaw.Dispose();
+        }
+
         var (wBeta,  _) = t.TempF32Named($"blk.{g}.ssm_beta.weight");
         var (wAlpha, _) = t.TempF32Named($"blk.{g}.ssm_alpha.weight");
         var (dtBias, _) = t.TempF32Named($"blk.{g}.ssm_dt.bias");
         var (ssA,    _) = t.TempF32Named($"blk.{g}.ssm_a");
 
-        // Get GPU scratch for norm weight
         var normF32 = t.GetOrBuildTiledNorm($"blk.{g}.ssm_norm.weight", HVD, VD);
         if (normF32 == null) { normF32 = t.TempF32Named($"blk.{g}.ssm_norm.weight").tensor; }
 
-        // Output projection: always ssm_out.weight [dm, VD] (GGUF row-major).
-        // CPU SSM transposes and matvecs; GPU uses MatMulWeightsT (A=[sl,VD], B=[dm,VD]^T)
         var (wOut,  _) = t.TempF32Named($"blk.{g}.ssm_out.weight");
 
-        // Wrap GPU state buffers as Tensors for SsmGdnDecode
         var convStateBuf = ss.GetGpuConvBuffer(g);
         var convStateTensor = new Tensor(convStateBuf, new TensorShape(new[]{SSMState.CONV_STATE_DIM}), DataType.F32);
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
         var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[]{SSMState.STATE_DIM}), DataType.F32);
 
-        // SsmGdnDecode writes per-token output [VD]; chain-concatenate into [sl, VD].
         var _tsP = GlobalProfiler.Start();
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} sl={SeqLen} dm={DModel}", g, sl, dm);
-        bool b = sl > 1; // batch mode same as TypeA
+        bool b = sl > 1;
         var scratch = Tensor.Create(o.Device, new TensorShape(new[]{CD + VD + NVH*3}), DataType.F32, "ssm_scratch");
         Tensor? result = null;
 
         for (int ti = 0; ti < sl; ti++)
         {
             var _tsTi = GlobalProfiler.Start();
+            t._logger.LogInformation("[SSM_GPU] Token {Token}/{Total}", ti, sl);
             var x1nRow = o.Clone(xn);
             var tokenOut = Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti}");
 
@@ -210,20 +239,17 @@ public class QwenHybridFormat : ITransformerFormat
                 normF32,
                 tokenOut);
 
+            // Flush after each SSM token to keep command buffers small
+            o.Flush();
             GlobalProfiler.End(_tsTi, "SSM_GPU.Token");
             if (result == null)
                 result = tokenOut;
             else
             {
                 result = o.Concat(result, tokenOut, 0, "ssm_cat");
-                // CRITICAL: in batch mode tokenOut is referenced by pending GPU dispatches
-                if (b) o.DeferExternal(tokenOut); else tokenOut.Dispose();
+                tokenOut.Dispose();
             }
-            // CRITICAL: in batch mode x1nRow is referenced by pending SsmGdnDecode dispatch
-            if (sl > 1 && ti < sl - 1)
-            {
-                if (b) o.DeferExternal(x1nRow); else x1nRow.Dispose();
-            }
+            x1nRow.Dispose();
         }
         GlobalProfiler.End(_tsP, "SSM_GPU.Total");
         result ??= Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, "ssm_empty");
@@ -231,10 +257,7 @@ public class QwenHybridFormat : ITransformerFormat
         var _tsP2 = GlobalProfiler.Start();
         var projected = o.MatMulWeights(result, wOut, "ssm_proj");
         var residual = o.Add(xr, projected, "ssm_out");
-        // CRITICAL: in batch mode, GPU dispatches reference these buffers.
-        // They will be disposed by the batch Flush() in the caller (TypeA).
-        if (b) { o.DeferExternal(result); o.DeferExternal(projected); o.DeferExternal(scratch); }
-        else { result.Dispose(); projected.Dispose(); scratch.Dispose(); }
+        result.Dispose(); projected.Dispose(); scratch.Dispose();
         GlobalProfiler.End(_tsP2, "SSM_GPU.OutProj");
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} done", g);
         return residual;

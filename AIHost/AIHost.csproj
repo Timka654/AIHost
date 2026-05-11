@@ -25,36 +25,36 @@
 	</ItemGroup>
 
 	<ItemGroup>
-	  <None Update="Shaders\CUDA\activations.cu">
+	  <Content Include="Shaders\CUDA\activations.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\CUDA\basic_ops.cu">
+	  </Content>
+	  <Content Include="Shaders\CUDA\basic_ops.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\CUDA\elementwise.cu">
+	  </Content>
+	  <Content Include="Shaders\CUDA\elementwise.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\CUDA\matmul.cu">
+	  </Content>
+	  <Content Include="Shaders\CUDA\matmul.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\CUDA\normalization.cu">
+	  </Content>
+	  <Content Include="Shaders\CUDA\normalization.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\CUDA\softmax.cu">
+	  </Content>
+	  <Content Include="Shaders\CUDA\softmax.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\CUDA\tensor_ops.cu">
+	  </Content>
+	  <Content Include="Shaders\CUDA\tensor_ops.cu">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\Vulkan\concat_axis0.glsl">
+	  </Content>
+	  <Content Include="Shaders\Vulkan\concat_axis0.glsl">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\Vulkan\ssm_gdn_decode.glsl">
+	  </Content>
+	  <Content Include="Shaders\Vulkan\ssm_gdn_decode.glsl">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
-	  <None Update="Shaders\Vulkan\ssm_gdn_recur.glsl">
+	  </Content>
+	  <Content Include="Shaders\Vulkan\ssm_gdn_recur.glsl">
 	    <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-	  </None>
+	  </Content>
 	</ItemGroup>
 
 	<!-- Generate BuildInfo.cs with UTC build timestamp before every compile. -->

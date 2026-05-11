@@ -31,8 +31,8 @@ void main() {
     float beta = 1.0 / (1.0 + exp(-betaSum));
     float alphaSum = 0.0;
     for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[k] * wAlpha.data[k + n * DMODEL];
-    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n]));
-    float gate = alpha * ssA.data[n];
+    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n % N_K_HEADS]));
+    float gate = alpha * ssA.data[n % N_K_HEADS];
     float qkvVal = 0.0;
     if (qkvIdx < CONV_DIM) {
         for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[k] * wQKV.data[k + qkvIdx * DMODEL];
