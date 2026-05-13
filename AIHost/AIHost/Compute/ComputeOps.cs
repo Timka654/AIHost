@@ -566,6 +566,30 @@ public class ComputeOps : IDisposable
     }
 
     /// <summary>
+    /// RMSNorm with explicit row/col override — used for per-head normalization.
+    /// The tensor buffer is treated as (rows × cols) regardless of its logical shape.
+    /// For per-head QK-norm on a [seqLen, numHeads×headDim] tensor, call with
+    /// rows = seqLen×numHeads, cols = headDim and the un-tiled [headDim] weight.
+    /// This normalizes each headDim-sized sub-vector independently.
+    /// </summary>
+    public void LayerNormVirtual(Tensor tensor, Tensor weight, int rows, int cols, float eps = 1e-5f)
+    {
+        var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
+        var paramBytes = new byte[12];
+        BitConverter.GetBytes((uint)rows).CopyTo(paramBytes, 0);
+        BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
+        BitConverter.GetBytes(eps).CopyTo(paramBytes, 8);
+        paramsBuffer.Write(paramBytes);
+        var kernel = GetOrCreateKernel("layer_norm", ComputeShaders.LayerNorm);
+        kernel.SetArgument(0, tensor.Buffer);
+        kernel.SetArgument(1, weight.Buffer);
+        kernel.SetArgument(2, paramsBuffer);
+        _queue.Dispatch(kernel, new[] { (uint)rows }, null);
+        MaybeFlush();
+        Defer(paramsBuffer);
+    }
+
+    /// <summary>
     /// Softmax activation (in-place)
     /// </summary>
     public void Softmax(Tensor tensor)

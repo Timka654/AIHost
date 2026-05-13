@@ -402,7 +402,11 @@ public class OllamaController : ControllerBase
                 var role = msg.Role == "assistant" ? "assistant" : "user";
                 sb.Append($"<|im_start|>{role}\n{msg.Content}<|im_end|>\n");
             }
-            sb.Append("<|im_start|>assistant\n");
+            // Qwen3-series: inject empty <think></think> so model skips reasoning and answers directly.
+            bool hasThinking = tokenizer.GetTokenId("<think>") >= 0;
+            sb.Append(hasThinking
+                ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                : "<|im_start|>assistant\n");
         }
         else
         {

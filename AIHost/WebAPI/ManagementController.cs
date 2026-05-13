@@ -599,7 +599,15 @@ public class ManagementController : ControllerBase
             if (!string.IsNullOrEmpty(systemText))
                 sb.Append($"<|im_start|>system\n{systemText}<|im_end|>\n");
             sb.Append($"<|im_start|>user\n{request.Message}<|im_end|>\n");
-            sb.Append("<|im_start|>assistant\n");
+            // Qwen3-series models require a thinking prefix after the assistant role marker.
+            // Without it the model doesn't know what mode to generate in → garbage output.
+            // Non-thinking mode: inject empty <think></think> block so model skips reasoning
+            // and generates the answer directly. This matches the official chat template with
+            // enable_thinking=false.
+            bool hasThinking = tokenizer.GetTokenId("<think>") >= 0;
+            sb.Append(hasThinking
+                ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                : "<|im_start|>assistant\n");
         }
         else
         {

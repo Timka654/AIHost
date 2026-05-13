@@ -147,8 +147,21 @@ public class QwenHybridFormat : ITransformerFormat
             if (b) o.DeferExternal(rqDi); else rqDi.Dispose();
             nqh = qd / hd;
         } else { gq = rq; nqh = qtd / hd; }
-        var qn = t.GetOrBuildTiledNorm($"blk.{g}.attn_q_norm.weight", hd, qd); var kn = t.GetOrBuildTiledNorm($"blk.{g}.attn_k_norm.weight", hd, kd);
-        if (qn != null) o.LayerNorm(gq, qn); if (kn != null) o.LayerNorm(K, kn);
+        // Per-head QK-norm: each [hd]-dim head is normalized independently.
+        // Use LayerNormVirtual with rows=seqLen*numHeads, cols=hd so each head is one "row".
+        // The original [hd] weight (NOT tiled) is used directly.
+        if (t.HasWeight($"blk.{g}.attn_q_norm.weight"))
+        {
+            var (qnW, qnS) = t.TempF32Named($"blk.{g}.attn_q_norm.weight");
+            o.LayerNormVirtual(gq, qnW, sl * nqh, hd);
+            if (!qnS) o.DeferExternal(qnW);
+        }
+        if (t.HasWeight($"blk.{g}.attn_k_norm.weight"))
+        {
+            var (knW, knS) = t.TempF32Named($"blk.{g}.attn_k_norm.weight");
+            o.LayerNormVirtual(K, knW, sl * (kd / hd), hd);
+            if (!knS) o.DeferExternal(knW);
+        }
         o.ApplyRoPEFull(gq, pos, nqh, hd, t._ropeFreqBase, t._ropeDimCount); o.ApplyRoPEFull(K, pos, kd / hd, hd, t._ropeFreqBase, t._ropeDimCount);
         // Diagnostic: log Q/K head-0 magnitude after RoPE for first 4 attention layers.
         // ||Q||² >> 0 = healthy; ≈ 0 or NaN = corrupted by RoPE/norm.
@@ -272,8 +285,14 @@ public class QwenHybridFormat : ITransformerFormat
                 int tokenIdx = ti + i;
                 // Pass full xn tensor with rowIndex instead of cloning per token.
                 // SSM shader reads xNorm.data[rowIndex * DMODEL + k].
-                var tokenOut = o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{tokenIdx}")
-                    ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{tokenIdx}");
+                // CRITICAL: AllocTempTensor allocates from arena. In non-batch (decode) mode,
+                // SsmGdnDecode calls MaybeFlush → Flush → _arena.Reset(), freeing the buffer
+                // before the SSM output can be used. Use Tensor.Create for decode;
+                // arena is fine for batch (prefill) since Flush happens only at sub-batch end.
+                var tokenOut = b
+                    ? (o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{tokenIdx}")
+                       ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{tokenIdx}"))
+                    : Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{tokenIdx}");
 
                 o.SsmGdnDecode(
                     xn,
