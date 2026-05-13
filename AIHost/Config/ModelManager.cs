@@ -610,7 +610,7 @@ public class ModelManager : IDisposable
         int ctx = config.Parameters.ContextSize;
         int maxT = config.Parameters.MaxTokens;
         int kvHeads = t._numKVHeads;
-        int headDim = dm / t._numHeads;
+        int headDim = t._headDim;
 
         long perFrame = (long)dm * VD * 4L                     // wZ padded
                       + SUB_BATCH * (VD + dm) * 4L            // temp pool

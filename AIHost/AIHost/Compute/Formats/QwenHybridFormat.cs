@@ -33,7 +33,9 @@ public class QwenHybridFormat : ITransformerFormat
         var _ts = GlobalProfiler.Start();
 
         var a = t.TempF32(nm.AttnNorm(g)); var qkw = t.TempF32(nm.AttnQKV(g));
-        string ak = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : nm.AttnOutput(g);
+        // ssm_out.weight [VALUE_DIM, dModel] is for SSM output, not attention.
+        // Use attn_output.weight (or attn_gate.weight fallback via TensorNameMapper).
+        string ak = nm.AttnOutput(g);
         var aoW = t.TempF32Named(ak); var fn = t.TempF32(nm.FfnNorm(g));
         var wg = t.TempF32(nm.FfnGate(g)); var wu = t.TempF32(nm.FfnUp(g));
         var wd = t.TempF32(nm.FfnDown(g));
@@ -49,9 +51,13 @@ public class QwenHybridFormat : ITransformerFormat
         GlobalProfiler.End(_ts2, "LayerA.AttnMatMul");
 
         int hd = t._headDim, qd = t._numHeads * hd, kd = t._numKVHeads * hd;
-        int tq = qkv.Shape[1], eb = qd + 2 * kd; bool hg = tq > eb; int qgd = hg ? tq - eb : 0;
+        int tq = qkv.Shape[1], eb = qd + 2 * kd;
+        // Gate detection: extra columns must form a proper gate (same dim as Q).
+        // Qwen3.6 Type A layers pack SSM conv data in the extra space — skip gated-Q for those.
+        int qgd = tq - eb;
+        bool hg = qgd > 0 && qgd == qd;
         var Q = o.SliceCols(qkv, 0, qd, "Q"); var K = o.SliceCols(qkv, qd, kd, "K"); var V = o.SliceCols(qkv, qd + kd, kd, "V");
-        Tensor gq; if (hg) { var qg = o.SliceCols(qkv, qd + 2 * kd, qgd, "qg"); o.SiLU(qg); var qt = o.Concat(qg, qg, 1, "qt2"); qt = o.Concat(qt, qg, 1, "qt3"); if (b) o.DeferExternal(qg); else qg.Dispose(); gq = o.Multiply(Q, qt, "gq"); if (b) o.DeferExternal(Q); else Q.Dispose(); if (b) o.DeferExternal(qt); else qt.Dispose(); } else { gq = Q; }
+        Tensor gq; if (hg) { var qg = o.SliceCols(qkv, qd + 2 * kd, qgd, "qg"); o.SiLU(qg); gq = o.Multiply(Q, qg, "gq"); if (b) o.DeferExternal(Q); else Q.Dispose(); if (b) o.DeferExternal(qg); else qg.Dispose(); } else { gq = Q; }
         if (b) o.DeferExternal(qkv); else qkv.Dispose();
 
         var _ts3 = GlobalProfiler.Start();

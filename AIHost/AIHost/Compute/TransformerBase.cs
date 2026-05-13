@@ -229,23 +229,10 @@ public class TransformerBase : IDisposable
         }
         _logger.LogInformation("[FWD] Layer loop done");
 
-        // 3. Final layer norm
-        {
-            var (normF32, normScratch) = TempF32(_nameMapper!.OutputNorm);
-            _ops.LayerNorm(x, normF32);
-            if (!normScratch) normF32.Dispose();
-        }
-
-        // 4. Vocab projection
-        Tensor logits;
-        {
-            var (outF32, outScratch) = TempF32(_nameMapper.OutputWeight);
-            logits = _ops.MatMulWeights(x, outF32, "logits");
-            if (!outScratch) outF32.Dispose();
-        }
-
-        x.Dispose();
-        return logits;
+        // 3. Final layer norm + vocab projection
+        //    Delegates to ForwardHead which has chunked MatMulWeightsLarge path
+        //    for large-vocab models (Qwen 248K, etc.).
+        return ForwardHead(x);
     }
 
     // ── Protected helpers for formats ─────────────────────────────────────────
