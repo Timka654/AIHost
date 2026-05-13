@@ -33,9 +33,7 @@ public class QwenHybridFormat : ITransformerFormat
         var _ts = GlobalProfiler.Start();
 
         var a = t.TempF32(nm.AttnNorm(g)); var qkw = t.TempF32(nm.AttnQKV(g));
-        // ssm_out.weight [VALUE_DIM, dModel] is for SSM output, not attention.
-        // Use attn_output.weight (or attn_gate.weight fallback via TensorNameMapper).
-        string ak = nm.AttnOutput(g);
+        string ak = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : nm.AttnOutput(g);
         var aoW = t.TempF32Named(ak); var fn = t.TempF32(nm.FfnNorm(g));
         var wg = t.TempF32(nm.FfnGate(g)); var wu = t.TempF32(nm.FfnUp(g));
         var wd = t.TempF32(nm.FfnDown(g));
@@ -249,18 +247,20 @@ public class QwenHybridFormat : ITransformerFormat
             for (int i = 0; i < end - ti; i++)
             {
                 var _tsTi = GlobalProfiler.Start();
-                var x1nRow = o.Clone(xn);
-                // Arena tokenOut (0 vkAllocateMemory when arena active)
-                var tokenOut = o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{ti + i}")
-                    ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{ti + i}");
+                int tokenIdx = ti + i;
+                // Pass full xn tensor with rowIndex instead of cloning per token.
+                // SSM shader reads xNorm.data[rowIndex * DMODEL + k].
+                var tokenOut = o.AllocTempTensor(TensorShape.Matrix(1, VD), $"ssm_tok{tokenIdx}")
+                    ?? Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, $"ssm_tok{tokenIdx}");
 
                 o.SsmGdnDecode(
-                    x1nRow,
+                    xn,
                     convW, convStateTensor, wQKV, wZ, wBeta, wAlpha, dtBias, ssA,
                     scratch,
                     ssmStateTensor,
                     normF32,
-                    tokenOut);
+                    tokenOut,
+                    (uint)tokenIdx);
 
                 GlobalProfiler.End(_tsTi, "SSM_GPU.Token");
 
@@ -271,7 +271,6 @@ public class QwenHybridFormat : ITransformerFormat
                     subResult = o.Concat(subResult, tokenOut, 0, "ssm_subcat");
                     if (b) o.DeferExternal(tokenOut); else tokenOut.Dispose();
                 }
-                if (b) o.DeferExternal(x1nRow); else x1nRow.Dispose();
             }
 
             subResult ??= Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, "ssm_empty_sub");

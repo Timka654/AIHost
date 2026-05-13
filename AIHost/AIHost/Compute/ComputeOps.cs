@@ -1853,7 +1853,8 @@ public class ComputeOps : IDisposable
         Tensor scratch,
         Tensor ssmState,
         Tensor ssmNorm,
-        Tensor output)
+        Tensor output,
+        uint rowIndex = 0u)
     {
         // ── Part 1: conv1d ───────────────────────────────────────────────────
         var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", ComputeShaders.SsmGdnDecode);
@@ -1867,6 +1868,11 @@ public class ComputeOps : IDisposable
         kernelDecode.SetArgument(7, dtBias.Buffer);
         kernelDecode.SetArgument(8, ssA.Buffer);
         kernelDecode.SetArgument(9, scratch.Buffer);
+
+        // RowIndex buffer (binding=10) — per-call, small (4 bytes), deferred disposal.
+        var rowIndexBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+        rowIndexBuf.Write(new[] { rowIndex });
+        kernelDecode.SetArgument(10, rowIndexBuf);
 
         // 48 workgroups × 128 threads
         _queue.Dispatch(kernelDecode, new[] { 48u }, null);
@@ -1885,6 +1891,7 @@ public class ComputeOps : IDisposable
         _queue.Dispatch(kernelRecur, new[] { 48u }, null);
 
         MaybeFlush();
+        Defer(rowIndexBuf);
     }
 
     #endregion
