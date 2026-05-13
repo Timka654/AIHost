@@ -98,7 +98,7 @@ public class QwenHybridFormat : ITransformerFormat
             try
             {
                 x2 = SSM_Gpu(t, o, x1, x1n, g, ss, sl);
-                x1.Dispose();
+                if (b) o.DeferExternal(x1); else x1.Dispose();
             }
             catch (Exception ex)
             {
@@ -141,8 +141,12 @@ public class QwenHybridFormat : ITransformerFormat
         var rq = o.MatMulWeights(xn, qW.tensor, "rqB"); var K = o.MatMulWeights(xn, kW.tensor, "KB"); var V = o.MatMulWeights(xn, vW.tensor, "VB");
         if (!qW.isScratch) o.DeferExternal(qW.tensor); if (!kW.isScratch) o.DeferExternal(kW.tensor); if (!vW.isScratch) o.DeferExternal(vW.tensor);
         if (b) o.DeferExternal(xn); else xn.Dispose();
-        int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim; bool ig = t.HasWeight($"blk.{g}.attn_gate.weight");
-        int qd = t.HasWeight($"blk.{g}.attn_output.weight") ? t._weightCache[$"blk.{g}.attn_output.weight"].Shape[0] : qtd;
+        int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim;
+        int qd = t.HasWeight($"blk.{g}.attn_output.weight")
+            ? t._weightCache[$"blk.{g}.attn_output.weight"].Shape[0] : qtd;
+        // Gate detection: only if Q weight has doubled output (Q + gate halves).
+        // attn_gate.weight alone doesn't mean this layer has gated Q.
+        bool ig = t.HasWeight($"blk.{g}.attn_gate.weight") && qtd == 2 * qd;
         Tensor gq; int nqh;
         if (ig || qtd > qd) { var qp = o.SliceCols(rq, 0, qd, "qpB"); var qg = o.SliceCols(rq, qd, qd, "qgB"); if (b) o.DeferExternal(rq); else rq.Dispose(); o.SiLU(qg); gq = o.Multiply(qp, qg, "gqB"); if (b) o.DeferExternal(qp); else qp.Dispose(); if (b) o.DeferExternal(qg); else qg.Dispose(); nqh = qd / hd; } else { gq = rq; nqh = qtd / hd; }
         var qn = t.GetOrBuildTiledNorm($"blk.{g}.attn_q_norm.weight", hd, qd); var kn = t.GetOrBuildTiledNorm($"blk.{g}.attn_k_norm.weight", hd, kd);
@@ -260,7 +264,10 @@ public class QwenHybridFormat : ITransformerFormat
                     ssmStateTensor,
                     normF32,
                     tokenOut,
-                    (uint)tokenIdx);
+                    (uint)tokenIdx,
+                    (uint)t._numHeads,
+                    (uint)t._numKVHeads,
+                    (uint)t._headDim);
 
                 GlobalProfiler.End(_tsTi, "SSM_GPU.Token");
 

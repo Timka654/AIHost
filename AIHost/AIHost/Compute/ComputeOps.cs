@@ -1854,7 +1854,10 @@ public class ComputeOps : IDisposable
         Tensor ssmState,
         Tensor ssmNorm,
         Tensor output,
-        uint rowIndex = 0u)
+        uint rowIndex = 0u,
+        uint numHeads = 24,
+        uint numKvHeads = 4,
+        uint headDim = 256)
     {
         // ── Part 1: conv1d ───────────────────────────────────────────────────
         var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", ComputeShaders.SsmGdnDecode);
@@ -1874,8 +1877,9 @@ public class ComputeOps : IDisposable
         rowIndexBuf.Write(new[] { rowIndex });
         kernelDecode.SetArgument(10, rowIndexBuf);
 
-        // 48 workgroups × 128 threads
-        _queue.Dispatch(kernelDecode, new[] { 48u }, null);
+        // CONV_DIM / HEAD_V_DIM = 80 workgroups × 128 threads.
+        // Covers all 10240 conv elements + 6144 z elements (first 48 groups).
+        _queue.Dispatch(kernelDecode, new[] { 80u }, null);
 
         // Memory barrier between part 1 and part 2
         _queue.InsertMemoryBarrier();

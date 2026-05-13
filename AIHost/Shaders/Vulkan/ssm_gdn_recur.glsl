@@ -19,17 +19,16 @@ void main() {
     uint d = gl_LocalInvocationID.x;
     uint h = n % N_K_HEADS;
     uint qkvIdx = n * HEAD_V_DIM + d;
-    float zVal = scratch.data[CONV_DIM + qkvIdx];
-    float beta = scratch.data[CONV_DIM + VALUE_DIM + n];
-    float gate = scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n];
     uint qkIdx = h * HEAD_V_DIM + d;
-    float qConvVal = 0.0;
-    float kConvVal = 0.0;
-    if (qkIdx < KEY_DIM) {
-        qConvVal = scratch.data[qkIdx];
-        kConvVal = scratch.data[KEY_DIM + qkIdx];
-    }
-    float vConvVal = scratch.data[2u * KEY_DIM + qkvIdx];
+    float zVal  = (qkvIdx < VALUE_DIM)
+        ? scratch.data[CONV_DIM + qkvIdx] : 0.0;
+    float beta  = (n < N_V_HEADS)
+        ? scratch.data[CONV_DIM + VALUE_DIM + n] : 0.0;
+    float gate  = (n < N_V_HEADS)
+        ? scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n] : 0.0;
+    float qConvVal = (qkIdx < KEY_DIM) ? scratch.data[qkIdx] : 0.0;
+    float kConvVal = (qkIdx < KEY_DIM) ? scratch.data[KEY_DIM + qkIdx] : 0.0;
+    float vConvVal = (qkvIdx < VALUE_DIM) ? scratch.data[2u * KEY_DIM + qkvIdx] : 0.0;
     float localSumSqQ = qConvVal * qConvVal;
     float localSumSqK = kConvVal * kConvVal;
     sharedMem[d] = localSumSqQ;
