@@ -19,23 +19,25 @@ layout(set = 0, binding = 6) readonly  buffer WAlphaBuf   { float data[]; } wAlp
 layout(set = 0, binding = 7) readonly  buffer DtBiasBuf   { float data[]; } dtBias;
 layout(set = 0, binding = 8) readonly  buffer SsABuf      { float data[]; } ssA;
 layout(set = 0, binding = 9)          buffer ScratchBuf   { float data[]; } scratch;
+layout(set = 0, binding = 10) readonly buffer RowIdxBuf   { uint rowIndex; } rowIdx;
 float silu(float x) { return x / (1.0 + exp(-x)); }
 void main() {
     uint n = gl_WorkGroupID.x;
     uint d = gl_LocalInvocationID.x;
+    uint base = rowIdx.rowIndex * DMODEL;
     uint qkvIdx = n * HEAD_V_DIM + d;
     float zVal = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) zVal += xNorm.data[k] * wZ.data[k + qkvIdx * DMODEL];
+    for (uint k = 0u; k < DMODEL; k++) zVal += xNorm.data[base + k] * wZ.data[k + qkvIdx * DMODEL];
     float betaSum = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) betaSum += xNorm.data[k] * wBeta.data[k + n * DMODEL];
+    for (uint k = 0u; k < DMODEL; k++) betaSum += xNorm.data[base + k] * wBeta.data[k + n * DMODEL];
     float beta = 1.0 / (1.0 + exp(-betaSum));
     float alphaSum = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[k] * wAlpha.data[k + n * DMODEL];
+    for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[base + k] * wAlpha.data[k + n * DMODEL];
     float alpha = log(1.0 + exp(alphaSum + dtBias.data[n % N_K_HEADS]));
     float gate = alpha * ssA.data[n % N_K_HEADS];
     float qkvVal = 0.0;
     if (qkvIdx < CONV_DIM) {
-        for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[k] * wQKV.data[k + qkvIdx * DMODEL];
+        for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[base + k] * wQKV.data[k + qkvIdx * DMODEL];
     }
     float convOut = 0.0;
     if (qkvIdx < CONV_DIM) {
