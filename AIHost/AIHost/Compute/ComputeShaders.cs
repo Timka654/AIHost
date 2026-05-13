@@ -795,10 +795,11 @@ void main() {
     }
     float convOut = 0.0;
     if (qkvIdx < CONV_DIM) {
-        convOut += convState.data[0u * CONV_DIM + qkvIdx] * convW.data[0u * CONV_DIM + qkvIdx];
-        convOut += convState.data[1u * CONV_DIM + qkvIdx] * convW.data[1u * CONV_DIM + qkvIdx];
-        convOut += convState.data[2u * CONV_DIM + qkvIdx] * convW.data[2u * CONV_DIM + qkvIdx];
-        convOut += qkvVal * convW.data[3u * CONV_DIM + qkvIdx];
+        // convW GGUF shape [CONV_KERNEL=4, CONV_DIM=10240], column-major: data[slot + ch * CONV_KERNEL]
+        convOut += convState.data[0u * CONV_DIM + qkvIdx] * convW.data[0u + qkvIdx * CONV_KERNEL];
+        convOut += convState.data[1u * CONV_DIM + qkvIdx] * convW.data[1u + qkvIdx * CONV_KERNEL];
+        convOut += convState.data[2u * CONV_DIM + qkvIdx] * convW.data[2u + qkvIdx * CONV_KERNEL];
+        convOut += qkvVal * convW.data[3u + qkvIdx * CONV_KERNEL];
     }
     float siluVal = silu(convOut);
     if (qkvIdx < CONV_DIM) scratch.data[qkvIdx] = siluVal;

@@ -124,6 +124,11 @@ public class QwenHybridFormat : ITransformerFormat
         int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim;
         int qd = t.HasWeight($"blk.{g}.attn_output.weight")
             ? t._weightCache[$"blk.{g}.attn_output.weight"].Shape[0] : qtd;
+        // Only log during decode (sl==1): in non-batch mode every MaybeFlush() does a full GPU sync,
+        // so ReadRange after each op sees correct values. In prefill batch mode the command buffer
+        // is not yet submitted when Row0 is called — reads would return stale GPU memory.
+        bool dbg = sl == 1 && QwenDbgTrace.Once("TypeB", g);
+        if (dbg) QwenDbgTrace.Row0($"rq_raw_g{g}", rq, 16); // interleaved layout visible here
         // Gate detection: Q weight has doubled output (Q + gate interleaved per head).
         // attn_q.weight output layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
         // Gate is applied via sigmoid to the attention OUTPUT (not to Q before attention).
@@ -134,9 +139,11 @@ public class QwenHybridFormat : ITransformerFormat
             // De-interleave: rearrange from [Q_h0(hd), gate_h0(hd), Q_h1, gate_h1, ...]
             // to [Q_all(qd), gate_all(qd)] so SliceCols correctly splits them.
             var rqDi = o.DeinterleaveQGate(rq, (uint)(qd / hd), (uint)hd, "rqDiB");
+            if (dbg) QwenDbgTrace.Row0($"rqDi_g{g}", rqDi, 16); // should be de-interleaved
             if (b) o.DeferExternal(rq); else rq.Dispose();
             gq = o.SliceCols(rqDi, 0, qd, "qpB");          // pure Q — no gate applied before attention
             attnOutGate = o.SliceCols(rqDi, qd, qd, "qgB"); // gate — sigmoid applied after attention
+            if (dbg) { QwenDbgTrace.Row0($"Q_g{g}", gq, 8); QwenDbgTrace.Row0($"gate_g{g}", attnOutGate, 8); }
             if (b) o.DeferExternal(rqDi); else rqDi.Dispose();
             nqh = qd / hd;
         } else { gq = rq; nqh = qtd / hd; }
@@ -145,10 +152,12 @@ public class QwenHybridFormat : ITransformerFormat
         o.ApplyRoPEFull(gq, pos, nqh, hd, t._ropeFreqBase); o.ApplyRoPEFull(K, pos, kd / hd, hd, t._ropeFreqBase);
         Tensor ao; if (kvc != null) { kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li); ao = o.MultiHeadAttention(gq, ck!, cv!, nqh, pos, "aoB"); o.DeferExternal(gq); }
         else { ao = o.MultiHeadAttention(gq, K, V, nqh, pos, "aoB"); o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V); }
+        if (dbg) QwenDbgTrace.Row0($"ao_pregate_g{g}", ao, 8);
         // Apply sigmoid gate to attention output (qwen3next: sigmoid, not SiLU; after attn, not before).
         if (attnOutGate != null) {
             o.Sigmoid(attnOutGate);
             var aoGated = o.Multiply(ao, attnOutGate, "aoGatedB");
+            if (dbg) QwenDbgTrace.Row0($"ao_gated_g{g}", aoGated, 8);
             if (b) o.DeferExternal(ao); else ao.Dispose();
             if (b) o.DeferExternal(attnOutGate); else attnOutGate.Dispose();
             ao = aoGated;
@@ -267,6 +276,11 @@ public class QwenHybridFormat : ITransformerFormat
                     (uint)t._numHeads,
                     (uint)t._numKVHeads,
                     (uint)t._headDim);
+
+                // Log during decode only (sl==1): non-batch mode flushes after each op → correct read.
+                // In decode, AllocTempTensor returns null (no arena) → fallback Tensor.Create → readable.
+                if (tokenIdx == 0 && sl == 1 && QwenDbgTrace.Once("SSM_tok0", g))
+                    QwenDbgTrace.Row0($"ssm_out_g{g}_tok0", tokenOut, 8);
 
                 GlobalProfiler.End(_tsTi, "SSM_GPU.Token");
 
