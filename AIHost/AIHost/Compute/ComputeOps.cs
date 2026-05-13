@@ -980,23 +980,28 @@ public class ComputeOps : IDisposable
     /// Apply RoPE to a full Q or K projection tensor [seqLen, numHeads * headDim].
     /// Each (seq, head) pair is rotated at position startPosition + seq.
     /// </summary>
-    public void ApplyRoPEFull(Tensor tensor, uint startPosition, int numHeads, int headDim, float theta = 10000.0f)
+    public void ApplyRoPEFull(Tensor tensor, uint startPosition, int numHeads, int headDim, float theta = 10000.0f, int ropeDim = 0)
     {
+        // ropeDim: number of head dimensions to rotate. 0 → use headDim (all pairs).
+        // For models with partial RoPE (e.g. Qwen3.5/3.6 rope.dimension_count=64 in a 256-dim head),
+        // only the first ropeDim dimensions per head are rotated; the rest are left unchanged.
+        if (ropeDim <= 0) ropeDim = headDim;
         int seqLen = tensor.Shape[0];
-        var paramsBuffer = _device.CreateBuffer(20, BufferType.Storage, DataType.I32);
-        var p = new byte[20];
+        var paramsBuffer = _device.CreateBuffer(24, BufferType.Storage, DataType.I32);
+        var p = new byte[24];
         BitConverter.GetBytes((uint)seqLen).CopyTo(p, 0);
         BitConverter.GetBytes((uint)numHeads).CopyTo(p, 4);
         BitConverter.GetBytes((uint)headDim).CopyTo(p, 8);
         BitConverter.GetBytes(startPosition).CopyTo(p, 12);
         BitConverter.GetBytes(theta).CopyTo(p, 16);
+        BitConverter.GetBytes((uint)ropeDim).CopyTo(p, 20);
         paramsBuffer.Write(p);
 
         var kernel = GetOrCreateKernel("rope_full", ComputeShaders.RoPEFull);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
-        uint total = (uint)(seqLen * numHeads * headDim / 2);
+        uint total = (uint)(seqLen * numHeads * ropeDim / 2);
         _queue.Dispatch(kernel, new[] { (total + 255u) / 256u }, null);
         MaybeFlush();
         Defer(paramsBuffer);

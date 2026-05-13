@@ -21,6 +21,13 @@ public class TransformerBase : IDisposable
     protected internal readonly int _numKVHeads;
     protected internal readonly int _headDim;
     protected internal readonly float _ropeFreqBase;
+    /// <summary>
+    /// Number of head dimensions to apply RoPE to (from rope.dimension_count).
+    /// For models with partial RoPE (e.g. Qwen3.5/3.6: 64 of 256), only these
+    /// dimensions are rotated; the rest are left unchanged.
+    /// Defaults to _headDim (full rotation) when key is absent.
+    /// </summary>
+    protected internal readonly int _ropeDimCount;
     protected bool _disposed;
     protected internal readonly ILogger<TransformerBase> _logger = AppLogger.Create<TransformerBase>();
 
@@ -79,12 +86,16 @@ public class TransformerBase : IDisposable
         _headDim = ArchInt("attention.key_length", _dModel / _numHeads);
 
         _ropeFreqBase = ArchFlt("rope.freq_base", 10000.0f);
+        // rope.dimension_count: how many dimensions per head get RoPE applied.
+        // For Qwen3.5/3.6: 64 (only 32 pairs rotated out of 128 in a 256-dim head).
+        // Absent on most models → default to headDim (rotate all pairs).
+        _ropeDimCount = ArchInt("rope.dimension_count", _headDim);
         var kvHeads = ArchInt("attention.head_count_kv", 4);
         _numKVHeads = kvHeads;
         _localLayerCount = _numLayers;
 
-        _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} head_dim={HeadDim} ctx={Ctx} rope={Rope}",
-            _numLayers, _dModel, _numHeads, kvHeads, _headDim, ContextLength, _ropeFreqBase);
+        _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} head_dim={HeadDim} ctx={Ctx} rope={Rope} rope_dim={RopeDim}",
+            _numLayers, _dModel, _numHeads, kvHeads, _headDim, ContextLength, _ropeFreqBase, _ropeDimCount);
     }
 
     // ── Weight loading ────────────────────────────────────────────────────────
@@ -401,6 +412,23 @@ public class TransformerBase : IDisposable
             names.Add(_nameMapper.FfnGate(refLayer));
             names.Add(_nameMapper.FfnUp(refLayer));
             names.Add(_nameMapper.FfnDown(refLayer));
+
+            // ── Gemma 4 extras ────────────────────────────────────────────────
+            names.Add($"blk.{refLayer}.attn_post_norm.weight");
+            names.Add($"blk.{refLayer}.ffn_post_norm.weight");
+            names.Add($"blk.{refLayer}.layer_out_scale.weight");
+
+            // ── DeepSeek V2/V3/V4 extras ───────────────────────────────────────
+            // MLA weights (compressed attention)
+            names.Add($"blk.{refLayer}.attn_q_a.weight");
+            names.Add($"blk.{refLayer}.attn_q_b.weight");
+            names.Add($"blk.{refLayer}.attn_kv_a_mqa.weight");
+            names.Add($"blk.{refLayer}.attn_k_b.weight");
+            names.Add($"blk.{refLayer}.attn_v_b.weight");
+            // MoE shared expert (shexp)
+            names.Add($"blk.{refLayer}.ffn_gate_shexp.weight");
+            names.Add($"blk.{refLayer}.ffn_up_shexp.weight");
+            names.Add($"blk.{refLayer}.ffn_down_shexp.weight");
         }
 
         string sample = names[0];
@@ -514,6 +542,32 @@ public class TransformerBase : IDisposable
         TryCacheWeight(nm.FfnGate(globalLayer));
         TryCacheWeight(nm.FfnUp(globalLayer));
         TryCacheWeight(nm.FfnDown(globalLayer));
+
+        // ── Gemma 4 extras ────────────────────────────────────────────────
+        TryCacheWeight($"blk.{globalLayer}.attn_post_norm.weight");
+        TryCacheWeight($"blk.{globalLayer}.ffn_post_norm.weight");
+        TryCacheWeight($"blk.{globalLayer}.layer_out_scale.weight");
+
+        // ── DeepSeek V2/V3/V4 extras ───────────────────────────────────────
+        // MLA weights (compressed attention)
+        TryCacheWeight($"blk.{globalLayer}.attn_q_a.weight");
+        TryCacheWeight($"blk.{globalLayer}.attn_q_b.weight");
+        TryCacheWeight($"blk.{globalLayer}.attn_q_a_norm.weight");
+        TryCacheWeight($"blk.{globalLayer}.attn_kv_a_mqa.weight");
+        TryCacheWeight($"blk.{globalLayer}.attn_kv_a_norm.weight");
+        TryCacheWeight($"blk.{globalLayer}.attn_k_b.weight");
+        TryCacheWeight($"blk.{globalLayer}.attn_v_b.weight");
+        // MoE router
+        TryCacheWeight($"blk.{globalLayer}.ffn_gate_inp.weight");
+        TryCacheWeight($"blk.{globalLayer}.ffn_exp_probs_b.bias");
+        // MoE shared expert (shexp)
+        TryCacheWeight($"blk.{globalLayer}.ffn_gate_shexp.weight");
+        TryCacheWeight($"blk.{globalLayer}.ffn_up_shexp.weight");
+        TryCacheWeight($"blk.{globalLayer}.ffn_down_shexp.weight");
+        // MoE routed experts (load only for diagnostic purposes)
+        TryCacheWeight($"blk.{globalLayer}.ffn_gate_exps.weight");
+        TryCacheWeight($"blk.{globalLayer}.ffn_up_exps.weight");
+        TryCacheWeight($"blk.{globalLayer}.ffn_down_exps.weight");
 
         // SSM weights (optional)
         TryCacheWeight($"blk.{globalLayer}.ssm_a");

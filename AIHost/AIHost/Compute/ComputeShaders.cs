@@ -538,21 +538,22 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
 layout(set = 0, binding = 1) readonly buffer Params {
-    uint seqLen; uint numHeads; uint headDim; uint startPosition; float theta;
+    uint seqLen; uint numHeads; uint headDim; uint startPosition; float theta; uint ropeDim;
 } params;
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    uint halfHead = params.headDim / 2u;
-    uint pairsPerSeq = params.numHeads * halfHead;
+    uint halfRope = params.ropeDim / 2u;
+    uint pairsPerSeq = params.numHeads * halfRope;
     if (gid >= params.seqLen * pairsPerSeq) return;
     uint seq  = gid / pairsPerSeq;
     uint rem  = gid % pairsPerSeq;
-    uint head = rem / halfHead;
-    uint pair = rem % halfHead;
+    uint head = rem / halfRope;
+    uint pair = rem % halfRope;
     uint pos = params.startPosition + seq;
-    float freq = 1.0 / pow(params.theta, float(pair * 2u) / float(params.headDim));
+    float freq = 1.0 / pow(params.theta, float(pair * 2u) / float(params.ropeDim));
     float angle = float(pos) * freq;
     float c = cos(angle), s = sin(angle);
+    // base = start of this token's head; offset within head = pair*2 (within ropeDim range)
     uint base = (seq * params.numHeads + head) * params.headDim + pair * 2u;
     float x1 = buf.data[base];
     float x2 = buf.data[base + 1u];

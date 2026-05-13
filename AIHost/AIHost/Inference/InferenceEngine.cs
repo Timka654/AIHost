@@ -203,6 +203,14 @@ public class InferenceEngine : IInferenceEngine
 
         _logger.LogDebug("[Inference] Prompt tokens: {Count} ids=[{Ids}]", tokens.Count, string.Join(",", tokens));
 
+        // Diagnostic: log every token with its text so we can verify special-token encoding.
+        // Runs at Warning level so it appears in release builds without changing log config.
+        if (_logger.IsEnabled(LogLevel.Warning))
+        {
+            var lines = tokens.Select((id, idx) => $"  [{idx:D3}] id={id,7}  '{_tokenizer.GetToken(id)}'");
+            _logger.LogWarning("[DIAG Tokenize] {Count} tokens:\n{Dump}", tokens.Count, string.Join("\n", lines));
+        }
+
         return tokens;
     }
 
@@ -286,25 +294,34 @@ public class InferenceEngine : IInferenceEngine
                         _logger.LogDebug("[Inference] Token {N}: {Ms}ms | avg {Tps:F1} tok/s | kvLen={KvLen}", generatedCount, iterSw.ElapsedMilliseconds, tps, startPos);
                     }
 
-                    if (generatedCount == 0)
+                    // Log logit quality stats for the first 20 generated tokens.
+                    // range > 15 = healthy sharp distribution; range < 5 = collapsed/garbage.
+                    if (generatedCount < 20)
                     {
                         var sorted = lastLogits.Select((v,i)=>(v,i)).OrderByDescending(x=>x.v).ToArray();
-                        int rankQuin = Array.FindIndex(sorted, x => x.i == 24150);
-                        int rankComma = Array.FindIndex(sorted, x => x.i == 1919);
-                        _logger.LogTrace("[LogitCmp] 'quin'(24150)=rank{RankQuin},logit{LQuin:F3} | ' ,'(1919)=rank{RankComma},logit{LComma:F3}", rankQuin+1, lastLogits[24150], rankComma+1, lastLogits[1919]);
-                        _logger.LogTrace("[LogitCmp] top1={Id}('{Tok}')={Val:F3}", sorted[0].i, _tokenizer.GetToken(sorted[0].i), sorted[0].v);
-                        // Print top-5 tokens for debugging
-                        _logger.LogWarning("[LogitCmp] Top-5 tokens at first step:");
-                        for (int t = 0; t < 5 && t < sorted.Length; t++)
+                        float maxL   = sorted[0].v;
+                        float minL   = sorted[^1].v;
+                        float meanL  = lastLogits.Average();
+                        float gap12  = sorted[0].v - sorted[1].v;  // top1 - top2 gap
+                        // Entropy over top-200 (fast proxy; higher = flatter = worse)
+                        var top200 = sorted.Take(200).Select(x => MathF.Exp(x.v - maxL)).ToArray();
+                        float s200 = top200.Sum();
+                        float ent = s200 > 0
+                            ? -top200.Sum(p => { float q = p / s200; return q > 1e-9f ? q * MathF.Log(q) : 0f; })
+                            : 0f;
+                        _logger.LogWarning(
+                            "[DIAG Logits#{N}] top1={T1Id}('{T1Tok}')={T1V:F2} top2={T2Id}('{T2Tok}')={T2V:F2} | gap={Gap:F2} range={Range:F2} mean={Mean:F2} ent200={Ent:F3}",
+                            generatedCount,
+                            sorted[0].i, _tokenizer.GetToken(sorted[0].i), maxL,
+                            sorted[1].i, _tokenizer.GetToken(sorted[1].i), sorted[1].v,
+                            gap12, maxL - minL, meanL, ent);
+                        if (generatedCount == 0)
                         {
-                            var tokStr = _tokenizer.GetToken(sorted[t].i);
-                            _logger.LogWarning("  #{Rank}: id={Id} token='{Tok}' logit={Logit:F4}",
-                                t + 1, sorted[t].i, tokStr, sorted[t].v);
+                            // Extended top-10 on very first step
+                            _logger.LogWarning("[DIAG Logits#0] Top-10:");
+                            for (int ti = 0; ti < 10 && ti < sorted.Length; ti++)
+                                _logger.LogWarning("  #{Rank}: id={Id} '{Tok}' = {Logit:F4}", ti+1, sorted[ti].i, _tokenizer.GetToken(sorted[ti].i), sorted[ti].v);
                         }
-                        // Print statistics
-                        float maxL = sorted[0].v, minL = sorted[^1].v, meanL = lastLogits.Average();
-                        _logger.LogWarning("[LogitCmp] Stats: max={Max:F4} min={Min:F4} mean={Mean:F4} range={Range:F4}",
-                            maxL, minL, meanL, maxL - minL);
                     }
                 }
                 finally
@@ -318,6 +335,9 @@ public class InferenceEngine : IInferenceEngine
             int nextToken = Sample(lastLogits, tokens, config);
             tokens.Add(nextToken);
             generatedCount++;
+
+            // Log every generated token so we can see the actual output stream.
+            _logger.LogWarning("[DIAG Gen#{N}] id={Id} text='{Tok}'", generatedCount, nextToken, _tokenizer.GetToken(nextToken));
 
             // Check stop BEFORE sending to client so stop tokens never appear in output
             if (stopSingleTokens.Contains(nextToken))

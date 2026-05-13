@@ -149,7 +149,17 @@ public class QwenHybridFormat : ITransformerFormat
         } else { gq = rq; nqh = qtd / hd; }
         var qn = t.GetOrBuildTiledNorm($"blk.{g}.attn_q_norm.weight", hd, qd); var kn = t.GetOrBuildTiledNorm($"blk.{g}.attn_k_norm.weight", hd, kd);
         if (qn != null) o.LayerNorm(gq, qn); if (kn != null) o.LayerNorm(K, kn);
-        o.ApplyRoPEFull(gq, pos, nqh, hd, t._ropeFreqBase); o.ApplyRoPEFull(K, pos, kd / hd, hd, t._ropeFreqBase);
+        o.ApplyRoPEFull(gq, pos, nqh, hd, t._ropeFreqBase, t._ropeDimCount); o.ApplyRoPEFull(K, pos, kd / hd, hd, t._ropeFreqBase, t._ropeDimCount);
+        // Diagnostic: log Q/K head-0 magnitude after RoPE for first 4 attention layers.
+        // ||Q||² >> 0 = healthy; ≈ 0 or NaN = corrupted by RoPE/norm.
+        if (sl == 1 && QwenDbgTrace.Once("RoPE_QK_norm", g))
+        {
+            var qd0 = gq.Buffer.ReadRange<float>(0, Math.Min(hd, 16));
+            var kd0 = K.Buffer.ReadRange<float>(0, Math.Min(hd, 16));
+            float qNormSq = qd0.Sum(v => v * v);
+            float kNormSq = kd0.Sum(v => v * v);
+            QwenDbgTrace.Msg($"[DIAG RoPE g={g}] ropeDim={t._ropeDimCount} headDim={hd} pos={pos} ||Q_h0[:16]||²={qNormSq:F4} ||K_h0[:16]||²={kNormSq:F4}  Q[:4]=[{string.Join(",", qd0.Take(4).Select(v => v.ToString("F3")))}]");
+        }
         Tensor ao; if (kvc != null) { kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li); ao = o.MultiHeadAttention(gq, ck!, cv!, nqh, pos, "aoB"); o.DeferExternal(gq); }
         else { ao = o.MultiHeadAttention(gq, K, V, nqh, pos, "aoB"); o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V); }
         if (dbg) QwenDbgTrace.Row0($"ao_pregate_g{g}", ao, 8);
@@ -339,8 +349,8 @@ public class QwenHybridFormat : ITransformerFormat
             var K = o.SliceCols(q, qd, kd, "K_fb");
             var V = o.SliceCols(q, qd + kd, kd, "V_fb");
             q.Dispose();
-            o.ApplyRoPEFull(Q, 0, t._numHeads, hd, t._ropeFreqBase);
-            o.ApplyRoPEFull(K, 0, t._numKVHeads, hd, t._ropeFreqBase);
+            o.ApplyRoPEFull(Q, 0, t._numHeads, hd, t._ropeFreqBase, t._ropeDimCount);
+            o.ApplyRoPEFull(K, 0, t._numKVHeads, hd, t._ropeFreqBase, t._ropeDimCount);
             ao = o.MultiHeadAttention(Q, K, V, t._numHeads, 0, "a_fb");
             o.DeferExternal(Q);
             o.DeferExternal(K);
@@ -357,8 +367,8 @@ public class QwenHybridFormat : ITransformerFormat
             if (!sq) wq.Dispose();
             if (!sk) wk.Dispose();
             if (!sv) wv.Dispose();
-            o.ApplyRoPEFull(Q, 0, t._numHeads, hd, t._ropeFreqBase);
-            o.ApplyRoPEFull(K, 0, t._numKVHeads, hd, t._ropeFreqBase);
+            o.ApplyRoPEFull(Q, 0, t._numHeads, hd, t._ropeFreqBase, t._ropeDimCount);
+            o.ApplyRoPEFull(K, 0, t._numKVHeads, hd, t._ropeFreqBase, t._ropeDimCount);
             ao = o.MultiHeadAttention(Q, K, V, t._numHeads, 0, "a_fb");
             o.DeferExternal(Q);
             o.DeferExternal(K);

@@ -50,8 +50,8 @@ public class CombinedQKVFormat : ITransformerFormat
         qkv.Dispose();
 
         // 4. RoPE
-        ops.ApplyRoPEFull(Q, position, transformer._numHeads, headDim, transformer._ropeFreqBase);
-        ops.ApplyRoPEFull(K, position, nKvH, headDim, transformer._ropeFreqBase);
+        ops.ApplyRoPEFull(Q, position, transformer._numHeads, headDim, transformer._ropeFreqBase, transformer._ropeDimCount);
+        ops.ApplyRoPEFull(K, position, nKvH, headDim, transformer._ropeFreqBase, transformer._ropeDimCount);
 
         // 5. GQA
         Tensor attnOut;
