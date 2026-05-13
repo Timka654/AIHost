@@ -17,7 +17,7 @@ float silu(float x) { return x / (1.0 + exp(-x)); }
 void main() {
     uint n = gl_WorkGroupID.x;
     uint d = gl_LocalInvocationID.x;
-    uint h = n % N_K_HEADS;
+    uint h = n / (N_V_HEADS / N_K_HEADS);   // repeat-interleave: v_head n -> k_head n/3
     uint qkvIdx = n * HEAD_V_DIM + d;
     uint qkIdx = h * HEAD_V_DIM + d;
     float zVal  = (qkvIdx < VALUE_DIM)

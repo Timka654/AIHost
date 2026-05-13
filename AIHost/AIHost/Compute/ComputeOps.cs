@@ -511,6 +511,26 @@ public class ComputeOps : IDisposable
         Defer(paramsBuffer);
     }
 
+    /// <summary>
+    /// In-place sigmoid activation: x = 1 / (1 + exp(-x))
+    /// </summary>
+    public void Sigmoid(Tensor tensor)
+    {
+        uint[] paramsData = { (uint)tensor.Shape.TotalElements };
+        var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
+        paramsBuffer.Write(paramsData);
+
+        var kernel = GetOrCreateKernel("sigmoid", ComputeShaders.Sigmoid);
+        kernel.SetArgument(0, tensor.Buffer);
+        kernel.SetArgument(1, paramsBuffer);
+
+        uint[] globalWorkSize = { (uint)((tensor.Shape.TotalElements + 255) / 256) };
+        _queue.Dispatch(kernel, globalWorkSize, null);
+        MaybeFlush();
+
+        Defer(paramsBuffer);
+    }
+
     #endregion
 
     #region Normalization
@@ -1121,6 +1141,31 @@ public class ComputeOps : IDisposable
         kernel.SetArgument(0, input.Buffer); kernel.SetArgument(1, result.Buffer); kernel.SetArgument(2, paramsBuffer);
         _queue.Dispatch(kernel, new[] { ((uint)(rows * colCount) + 255u) / 256u }, null);
         MaybeFlush(); Defer(paramsBuffer);
+        return result;
+    }
+
+    /// <summary>
+    /// Rearranges Q+gate interleaved per head into [Q_all, gate_all] layout.
+    /// Input : [sl, n_head * 2 * head_dim] — [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+    /// Output: [sl, n_head * 2 * head_dim] — [Q_h0, Q_h1, ..., Q_hn, gate_h0, ..., gate_hn]
+    /// Use SliceCols(result, 0, n_head*head_dim) for Q and SliceCols(result, n_head*head_dim, n_head*head_dim) for gate.
+    /// </summary>
+    public Tensor DeinterleaveQGate(Tensor input, uint nHead, uint headDim, string? resultName = null)
+    {
+        var result = Tensor.Create(_device, input.Shape, DataType.F32, resultName);
+        var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
+        var p = new byte[12];
+        BitConverter.GetBytes((uint)input.Shape[0]).CopyTo(p, 0);
+        BitConverter.GetBytes(nHead).CopyTo(p, 4);
+        BitConverter.GetBytes(headDim).CopyTo(p, 8);
+        paramsBuffer.Write(p);
+        var kernel = GetOrCreateKernel("deinterleave_q_gate", ComputeShaders.DeinterleaveQGate);
+        kernel.SetArgument(0, input.Buffer);
+        kernel.SetArgument(1, result.Buffer);
+        kernel.SetArgument(2, paramsBuffer);
+        _queue.Dispatch(kernel, new[] { ((uint)input.Shape.TotalElements + 255u) / 256u }, null);
+        MaybeFlush();
+        Defer(paramsBuffer);
         return result;
     }
 
@@ -1893,6 +1938,12 @@ public class ComputeOps : IDisposable
 
         // 48 workgroups × 128 threads
         _queue.Dispatch(kernelRecur, new[] { 48u }, null);
+
+        // Barrier after recur: ensures recur_N's writes (ssmState, output) are complete and visible
+        // before the next decode_N+1 can start reading/writing scratch or ssmState.
+        // Without this barrier, decode_{N+1} may race with recur_N over the shared scratch buffer
+        // in batch mode (multiple tokens per GPU submit during prefill).
+        _queue.InsertMemoryBarrier();
 
         MaybeFlush();
         Defer(rowIndexBuf);

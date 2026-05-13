@@ -18,7 +18,7 @@ public class QwenHybridFormat : ITransformerFormat
         bool hc = t.HasWeight($"blk.{g}.attn_qkv.weight"), hs = t.HasWeight($"blk.{g}.attn_q.weight");
         Tensor result;
         if (!hc && !hs) result = Fallback(t, x, g, nm);
-        else if (hs) result = TypeB(t, x, g, li, pos, kvc);
+        else if (hs) result = TypeB(t, x, g, li, pos, kvc, nm);
         else result = TypeA(t, x, g, li, pos, kvc, nm, ss);
         GlobalProfiler.End(_ts, "Qwen.ApplyLayer");
         return result;
@@ -26,79 +26,45 @@ public class QwenHybridFormat : ITransformerFormat
 
 
     // ─── Type A ────────────────────────────────────────────────────────
+    // Recurrent (Gated Delta Net) layer: NO standard MultiHeadAttention.
+    // SSM_Gpu IS the full attention mechanism for this layer type.
     static Tensor TypeA(TransformerBase t, Tensor x, int g, int li, uint pos, KVCache? kvc, TensorNameMapper nm, SSMState? ss)
     {
         var o = t.Ops; int sl = x.Shape[0]; bool b = sl > 1;
         t._logger.LogInformation("[TypeA] Layer {Layer} START sl={SeqLen}", g, sl);
         var _ts = GlobalProfiler.Start();
 
-        var a = t.TempF32(nm.AttnNorm(g)); var qkw = t.TempF32(nm.AttnQKV(g));
-        string ak = t.HasWeight($"blk.{g}.ssm_out.weight") ? $"blk.{g}.ssm_out.weight" : nm.AttnOutput(g);
-        var aoW = t.TempF32Named(ak); var fn = t.TempF32(nm.FfnNorm(g));
-        var wg = t.TempF32(nm.FfnGate(g)); var wu = t.TempF32(nm.FfnUp(g));
-        var wd = t.TempF32(nm.FfnDown(g));
+        // Only load norms and FFN weights here; attn_qkv/ssm weights are loaded inside SSM_Gpu.
+        var a = t.TempF32(nm.AttnNorm(g));
+        var fn = t.TempF32(nm.FfnNorm(g));
+        // For MoE models (Qwen3Next): use shared expert weights if available.
+        // The full expert matrix (ffn_gate_exps.weight) is a 3D MoE tensor — wrong for dense FFN.
+        string wgName = nm.FfnGateShexp(g) ?? nm.FfnGate(g);
+        string wuName = nm.FfnUpShexp(g)   ?? nm.FfnUp(g);
+        string wdName = nm.FfnDownShexp(g) ?? nm.FfnDown(g);
+        var wg = t.TempF32Named(wgName); var wu = t.TempF32Named(wuName);
+        var wd = t.TempF32Named(wdName);
         GlobalProfiler.End(_ts, "LayerA.LoadW");
 
         if (b) o.BeginBatch();
 
+        // Normalize input — this is the GDN block input (pre-GDN norm = attn_norm).
         var _ts2 = GlobalProfiler.Start();
         var xn = o.Clone(x, "an"); o.LayerNorm(xn, a.tensor);
         if (!a.isScratch) o.DeferExternal(a.tensor);
-        var qkv = o.MatMulWeights(xn, qkw.tensor, "qkv");
-        if (!qkw.isScratch) o.DeferExternal(qkw.tensor);
-        GlobalProfiler.End(_ts2, "LayerA.AttnMatMul");
+        GlobalProfiler.End(_ts2, "LayerA.AttnNorm");
 
-        int hd = t._headDim, qd = t._numHeads * hd, kd = t._numKVHeads * hd;
-        int tq = qkv.Shape[1], eb = qd + 2 * kd;
-        // Gate detection: extra columns must form a proper gate (same dim as Q).
-        // Qwen3.6 Type A layers pack SSM conv data in the extra space — skip gated-Q for those.
-        int qgd = tq - eb;
-        bool hg = qgd > 0 && qgd == qd;
-        var Q = o.SliceCols(qkv, 0, qd, "Q"); var K = o.SliceCols(qkv, qd, kd, "K"); var V = o.SliceCols(qkv, qd + kd, kd, "V");
-        Tensor gq; if (hg) { var qg = o.SliceCols(qkv, qd + 2 * kd, qgd, "qg"); o.SiLU(qg); gq = o.Multiply(Q, qg, "gq"); if (b) o.DeferExternal(Q); else Q.Dispose(); if (b) o.DeferExternal(qg); else qg.Dispose(); } else { gq = Q; }
-        if (b) o.DeferExternal(qkv); else qkv.Dispose();
-
-        var _ts3 = GlobalProfiler.Start();
-        o.ApplyRoPEFull(gq, pos, t._numHeads, hd, t._ropeFreqBase);
-        o.ApplyRoPEFull(K, pos, t._numKVHeads, hd, t._ropeFreqBase);
-        Tensor ao; if (kvc != null)
-        {
-            kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li);
-            ao = o.MultiHeadAttention(gq, ck!, cv!, t._numHeads, pos, "ao");
-            o.DeferExternal(gq);
-        }
-        else
-        {
-            ao = o.MultiHeadAttention(gq, K, V, t._numHeads, pos, "ao");
-            o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V);
-        }
-        GlobalProfiler.End(_ts3, "LayerA.Attn");
-
-        var _ts4 = GlobalProfiler.Start();
-        Tensor ap = aoW.tensor.Shape[0] == ao.Shape[1]
-            ? o.MatMulWeights(ao, aoW.tensor, "ap")
-            : o.MatMulWeightsT(ao, aoW.tensor, "ap");
-        if (!aoW.isScratch) o.DeferExternal(aoW.tensor);
-        if (b) o.DeferExternal(ao); else ao.Dispose();
-        if (b) o.DeferExternal(xn); else xn.Dispose();
-        GlobalProfiler.End(_ts4, "LayerA.OutProj");
-
-        var x1 = o.Add(x, ap, "xa");
-        if (b) o.DeferExternal(ap); else ap.Dispose();
-
-        var _ts5 = GlobalProfiler.Start();
-        var x1n = o.Clone(x1, "pn"); o.LayerNorm(x1n, fn.tensor);
-        if (!fn.isScratch) o.DeferExternal(fn.tensor);
-        GlobalProfiler.End(_ts5, "LayerA.FfnNorm");
-
+        // GDN block (Gated Delta Net) — the sole attention mechanism for recurrent layers.
         var _ts6 = GlobalProfiler.Start();
-        Tensor x2;
-        if (ss != null && t.HasWeight($"blk.{g}.ssm_a"))
+        Tensor x1;
+        if (ss != null)
         {
             try
             {
-                x2 = SSM_Gpu(t, o, x1, x1n, g, ss, sl);
-                if (b) o.DeferExternal(x1); else x1.Dispose();
+                // xr=x (residual), xn=attn_norm(x) (GDN input)
+                x1 = SSM_Gpu(t, o, x, xn, g, ss, sl);
+                // x is consumed as residual inside SSM_Gpu.Add — dispose it now.
+                if (b) o.DeferExternal(x); else x.Dispose();
             }
             catch (Exception ex)
             {
@@ -106,8 +72,19 @@ public class QwenHybridFormat : ITransformerFormat
                 throw;
             }
         }
-        else { x2 = x1; }
-        GlobalProfiler.End(_ts6, "LayerA.SSM");
+        else
+        {
+            t._logger.LogWarning("[TypeA] No SSM state for recurrent layer {Layer} — identity pass-through", g);
+            x1 = x; // no-op; x disposed via x1 below
+        }
+        if (b) o.DeferExternal(xn); else xn.Dispose();
+        GlobalProfiler.End(_ts6, "LayerA.GDN");
+
+        // Post-GDN norm for FFN (post_attention_norm / ffn_norm)
+        var _ts5 = GlobalProfiler.Start();
+        var x1n = o.Clone(x1, "pn"); o.LayerNorm(x1n, fn.tensor);
+        if (!fn.isScratch) o.DeferExternal(fn.tensor);
+        GlobalProfiler.End(_ts5, "LayerA.FfnNorm");
 
         var _ts7 = GlobalProfiler.Start();
         var fo = o.FeedForward(x1n, wg.tensor, wu.tensor, wd.tensor, "ff");
@@ -117,10 +94,9 @@ public class QwenHybridFormat : ITransformerFormat
         GlobalProfiler.End(_ts7, "LayerA.FFN");
 
         if (b) o.DeferExternal(x1n); else x1n.Dispose();
-        var ou = o.Add(x2, fo, "lo");
-        if (b) o.DeferExternal(x2); else x2.Dispose();
+        var ou = o.Add(x1, fo, "lo");
+        if (b) o.DeferExternal(x1); else x1.Dispose();
         if (b) o.DeferExternal(fo); else fo.Dispose();
-        if (b) o.DeferExternal(x); else x.Dispose();
 
         var _ts8 = GlobalProfiler.Start();
         if (b) o.Flush();
@@ -130,12 +106,16 @@ public class QwenHybridFormat : ITransformerFormat
     }
 
     // ─── Type B ────────────────────────────────────────────────────────
-    static Tensor TypeB(TransformerBase t, Tensor x, int g, int li, uint pos, KVCache? kvc)
+    static Tensor TypeB(TransformerBase t, Tensor x, int g, int li, uint pos, KVCache? kvc, TensorNameMapper nm)
     {
         var o = t.Ops; int sl = x.Shape[0]; bool b = sl > 1;
         var anW = t.TempF32Named($"blk.{g}.attn_norm.weight"); var qW = t.TempF32Named($"blk.{g}.attn_q.weight"); var kW = t.TempF32Named($"blk.{g}.attn_k.weight"); var vW = t.TempF32Named($"blk.{g}.attn_v.weight");
         var oW = t.TempF32Named($"blk.{g}.attn_output.weight"); var pW = t.TempF32Named($"blk.{g}.post_attention_norm.weight");
-        var gW = t.TempF32Named($"blk.{g}.ffn_gate.weight"); var uW = t.TempF32Named($"blk.{g}.ffn_up.weight"); var dW = t.TempF32Named($"blk.{g}.ffn_down.weight");
+        // MoE fallback: prefer shared-expert weights (ffn_*_shexp) if present (Qwen3Next), else dense ffn_*.weight.
+        string gwName = nm.FfnGateShexp(g) ?? $"blk.{g}.ffn_gate.weight";
+        string uwName = nm.FfnUpShexp(g)   ?? $"blk.{g}.ffn_up.weight";
+        string dwName = nm.FfnDownShexp(g) ?? $"blk.{g}.ffn_down.weight";
+        var gW = t.TempF32Named(gwName); var uW = t.TempF32Named(uwName); var dW = t.TempF32Named(dwName);
         if (b) o.BeginBatch();
         var xn = o.Clone(x, "anB"); o.LayerNorm(xn, anW.tensor); if (!anW.isScratch) o.DeferExternal(anW.tensor);
         var rq = o.MatMulWeights(xn, qW.tensor, "rqB"); var K = o.MatMulWeights(xn, kW.tensor, "KB"); var V = o.MatMulWeights(xn, vW.tensor, "VB");
@@ -144,16 +124,35 @@ public class QwenHybridFormat : ITransformerFormat
         int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim;
         int qd = t.HasWeight($"blk.{g}.attn_output.weight")
             ? t._weightCache[$"blk.{g}.attn_output.weight"].Shape[0] : qtd;
-        // Gate detection: only if Q weight has doubled output (Q + gate halves).
-        // attn_gate.weight alone doesn't mean this layer has gated Q.
+        // Gate detection: Q weight has doubled output (Q + gate interleaved per head).
+        // attn_q.weight output layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+        // Gate is applied via sigmoid to the attention OUTPUT (not to Q before attention).
+        // Reference: qwen35 build_layer_attn — gate_sigmoid = sigmoid(gate); cur = attn_out * gate_sigmoid.
         bool ig = t.HasWeight($"blk.{g}.attn_gate.weight") && qtd == 2 * qd;
-        Tensor gq; int nqh;
-        if (ig || qtd > qd) { var qp = o.SliceCols(rq, 0, qd, "qpB"); var qg = o.SliceCols(rq, qd, qd, "qgB"); if (b) o.DeferExternal(rq); else rq.Dispose(); o.SiLU(qg); gq = o.Multiply(qp, qg, "gqB"); if (b) o.DeferExternal(qp); else qp.Dispose(); if (b) o.DeferExternal(qg); else qg.Dispose(); nqh = qd / hd; } else { gq = rq; nqh = qtd / hd; }
+        Tensor gq; Tensor? attnOutGate = null; int nqh;
+        if (ig || qtd > qd) {
+            // De-interleave: rearrange from [Q_h0(hd), gate_h0(hd), Q_h1, gate_h1, ...]
+            // to [Q_all(qd), gate_all(qd)] so SliceCols correctly splits them.
+            var rqDi = o.DeinterleaveQGate(rq, (uint)(qd / hd), (uint)hd, "rqDiB");
+            if (b) o.DeferExternal(rq); else rq.Dispose();
+            gq = o.SliceCols(rqDi, 0, qd, "qpB");          // pure Q — no gate applied before attention
+            attnOutGate = o.SliceCols(rqDi, qd, qd, "qgB"); // gate — sigmoid applied after attention
+            if (b) o.DeferExternal(rqDi); else rqDi.Dispose();
+            nqh = qd / hd;
+        } else { gq = rq; nqh = qtd / hd; }
         var qn = t.GetOrBuildTiledNorm($"blk.{g}.attn_q_norm.weight", hd, qd); var kn = t.GetOrBuildTiledNorm($"blk.{g}.attn_k_norm.weight", hd, kd);
         if (qn != null) o.LayerNorm(gq, qn); if (kn != null) o.LayerNorm(K, kn);
         o.ApplyRoPEFull(gq, pos, nqh, hd, t._ropeFreqBase); o.ApplyRoPEFull(K, pos, kd / hd, hd, t._ropeFreqBase);
         Tensor ao; if (kvc != null) { kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li); ao = o.MultiHeadAttention(gq, ck!, cv!, nqh, pos, "aoB"); o.DeferExternal(gq); }
         else { ao = o.MultiHeadAttention(gq, K, V, nqh, pos, "aoB"); o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V); }
+        // Apply sigmoid gate to attention output (qwen3next: sigmoid, not SiLU; after attn, not before).
+        if (attnOutGate != null) {
+            o.Sigmoid(attnOutGate);
+            var aoGated = o.Multiply(ao, attnOutGate, "aoGatedB");
+            if (b) o.DeferExternal(ao); else ao.Dispose();
+            if (b) o.DeferExternal(attnOutGate); else attnOutGate.Dispose();
+            ao = aoGated;
+        }
         Tensor ap = oW.tensor.Shape[0] == ao.Shape[1] ? o.MatMulWeights(ao, oW.tensor, "apB") : o.MatMulWeightsT(ao, oW.tensor, "apB");
         if (!oW.isScratch) o.DeferExternal(oW.tensor); if (b) o.DeferExternal(ao); else ao.Dispose();
         var x1 = o.Add(x, ap, "xaB"); if (b) o.DeferExternal(ap); else ap.Dispose();

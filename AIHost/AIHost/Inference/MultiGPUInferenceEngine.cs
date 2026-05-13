@@ -95,7 +95,18 @@ public class MultiGPUInferenceEngine : IInferenceEngine
             _cpuThrottle.Release();
             cpuThrottleAcquired = false;
 
-            RunGenerationLoop(promptTokens, config, id => onToken(_tokenizer.GetToken(id)), cancellationToken);
+            // Use a stateful UTF-8 Decoder so that multi-byte characters split across
+            // tokens (e.g. 3-byte CJK chars in BPE) are buffered and emitted whole.
+            var utf8Decoder = System.Text.Encoding.UTF8.GetDecoder();
+            var charBuf = new char[256];
+            RunGenerationLoop(promptTokens, config, id =>
+            {
+                var bytes = _tokenizer.GetTokenBytes(id);
+                if (bytes.Length == 0) return;
+                int charCount = utf8Decoder.GetChars(bytes, 0, bytes.Length, charBuf, 0);
+                if (charCount > 0)
+                    onToken(new string(charBuf, 0, charCount));
+            }, cancellationToken);
         }
         finally
         {

@@ -49,8 +49,8 @@ void main() {
             scratch.data[CONV_DIM + VALUE_DIM + n] = 1.0 / (1.0 + exp(-betaSum));
             float alphaSum = 0.0;
             for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[base + k] * wAlpha.data[k + n * DMODEL];
-            float alpha = log(1.0 + exp(alphaSum + dtBias.data[n % N_K_HEADS]));
-            scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n] = alpha * ssA.data[n % N_K_HEADS];
+            float alpha = log(1.0 + exp(alphaSum + dtBias.data[n]));
+            scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n] = alpha * ssA.data[n];
         }
     }
     if (qkvIdx < CONV_DIM) {

@@ -142,8 +142,19 @@ public class InferenceEngine : IInferenceEngine
             _cpuThrottle.Release();
             cpuThrottleAcquired = false;
 
+            // Use a stateful UTF-8 Decoder so that multi-byte characters split across
+            // tokens (e.g. 3-byte CJK chars in BPE) are buffered and emitted whole.
+            var utf8Decoder = System.Text.Encoding.UTF8.GetDecoder();
+            var charBuf = new char[256];
             RunGenerationLoop(tokens, config,
-                onToken: tokenId => onTokenGenerated(_tokenizer.GetToken(tokenId)),
+                onToken: tokenId =>
+                {
+                    var bytes = _tokenizer.GetTokenBytes(tokenId);
+                    if (bytes.Length == 0) return;
+                    int charCount = utf8Decoder.GetChars(bytes, 0, bytes.Length, charBuf, 0);
+                    if (charCount > 0)
+                        onTokenGenerated(new string(charBuf, 0, charCount));
+                },
                 cancellationToken);
         }
         finally

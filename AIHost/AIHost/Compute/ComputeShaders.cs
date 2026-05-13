@@ -28,6 +28,7 @@ public static class ComputeShaders
     public static readonly string MatMulWeightsTF32 = TryLoadOrInline("matmul_weights_t", _inlineMatMulWeightsT);
     public static readonly string Softmax = TryLoadOrInline("softmax", _inlineSoftmax);
     public static readonly string SiLU = TryLoadOrInline("silu", _inlineSiLU);
+    public static readonly string Sigmoid = TryLoadOrInline("sigmoid", _inlineSigmoid);
     public static readonly string ElementWiseAdd = TryLoadOrInline("add", _inlineAdd);
     public static readonly string ConcatAxis1 = TryLoadOrInline("concat_axis1", _inlineConcat);
     public static readonly string ConcatAxis0 = TryLoadOrInline("concat_axis0", _inlineConcatAxis0);
@@ -71,6 +72,12 @@ public static class ComputeShaders
     // Part 2: recurrence — reads scratch, L2 norm, Delta Net, Gated norm → output
     // Dispatch: 48 workgroups × 128 threads
     public static readonly string SsmGdnRecur = TryLoadOrInline("ssm_gdn_recur", _inlineSsmGdnRecur);
+
+    // De-interleave Q+gate from attn_q.weight output for TypeB (Qwen3Next/qwen35) attention layers.
+    // Input : [sl, n_head * 2 * head_dim] — [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+    // Output: [sl, n_head * 2 * head_dim] — [Q_all(n_head*hd), gate_all(n_head*hd)]
+    // Dispatch: ceil(sl * n_head * 2 * head_dim / 256) workgroups × 256 threads
+    public static readonly string DeinterleaveQGate = TryLoadOrInline("deinterleave_q_gate", _inlineDeinterleaveQGate);
 
     private static string TryLoadOrInline(string shaderName, string inlineSource)
     {
@@ -288,6 +295,18 @@ void main() {
     float x = buf.data[gid];
     float sigmoid = 1.0 / (1.0 + exp(-x));
     buf.data[gid] = x * sigmoid;
+}
+";
+
+    private const string _inlineSigmoid = @"
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
+layout(set = 0, binding = 1) readonly buffer Params { uint size; } params;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.size) return;
+    buf.data[gid] = 1.0 / (1.0 + exp(-buf.data[gid]));
 }
 ";
 
@@ -754,23 +773,25 @@ layout(set = 0, binding = 6) readonly  buffer WAlphaBuf   { float data[]; } wAlp
 layout(set = 0, binding = 7) readonly  buffer DtBiasBuf   { float data[]; } dtBias;
 layout(set = 0, binding = 8) readonly  buffer SsABuf      { float data[]; } ssA;
 layout(set = 0, binding = 9)          buffer ScratchBuf   { float data[]; } scratch;
+layout(set = 0, binding = 10) readonly buffer RowIdxBuf   { uint rowIdx; } rowIdxBuf;
 float silu(float x) { return x / (1.0 + exp(-x)); }
 void main() {
     uint n = gl_WorkGroupID.x;
     uint d = gl_LocalInvocationID.x;
     uint qkvIdx = n * HEAD_V_DIM + d;
+    uint rowOff = rowIdxBuf.rowIdx * DMODEL;
     float zVal = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) zVal += xNorm.data[k] * wZ.data[k + qkvIdx * DMODEL];
+    for (uint k = 0u; k < DMODEL; k++) zVal += xNorm.data[rowOff + k] * wZ.data[k + qkvIdx * DMODEL];
     float betaSum = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) betaSum += xNorm.data[k] * wBeta.data[k + n * DMODEL];
+    for (uint k = 0u; k < DMODEL; k++) betaSum += xNorm.data[rowOff + k] * wBeta.data[k + n * DMODEL];
     float beta = 1.0 / (1.0 + exp(-betaSum));
     float alphaSum = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[k] * wAlpha.data[k + n * DMODEL];
-    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n % N_K_HEADS]));
-    float gate = alpha * ssA.data[n % N_K_HEADS];
+    for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[rowOff + k] * wAlpha.data[k + n * DMODEL];
+    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n]));
+    float gate = alpha * ssA.data[n];
     float qkvVal = 0.0;
     if (qkvIdx < CONV_DIM) {
-        for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[k] * wQKV.data[k + qkvIdx * DMODEL];
+        for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[rowOff + k] * wQKV.data[k + qkvIdx * DMODEL];
     }
     float convOut = 0.0;
     if (qkvIdx < CONV_DIM) {
@@ -814,7 +835,7 @@ float silu(float x) { return x / (1.0 + exp(-x)); }
 void main() {
     uint n = gl_WorkGroupID.x;
     uint d = gl_LocalInvocationID.x;
-    uint h = n % N_K_HEADS;
+    uint h = n / (N_V_HEADS / N_K_HEADS);   // repeat-interleave: v_head n -> k_head n/3
     uint qkvIdx = n * HEAD_V_DIM + d;
     float zVal = scratch.data[CONV_DIM + qkvIdx];
     float beta = scratch.data[CONV_DIM + VALUE_DIM + n];
@@ -864,6 +885,28 @@ void main() {
     float rmsInv = 1.0 / sqrt(sumSq / float(HEAD_V_DIM) + EPS);
     float yVal = oVal * rmsInv * ssmNorm.data[d] * zSilu;
     outBuf.data[qkvIdx] = yVal;
+}
+";
+
+    private const string _inlineDeinterleaveQGate = @"
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly  buffer InBuf     { float data[]; } inBuf;
+layout(set = 0, binding = 1) writeonly buffer OutBuf    { float data[]; } outBuf;
+layout(set = 0, binding = 2) readonly  buffer ParamsBuf { uint sl; uint n_head; uint head_dim; } params;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint full_stride = params.n_head * params.head_dim * 2u;
+    if (idx >= params.sl * full_stride) return;
+    uint t        = idx / full_stride;
+    uint tok_local = idx % full_stride;
+    uint half_stride = params.n_head * params.head_dim;
+    uint part  = tok_local / half_stride;
+    uint rem   = tok_local % half_stride;
+    uint h     = rem / params.head_dim;
+    uint d     = rem % params.head_dim;
+    uint in_local = h * (2u * params.head_dim) + part * params.head_dim + d;
+    outBuf.data[idx] = inBuf.data[t * full_stride + in_local];
 }
 ";
 }

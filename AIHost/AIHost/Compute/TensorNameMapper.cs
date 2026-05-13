@@ -131,6 +131,11 @@ public class TensorNameMapper
     public string FfnUp(int layer)           => TryFfn(layer, "up");
     public string FfnDown(int layer)         => TryFfn(layer, "down");
 
+    /// <summary>Shared expert FFN weights (Qwen3Next MoE). Returns null if not present.</summary>
+    public string? FfnGateShexp(int layer)   => TryOpt($"blk.{layer}.ffn_gate_shexp.weight");
+    public string? FfnUpShexp(int layer)     => TryOpt($"blk.{layer}.ffn_up_shexp.weight");
+    public string? FfnDownShexp(int layer)   => TryOpt($"blk.{layer}.ffn_down_shexp.weight");
+
     // ── Global weight names ───────────────────────────────────────────────────
 
     public string TokenEmbd         => Try("token_embd.weight", "tok_embeddings.weight");

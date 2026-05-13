@@ -15,6 +15,8 @@ public class BPETokenizer
     // GPT-2 style bytes_to_unicode mapping for BPE/tiktoken tokenizers
     // Maps each byte (0-255) to a unicode character that exists as a token in the vocabulary
     private readonly Dictionary<byte, int> _byteToTokenId;
+    // Inverse mapping: GPT-2 bytes_to_unicode char → original byte (for decoding)
+    private readonly Dictionary<char, byte> _charToByte;
 
     public int VocabSize => _tokens.Length;
     public int BosToken => _bosToken;
@@ -37,6 +39,43 @@ public class BPETokenizer
 
         // Build byte -> token id mapping for BPE/tiktoken (GPT-2 style)
         _byteToTokenId = BuildByteToTokenIdMapping();
+        // Build inverse: GPT-2 unicode char -> byte (for decoding token text back to UTF-8)
+        _charToByte = BuildCharToByteMapping();
+    }
+
+    /// <summary>
+    /// Builds the inverse of the GPT-2 bytes_to_unicode mapping: unicode char → original byte.
+    /// Used to decode BPE token strings back to raw bytes which are then UTF-8 decoded.
+    /// </summary>
+    private static Dictionary<char, byte> BuildCharToByteMapping()
+    {
+        var byteList = new List<int>();
+        var charList = new List<int>();
+        for (int i = 33; i <= 126; i++) { byteList.Add(i); charList.Add(i); }
+        for (int i = 161; i <= 172; i++) { byteList.Add(i); charList.Add(i); }
+        for (int i = 174; i <= 255; i++) { byteList.Add(i); charList.Add(i); }
+        int n = 0;
+        for (int b = 0; b < 256; b++)
+        {
+            if (!byteList.Contains(b))
+            { byteList.Add(b); charList.Add(256 + n); n++; }
+        }
+        var mapping = new Dictionary<char, byte>(256);
+        for (int i = 0; i < 256; i++)
+            mapping[(char)charList[i]] = (byte)byteList[i];
+        return mapping;
+    }
+
+    /// <summary>
+    /// Converts a BPE token string (GPT-2 bytes_to_unicode encoded) to raw bytes.
+    /// Each character in the token maps to exactly one byte via the inverse mapping.
+    /// </summary>
+    private byte[] TokenToBytes(string tokenStr)
+    {
+        var bytes = new byte[tokenStr.Length];
+        for (int i = 0; i < tokenStr.Length; i++)
+            bytes[i] = _charToByte.TryGetValue(tokenStr[i], out var b) ? b : (byte)tokenStr[i];
+        return bytes;
     }
 
     /// <summary>
@@ -308,40 +347,56 @@ public class BPETokenizer
     /// </summary>
     public string Decode(int[] tokenIds)
     {
-        var result = new System.Text.StringBuilder();
-
-        foreach (int tokenId in tokenIds)
-        {
-            if (tokenId >= 0 && tokenId < _tokens.Length)
-            {
-                if (tokenId == _bosToken || tokenId == _eosToken)
-                    continue;
-
-                if (_isSentencePiece)
-                {
-                    // SentencePiece: ▁ marks word boundary (space before word)
-                    result.Append(_tokens[tokenId].Replace('▁', ' '));
-                }
-                else
-                {
-                    // BPE/tiktoken: tokens are raw text (may contain spaces)
-                    result.Append(_tokens[tokenId]);
-                }
-            }
-        }
-
         if (_isSentencePiece)
         {
-            // Leading space is an artifact of the ▁ prepended during encoding
+            var result = new System.Text.StringBuilder();
+            foreach (int tokenId in tokenIds)
+            {
+                if (tokenId >= 0 && tokenId < _tokens.Length)
+                {
+                    if (tokenId == _bosToken || tokenId == _eosToken) continue;
+                    result.Append(_tokens[tokenId].Replace('▁', ' '));
+                }
+            }
             return result.Length > 0 && result[0] == ' '
                 ? result.ToString(1, result.Length - 1)
                 : result.ToString();
         }
-        return result.ToString();
+        else
+        {
+            // BPE/tiktoken: each token is GPT-2 bytes_to_unicode encoded.
+            // Accumulate all raw bytes across tokens, then UTF-8 decode the whole buffer.
+            var allBytes = new System.Collections.Generic.List<byte>();
+            foreach (int tokenId in tokenIds)
+            {
+                if (tokenId >= 0 && tokenId < _tokens.Length)
+                {
+                    if (tokenId == _bosToken || tokenId == _eosToken) continue;
+                    allBytes.AddRange(TokenToBytes(_tokens[tokenId]));
+                }
+            }
+            return System.Text.Encoding.UTF8.GetString(allBytes.ToArray());
+        }
     }
 
     /// <summary>
-    /// Get token text by ID
+    /// Returns the raw bytes represented by this token (for BPE/tiktoken via inverse
+    /// bytes_to_unicode mapping, for SentencePiece via UTF-8 encoding of the ▁-replaced text).
+    /// Used by streaming engines to buffer partial UTF-8 sequences safely.
+    /// </summary>
+    public byte[] GetTokenBytes(int tokenId)
+    {
+        if (tokenId < 0 || tokenId >= _tokens.Length) return [];
+        if (tokenId == _bosToken || tokenId == _eosToken) return [];
+        if (_isSentencePiece)
+            return System.Text.Encoding.UTF8.GetBytes(_tokens[tokenId].Replace('▁', ' '));
+        return TokenToBytes(_tokens[tokenId]);
+    }
+
+    /// <summary>
+    /// Get token text by ID. For BPE/tiktoken, decodes bytes_to_unicode back to UTF-8.
+    /// Note: streaming may emit incomplete UTF-8 sequences for split multi-byte characters;
+    /// use Decode() on the full token sequence for guaranteed correctness.
     /// </summary>
     public string GetToken(int tokenId)
     {
@@ -349,7 +404,8 @@ public class BPETokenizer
         {
             if (_isSentencePiece)
                 return _tokens[tokenId].Replace('▁', ' ');
-            return _tokens[tokenId];
+            // BPE: decode via inverse bytes_to_unicode, then interpret as UTF-8
+            return System.Text.Encoding.UTF8.GetString(TokenToBytes(_tokens[tokenId]));
         }
         return "<unk>";
     }
