@@ -82,6 +82,6 @@ void main() {
     float sumSq = sharedMem[0];
     barrier();
     float rmsInv = 1.0 / sqrt(sumSq / float(HEAD_V_DIM) + EPS);
-    float yVal = oVal * rmsInv * ssmNorm.data[d] * zSilu;
+    float yVal = oVal * rmsInv * ssmNorm.data[qkvIdx] * zSilu;
     outBuf.data[qkvIdx] = yVal;
 }

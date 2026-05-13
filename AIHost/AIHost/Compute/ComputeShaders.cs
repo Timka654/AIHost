@@ -867,16 +867,16 @@ void main() {
     barrier();
     sharedMem[d] = kNorm; barrier();
     float sk = 0.0;
-    uint rowBaseD = stateBase + d * HEAD_V_DIM;
-    for (uint j = 0u; j < HEAD_V_DIM; j++) sk += ssmState.data[rowBaseD + j] * sharedMem[j];
+    for (uint i = 0u; i < HEAD_V_DIM; i++) sk += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
     barrier();
     float dVec = (vConvVal - sk) * beta;
     sharedMem[d] = dVec; barrier();
+    uint rowBaseD = stateBase + d * HEAD_V_DIM;
     for (uint j = 0u; j < HEAD_V_DIM; j++) ssmState.data[rowBaseD + j] += kNorm * sharedMem[j];
     barrier();
     sharedMem[d] = qNorm; barrier();
     float oVal = 0.0;
-    for (uint j = 0u; j < HEAD_V_DIM; j++) oVal += ssmState.data[rowBaseD + j] * sharedMem[j];
+    for (uint i = 0u; i < HEAD_V_DIM; i++) oVal += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
     oVal *= SCALE;
     float zSilu = silu(zVal);
     sharedMem[d] = oVal * oVal;
@@ -884,7 +884,7 @@ void main() {
     for (uint s = 64u; s > 0u; s >>= 1u) { if (d < s) sharedMem[d] += sharedMem[d + s]; barrier(); }
     float sumSq = sharedMem[0]; barrier();
     float rmsInv = 1.0 / sqrt(sumSq / float(HEAD_V_DIM) + EPS);
-    float yVal = oVal * rmsInv * ssmNorm.data[d] * zSilu;
+    float yVal = oVal * rmsInv * ssmNorm.data[qkvIdx] * zSilu;
     outBuf.data[qkvIdx] = yVal;
 }
 ";
