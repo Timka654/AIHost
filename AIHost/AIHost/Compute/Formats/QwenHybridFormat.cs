@@ -130,40 +130,39 @@ public class QwenHybridFormat : ITransformerFormat
         if (!qW.isScratch) o.DeferExternal(qW.tensor); if (!kW.isScratch) o.DeferExternal(kW.tensor); if (!vW.isScratch) o.DeferExternal(vW.tensor);
         if (b) o.DeferExternal(xn); else xn.Dispose();
         int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim;
-        int qd = t.HasWeight($"blk.{g}.attn_output.weight")
-            ? t._weightCache[$"blk.{g}.attn_output.weight"].Shape[0] : qtd;
+        // Per-head QK-norm: norm weight is [head_k_dim=128] (ssm_d_state), NOT t._headDim (256).
+        // Qwen3.5 attn_q.weight output is 48×(128Q+128gate)=12288;  attn_output.weight is [6144,5120].
+        // FIX: Determine real Q/K head dimension from norm weight size; use it for gate detection,
+        // deinterleave, RoPE, and MHA.  t._headDim is 256 (attention.key_length) but actual
+        // per-head dimension after QK-norm is 128.
+        int qknDim = t.HasWeight($"blk.{g}.attn_q_norm.weight")
+            ? t._weightCache[$"blk.{g}.attn_q_norm.weight"].Shape[0] : hd;
+        int kknDim = t.HasWeight($"blk.{g}.attn_k_norm.weight")
+            ? t._weightCache[$"blk.{g}.attn_k_norm.weight"].Shape[0] : hd;
+        int totalHeads = qtd / (qknDim * 2);  // 12288 / 256 = 48 heads, each head 256 = 128(Q)+128(gate)
+        int qd = totalHeads * qknDim;           // 48 * 128 = 6144 = pure Q part
         // Only log during decode (sl==1): in non-batch mode every MaybeFlush() does a full GPU sync,
         // so ReadRange after each op sees correct values. In prefill batch mode the command buffer
         // is not yet submitted when Row0 is called — reads would return stale GPU memory.
         bool dbg = sl == 1 && QwenDbgTrace.Once("TypeB", g);
         if (dbg) QwenDbgTrace.Row0($"rq_raw_g{g}", rq, 16); // interleaved layout visible here
-        // Gate detection: Q weight has doubled output (Q + gate interleaved per head).
-        // attn_q.weight output layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
-        // Gate is applied via sigmoid to the attention OUTPUT (not to Q before attention).
-        // Reference: qwen35 build_layer_attn — gate_sigmoid = sigmoid(gate); cur = attn_out * gate_sigmoid.
-        // FIX: Qwen3.5 does NOT have per-head Q-gate.  The fallback "qtd > qd" was
-        // always true because attn_q.weight output (n_heads*head_dim=12288) ≠
-        // attn_output.weight Shape[0] (d_model=5120).  Only Qwen3Next has a separate
-        // attn_gate.weight, and its Q output is exactly 2× the attention output dim.
+        // Gate detection: Qwen3.5 Q weight has 2× output per head — Q(128) + gate(128) interleaved.
+        // attn_q.weight output layout: [Q_h0(128), gate_h0(128), Q_h1(128), gate_h1(128), ...]
+        // Qwen3Next: detachable gate via attn_gate.weight (qtd == 2*qd where qd = output_weight.Shape[0]).
         bool ig = t.HasWeight($"blk.{g}.attn_gate.weight") && qtd == 2 * qd;
+        if (!ig && qtd > qd) ig = true; // Qwen3.5: fused gate without separate weight
         Tensor gq; Tensor? attnOutGate = null; int nqh;
         if (ig) {
-            // De-interleave: rearrange from [Q_h0(hd), gate_h0(hd), Q_h1, gate_h1, ...]
-            // to [Q_all(qd), gate_all(qd)] so SliceCols correctly splits them.
-            var rqDi = o.DeinterleaveQGate(rq, (uint)(qd / hd), (uint)hd, "rqDiB");
+            // De-interleave using real Q head dim (qknDim=128): 48 heads × (128 Q + 128 gate) stride
+            var rqDi = o.DeinterleaveQGate(rq, (uint)totalHeads, (uint)qknDim, "rqDiB");
             if (dbg) QwenDbgTrace.Row0($"rqDi_g{g}", rqDi, 16); // should be de-interleaved
             if (b) o.DeferExternal(rq); else rq.Dispose();
-            gq = o.SliceCols(rqDi, 0, qd, "qpB");          // pure Q — no gate applied before attention
-            attnOutGate = o.SliceCols(rqDi, qd, qd, "qgB"); // gate — sigmoid applied after attention
+            gq = o.SliceCols(rqDi, 0, qd, "qpB");          // pure Q: 48×128 = 6144
+            attnOutGate = o.SliceCols(rqDi, qd, qd, "qgB"); // gate: 48×128 = 6144
             if (dbg) { QwenDbgTrace.Row0($"Q_g{g}", gq, 8); QwenDbgTrace.Row0($"gate_g{g}", attnOutGate, 8); }
             if (b) o.DeferExternal(rqDi); else rqDi.Dispose();
-            nqh = qd / hd;
+            nqh = totalHeads;
         } else { gq = rq; nqh = qtd / hd; }
-        // Per-head QK-norm: norm weight is [head_k_dim=128] (ssm_d_state), NOT head_dim=256.
-        int qknDim = t.HasWeight($"blk.{g}.attn_q_norm.weight")
-            ? t._weightCache[$"blk.{g}.attn_q_norm.weight"].Shape[0] : hd;
-        int kknDim = t.HasWeight($"blk.{g}.attn_k_norm.weight")
-            ? t._weightCache[$"blk.{g}.attn_k_norm.weight"].Shape[0] : hd;
         if (t.HasWeight($"blk.{g}.attn_q_norm.weight"))
         {
             var (qnW, qnS) = t.TempF32Named($"blk.{g}.attn_q_norm.weight");
