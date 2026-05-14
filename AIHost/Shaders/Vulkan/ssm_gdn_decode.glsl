@@ -26,7 +26,7 @@ void main() {
     float qkvVal = 0.0;
     float convOut = 0.0;
     if (qkvIdx < smp.CD) {
-        for (uint k = 0u; k < DM; k++) qkvVal += xNorm.data[base + k] * wQKV.data[qkvIdx + k * smp.CD];
+        for (uint k = 0u; k < DM; k++) qkvVal += xNorm.data[base + k] * wQKV.data[k + qkvIdx * DM];
         // convW GGUF shape [CONV_KERNEL=4, CD], column-major: data[slot + ch * CONV_KERNEL]
         uint cwOff = qkvIdx * CONV_KERNEL;
         convOut += convState.data[0u * smp.CD + qkvIdx] * convW.data[cwOff + 0u];
