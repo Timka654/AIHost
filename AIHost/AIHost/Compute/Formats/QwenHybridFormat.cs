@@ -16,15 +16,18 @@ public class QwenHybridFormat : ITransformerFormat
         var _ts = GlobalProfiler.Start();
         int g = t.GlobalLayer(li); var nm = t._nameMapper!;
         // Qwen3.5: attn_qkv.weight exists on ALL 64 layers (SSM + attention).
-        // Discriminate: SSM layers have ssm_conv1d.weight; attention layers have attn_output.weight.
-        bool hasQkv = t.HasWeight($"blk.{g}.attn_qkv.weight");
+        // Discriminate: SSM layers have ssm_conv1d.weight; attention layers DO NOT.
+        bool isSsm  = t.HasWeight($"blk.{g}.ssm_conv1d.weight");
         bool hasQ   = t.HasWeight($"blk.{g}.attn_q.weight");
-        bool isSsm  = t.HasWeight($"blk.{g}.ssm_conv1d.weight"); // only SSM layers
+        bool hasQkv = t.HasWeight($"blk.{g}.attn_qkv.weight");
+        if (g <= 7 && QwenDbgTrace.Once("layer_type", g))
+            _logger.LogWarning("[ROUTE] L{L} isSsm={IsSsm} hasQ={HasQ} hasQkv={HasQkv} → {Route}",
+                g, isSsm, hasQ, hasQkv, isSsm ? "TypeA" : "TypeB");
         Tensor result;
-        if (!hasQkv && !hasQ) result = Fallback(t, x, g, nm);
-        else if (hasQ)        result = TypeB(t, x, g, li, pos, kvc, nm);
-        else if (isSsm)       result = TypeA(t, x, g, li, pos, kvc, nm, ss);
-        else                  result = TypeB(t, x, g, li, pos, kvc, nm); // attention layer w/ attn_qkv
+        if (isSsm)
+            result = TypeA(t, x, g, li, pos, kvc, nm, ss);
+        else
+            result = TypeB(t, x, g, li, pos, kvc, nm);
         GlobalProfiler.End(_ts, "Qwen.ApplyLayer");
         return result;
     }
@@ -138,9 +141,13 @@ public class QwenHybridFormat : ITransformerFormat
         // attn_q.weight output layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
         // Gate is applied via sigmoid to the attention OUTPUT (not to Q before attention).
         // Reference: qwen35 build_layer_attn — gate_sigmoid = sigmoid(gate); cur = attn_out * gate_sigmoid.
+        // FIX: Qwen3.5 does NOT have per-head Q-gate.  The fallback "qtd > qd" was
+        // always true because attn_q.weight output (n_heads*head_dim=12288) ≠
+        // attn_output.weight Shape[0] (d_model=5120).  Only Qwen3Next has a separate
+        // attn_gate.weight, and its Q output is exactly 2× the attention output dim.
         bool ig = t.HasWeight($"blk.{g}.attn_gate.weight") && qtd == 2 * qd;
         Tensor gq; Tensor? attnOutGate = null; int nqh;
-        if (ig || qtd > qd) {
+        if (ig) {
             // De-interleave: rearrange from [Q_h0(hd), gate_h0(hd), Q_h1, gate_h1, ...]
             // to [Q_all(qd), gate_all(qd)] so SliceCols correctly splits them.
             var rqDi = o.DeinterleaveQGate(rq, (uint)(qd / hd), (uint)hd, "rqDiB");
@@ -152,22 +159,26 @@ public class QwenHybridFormat : ITransformerFormat
             if (b) o.DeferExternal(rqDi); else rqDi.Dispose();
             nqh = qd / hd;
         } else { gq = rq; nqh = qtd / hd; }
-        // Per-head QK-norm: each [hd]-dim head is normalized independently.
-        // Use LayerNormVirtual with rows=seqLen*numHeads, cols=hd so each head is one "row".
-        // The original [hd] weight (NOT tiled) is used directly.
+        // Per-head QK-norm: norm weight is [head_k_dim=128] (ssm_d_state), NOT head_dim=256.
+        int qknDim = t.HasWeight($"blk.{g}.attn_q_norm.weight")
+            ? t._weightCache[$"blk.{g}.attn_q_norm.weight"].Shape[0] : hd;
+        int kknDim = t.HasWeight($"blk.{g}.attn_k_norm.weight")
+            ? t._weightCache[$"blk.{g}.attn_k_norm.weight"].Shape[0] : hd;
         if (t.HasWeight($"blk.{g}.attn_q_norm.weight"))
         {
             var (qnW, qnS) = t.TempF32Named($"blk.{g}.attn_q_norm.weight");
-            o.LayerNormVirtual(gq, qnW, sl * nqh, hd);
+            o.LayerNormVirtual(gq, qnW, sl * (gq.Shape[1] / qknDim), qknDim);
             if (!qnS) o.DeferExternal(qnW);
         }
         if (t.HasWeight($"blk.{g}.attn_k_norm.weight"))
         {
             var (knW, knS) = t.TempF32Named($"blk.{g}.attn_k_norm.weight");
-            o.LayerNormVirtual(K, knW, sl * (kd / hd), hd);
+            o.LayerNormVirtual(K, knW, sl * (K.Shape[1] / kknDim), kknDim);
             if (!knS) o.DeferExternal(knW);
         }
-        o.ApplyRoPEFull(gq, pos, nqh, hd, t._ropeFreqBase, t._ropeDimCount); o.ApplyRoPEFull(K, pos, kd / hd, hd, t._ropeFreqBase, t._ropeDimCount);
+        // RoPE: use actual head dim from norm weight (qknDim=128), not t._headDim (256 generic).
+        o.ApplyRoPEFull(gq, pos, gq.Shape[1] / qknDim, qknDim, t._ropeFreqBase, t._ropeDimCount);
+        o.ApplyRoPEFull(K, pos, K.Shape[1] / kknDim, kknDim, t._ropeFreqBase, t._ropeDimCount);
         // Diagnostic: log Q/K head-0 magnitude after RoPE for first 4 attention layers.
         // ||Q||² >> 0 = healthy; ≈ 0 or NaN = corrupted by RoPE/norm.
         if (sl == 1 && QwenDbgTrace.Once("RoPE_QK_norm", g))
