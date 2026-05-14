@@ -197,7 +197,8 @@ public class QwenHybridFormat : ITransformerFormat
     // ─── SSM recurrence on GPU (sub-batch + ArrayPool for CPU padding) ─
     static Tensor SSM_Gpu(TransformerBase t, ComputeOps o, Tensor xr, Tensor xn, int g, SSMState ss, int sl)
     {
-        const int HVD = 128, NVH = 48, NKH = 16, KD = NKH * HVD, VD = NVH * HVD, CD = 2 * KD + VD;
+        int HVD = t._ssmHVD, NVH = t._ssmVH, NKH = t._ssmKH;
+        int KD = t._ssmKD, VD = t._ssmVD, CD = t._ssmCD;
         const int SUB_BATCH = 8; // tokens per GPU submit
         int dm = xn.Shape[1];
         bool b = sl > 1;
@@ -302,9 +303,14 @@ public class QwenHybridFormat : ITransformerFormat
                     normF32,
                     tokenOut,
                     (uint)tokenIdx,
-                    (uint)t._numHeads,
-                    (uint)t._numKVHeads,
-                    (uint)t._headDim);
+                    (uint)t._dModel,
+                    (uint)t._ssmHVD,
+                    (uint)t._ssmVH,
+                    (uint)t._ssmKH,
+                    (uint)t._ssmKD,
+                    (uint)t._ssmVD,
+                    (uint)t._ssmCD,
+                    (uint)g);
 
                 // Log during decode only (sl==1): non-batch mode flushes after each op → correct read.
                 // In decode, AllocTempTensor returns null (no arena) → fallback Tensor.Create → readable.

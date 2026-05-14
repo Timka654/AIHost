@@ -36,12 +36,35 @@ public sealed class QwenDbgTrace
             var data = t.ReadRow(0);
             int take = Math.Min(n, data.Length);
             var vals = string.Join(", ", data.Take(take).Select(v => v.ToString("G5")));
-            _log.LogWarning("[QDBG] {Tag} shape=[{R}×{C}] row0[0..{N}]: [{Vals}]",
+            _log.LogWarning("[QDBG] {Tag} shape=[{R}x{C}] row0[0..{N}]: [{Vals}]",
                 tag, t.Shape[0], t.Shape[1], take, vals);
         }
         catch (Exception ex)
         {
             _log.LogWarning("[QDBG] {Tag} read failed: {Err}", tag, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Reads <paramref name="n"/> float elements from a 1-D tensor starting at <paramref name="offset"/>.
+    /// Forces GPU→CPU sync. Use for scratch buffers and flat state tensors.
+    /// </summary>
+    public static void Slice(string tag, Tensor t, int offset, int n)
+    {
+        try
+        {
+            var raw = t.Buffer.Read<float>();
+            int end = Math.Min(offset + n, raw.Length);
+            int take = end - offset;
+            if (take <= 0) { _log.LogWarning("[QDBG] {Tag} offset={Off} OOB len={Len}", tag, offset, raw.Length); return; }
+            var vals = new float[take];
+            Array.Copy(raw, offset, vals, 0, take);
+            _log.LogWarning("[QDBG] {Tag} off={Off} n={N}: [{Vals}]",
+                tag, offset, take, string.Join(", ", vals.Select(v => v.ToString("G5"))));
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning("[QDBG] {Tag} Slice failed: {Err}", tag, ex.Message);
         }
     }
 

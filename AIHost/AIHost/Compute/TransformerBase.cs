@@ -20,6 +20,16 @@ public class TransformerBase : IDisposable
     protected internal readonly int _numHeads;
     protected internal readonly int _numKVHeads;
     protected internal readonly int _headDim;
+    // SSM / Gated Delta Net parameters (read from GGUF metadata).
+    // HVD = ssm_d_state (size of each SSM head, typically 128).
+    // NVH = ssm_dt_rank (number of V/SSM heads, typically 48).
+    // NKH = ssm_n_group (number of K heads, typically 16).
+    protected internal readonly int _ssmHVD;  // head_v_dim = ssm_d_state
+    protected internal readonly int _ssmVH;   // n_v_heads = ssm_dt_rank
+    protected internal readonly int _ssmKH;   // n_k_heads = ssm_n_group
+    protected internal readonly int _ssmKD;   // key_dim = NKH * HVD
+    protected internal readonly int _ssmVD;   // value_dim = NVH * HVD
+    protected internal readonly int _ssmCD;   // conv_dim = ssm_d_inner + 2 * key_dim
     protected internal readonly float _ropeFreqBase;
     /// <summary>
     /// Number of head dimensions to apply RoPE to (from rope.dimension_count).
@@ -95,8 +105,22 @@ public class TransformerBase : IDisposable
         _numKVHeads = kvHeads;
         _localLayerCount = _numLayers;
 
+        // ── SSM / Gated Delta Net parameters ─────────────────────────────
+        int ssmInner  = ArchInt("ssm.inner_size", 6144);
+        int ssmState  = ArchInt("ssm.state_size", 128);
+        int ssmGroups = ArchInt("ssm.group_count", 16);
+        int ssmDtRank = ArchInt("ssm.time_step_rank", 48);
+        _ssmVH  = ssmDtRank;                     // n_v_heads
+        _ssmKH  = ssmGroups;                     // n_k_heads
+        _ssmHVD = ssmState;                      // head_v_dim = ssm.state_size
+        _ssmKD  = ssmState * ssmGroups;           // key_dim = HVD*KH
+        _ssmVD  = ssmDtRank * _ssmHVD;            // value_dim = VH*HVD
+        _ssmCD  = ssmInner + 2 * _ssmKD;          // conv_dim
+
         _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} head_dim={HeadDim} ctx={Ctx} rope={Rope} rope_dim={RopeDim}",
             _numLayers, _dModel, _numHeads, kvHeads, _headDim, ContextLength, _ropeFreqBase, _ropeDimCount);
+        _logger.LogInformation("Transformer SSM: v_heads={VH} k_heads={KH} hvd={HVD} key_dim={KD} value_dim={VD} conv_dim={CD}",
+            _ssmVH, _ssmKH, _ssmHVD, _ssmKD, _ssmVD, _ssmCD);
     }
 
     // ── Weight loading ────────────────────────────────────────────────────────

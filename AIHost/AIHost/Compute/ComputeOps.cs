@@ -1927,10 +1927,19 @@ public class ComputeOps : IDisposable
         Tensor ssmNorm,
         Tensor output,
         uint rowIndex = 0u,
-        uint numHeads = 24,
-        uint numKvHeads = 4,
-        uint headDim = 256)
+        uint ssmDModel = 5120, // d_model
+        uint ssmHVD = 128,     // head_v_dim
+        uint ssmNVH = 48,      // n_v_heads
+        uint ssmNKH = 16,      // n_k_heads
+        uint ssmKD  = 2048,    // key_dim
+        uint ssmVD  = 6144,    // value_dim
+        uint ssmCD  = 10240,   // conv_dim
+        uint debugLayer = uint.MaxValue)   // if 0/1/2 → trace scratch+state+output
     {
+        bool dbg = debugLayer <= 2;
+        uint convGroups = ssmCD / ssmHVD; // 10240/128 = 80
+        uint vGroups    = ssmNVH;          // 48
+
         // ── Part 1: conv1d ───────────────────────────────────────────────────
         var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", () => ComputeShaders.SsmGdnDecode);
         kernelDecode.SetArgument(0, xNorm.Buffer);
@@ -1949,9 +1958,13 @@ public class ComputeOps : IDisposable
         rowIndexBuf.Write(new[] { rowIndex });
         kernelDecode.SetArgument(10, rowIndexBuf);
 
-        // CONV_DIM / HEAD_V_DIM = 80 workgroups × 128 threads.
-        // Covers all 10240 conv elements + 6144 z elements (first 48 groups).
-        _queue.Dispatch(kernelDecode, new[] { 80u }, null);
+        // SSM params UBO (binding=11): DMODEL, HVD, NVH, NKH, KD, VD, CD (28 bytes, pad to 32).
+        var ssmParams = _device.CreateBuffer(32, BufferType.Storage, DataType.I32);
+        ssmParams.Write(new[] { ssmDModel, ssmHVD, ssmNVH, ssmNKH, ssmKD, ssmVD, ssmCD, 0u });
+        kernelDecode.SetArgument(11, ssmParams);
+
+        // convGroups workgroups × 128 threads.
+        _queue.Dispatch(kernelDecode, new[] { convGroups }, null);
 
         // Memory barrier between part 1 and part 2
         _queue.InsertMemoryBarrier();
@@ -1963,8 +1976,13 @@ public class ComputeOps : IDisposable
         kernelRecur.SetArgument(2, ssmNorm.Buffer);
         kernelRecur.SetArgument(3, output.Buffer);
 
-        // 48 workgroups × 128 threads
-        _queue.Dispatch(kernelRecur, new[] { 48u }, null);
+        // SSM params UBO (binding=4): same layout as decode binding 11.
+        var ssmParams2 = _device.CreateBuffer(32, BufferType.Storage, DataType.I32);
+        ssmParams2.Write(new[] { ssmDModel, ssmHVD, ssmNVH, ssmNKH, ssmKD, ssmVD, ssmCD, 0u });
+        kernelRecur.SetArgument(4, ssmParams2);
+
+        // vGroups workgroups × 128 threads
+        _queue.Dispatch(kernelRecur, new[] { vGroups }, null);
 
         // Barrier after recur: ensures recur_N's writes (ssmState, output) are complete and visible
         // before the next decode_N+1 can start reading/writing scratch or ssmState.
@@ -1972,8 +1990,33 @@ public class ComputeOps : IDisposable
         // in batch mode (multiple tokens per GPU submit during prefill).
         _queue.InsertMemoryBarrier();
 
+        // ── Debug tracing for layers 0-2 ────────────────────────────────────
+        if (dbg && Formats.QwenDbgTrace.Once("ssm_phase", (int)debugLayer))
+        {
+            string p = $"L{debugLayer}";
+            // scratch layout:
+            //   [0..CD)           = qkv_conv (post-SiLU)
+            //   [CD..CD+VD)       = z
+            //   [CD+VD..CD+VD+NVH)= beta
+            //   [CD+VD+NVH..end)  = gate (alpha * ssA)
+            // state layout: [NVH][HVD][HVD] = [48*128*128] = 786432 floats
+            Formats.QwenDbgTrace.Slice($"{p}_qkvConv", scratch, 0, 8);
+            Formats.QwenDbgTrace.Slice($"{p}_qkvConv_end", scratch, (int)(ssmCD - 8), 8);
+            Formats.QwenDbgTrace.Slice($"{p}_z", scratch, (int)ssmCD, 8);
+            Formats.QwenDbgTrace.Slice($"{p}_beta", scratch, (int)(ssmCD + ssmVD), 6);
+            Formats.QwenDbgTrace.Slice($"{p}_gate", scratch, (int)(ssmCD + ssmVD + ssmNVH), 6);
+            // ssmState: first head [128*128] region, first 12 values
+            Formats.QwenDbgTrace.Slice($"{p}_state_h0", ssmState, 0, 12);
+            Formats.QwenDbgTrace.Slice($"{p}_state_h0_mid", ssmState, (int)(ssmHVD * ssmHVD / 2), 12);
+            // output: VD=6144, log first 8
+            Formats.QwenDbgTrace.Slice($"{p}_out", output, 0, 8);
+            Formats.QwenDbgTrace.Slice($"{p}_out_mid", output, (int)(ssmVD / 2), 8);
+        }
+
         MaybeFlush();
         Defer(rowIndexBuf);
+        Defer(ssmParams);
+        Defer(ssmParams2);
     }
 
     #endregion
