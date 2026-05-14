@@ -53,24 +53,21 @@ void main() {
         for (uint j = 0u; j < smp.HVD; j++) ssmState.data[rowBase + j] *= gExp;
     }
     barrier();
-    // Step 2: compute sk = S_decayed @ k  (row d × cols j).
-    sharedMem[d] = kNorm;
-    barrier();
+    // Step 2: compute sk = S^T @ k.
+    // sharedMem still holds kNorm from earlier (set before first barrier).
     float sk = 0.0;
-    uint sdRowBase = stateBase + d * smp.HVD;
-    for (uint j = 0u; j < smp.HVD; j++) sk += ssmState.data[sdRowBase + j] * sharedMem[j];
-    barrier();
+    for (uint j = 0u; j < smp.HVD; j++) sk += ssmState.data[stateBase + j * smp.HVD + d] * sharedMem[j];
     float dVec = (vConvVal - sk) * beta;
-    sharedMem[d] = dVec;
+    // Step 3: update state column d: S[j][d] += k[j] * dVec for each row j.
+    // CRITICAL: use sharedMem (still = kNorm) BEFORE overwriting it with dVec!
+    for (uint j = 0u; j < smp.HVD; j++)
+        ssmState.data[stateBase + j * smp.HVD + d] += sharedMem[j] * dVec;
     barrier();
-    uint rowBaseD = stateBase + d * smp.HVD;
-    for (uint j = 0u; j < smp.HVD; j++) ssmState.data[rowBaseD + j] += kNorm * sharedMem[j];
-    barrier();
+    // Step 4: compute o = S_new^T @ q. Load q into sharedMem.
     sharedMem[d] = qNorm;
     barrier();
     float oVal = 0.0;
-    uint soRowBase = stateBase + d * smp.HVD;
-    for (uint j = 0u; j < smp.HVD; j++) oVal += ssmState.data[soRowBase + j] * sharedMem[j];
+    for (uint j = 0u; j < smp.HVD; j++) oVal += ssmState.data[stateBase + j * smp.HVD + d] * sharedMem[j];
     oVal *= SCALE;
     float zSilu = silu(zVal);
     sharedMem[d] = oVal * oVal;
