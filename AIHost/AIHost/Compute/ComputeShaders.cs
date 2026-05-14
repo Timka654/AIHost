@@ -9,906 +9,99 @@ public static class ComputeShaders
     private const string DefaultProvider = "Vulkan";
 
     // Quantization shaders - cached once at startup (inline fallback if .glsl file missing)
-    public static readonly string DequantizeQ2K = TryLoadOrInline("dequant_q2k", QuantizationFormats.DequantizeQ2K_Correct);
-    public static readonly string DequantizeQ3K = TryLoadOrInline("dequant_q3k", QuantizationFormats.DequantizeQ3K_Correct);
-    public static readonly string DequantizeQ4K = TryLoadOrInline("dequant_q4k", QuantizationFormats.DequantizeQ4K_Correct);
-    public static readonly string DequantizeQ5K = TryLoadOrInline("dequant_q5k", QuantizationFormats.DequantizeQ5K_Correct);
-    public static readonly string DequantizeQ6K = TryLoadOrInline("dequant_q6k", QuantizationFormats.DequantizeQ6K_Correct);
+    public static readonly string DequantizeQ2K = TryLoadOrInline("dequant_q2k");
+    public static readonly string DequantizeQ3K = TryLoadOrInline("dequant_q3k");
+    public static readonly string DequantizeQ4K = TryLoadOrInline("dequant_q4k");
+    public static readonly string DequantizeQ5K = TryLoadOrInline("dequant_q5k");
+    public static readonly string DequantizeQ6K = TryLoadOrInline("dequant_q6k");
 
     // Core operations
-    public static readonly string MatMulF32 = TryLoadOrInline("matmul", _inlineMatMul);
+    public static readonly string MatMulF32 = TryLoadOrInline("matmul");
 
     // Weight matrices from GGUF are stored column-major (ne[0] is innermost/fastest dim).
     // This variant reads B as column-major: B[bRow, bCol] = data[bRow + bCol * K].
-    public static readonly string MatMulWeightsF32  = TryLoadOrInline("matmul_weights",   _inlineMatMulWeights);
-    /// <summary>
-    /// C[M,J] = A[M,K] @ B^T where B[J,K] is GGUF col-major (B[j,k]=data[j+k*J]).
-    /// Used for gated attention output projection when W_gate is stored transposed.
-    /// </summary>
-    public static readonly string MatMulWeightsTF32 = TryLoadOrInline("matmul_weights_t", _inlineMatMulWeightsT);
-    public static readonly string Softmax = TryLoadOrInline("softmax", _inlineSoftmax);
-    public static readonly string SiLU = TryLoadOrInline("silu", _inlineSiLU);
-    public static readonly string Sigmoid = TryLoadOrInline("sigmoid", _inlineSigmoid);
-    public static readonly string ElementWiseAdd = TryLoadOrInline("add", _inlineAdd);
-    public static readonly string ConcatAxis1 = TryLoadOrInline("concat_axis1", _inlineConcat);
-    public static readonly string ConcatAxis0 = TryLoadOrInline("concat_axis0", _inlineConcatAxis0);
-
-    // Additional operations
-    public static readonly string LayerNorm = TryLoadOrInline("layernorm", _inlineLayerNorm);
-    public static readonly string ElementWiseMul = TryLoadOrInline("elementwise_mul", _inlineElementWiseMul);
-    public static readonly string RoPE = TryLoadOrInline("rope", _inlineRoPE);
-    public static readonly string Transpose = TryLoadOrInline("transpose", _inlineTranspose);
-    public static readonly string RowwiseSoftmax = TryLoadOrInline("rowwise_softmax", _inlineRowwiseSoftmax);
-    public static readonly string Scale = TryLoadOrInline("scale", _inlineScale);
-    public static readonly string EmbeddingLookup = TryLoadOrInline("embedding_lookup", _inlineEmbeddingLookup);
-    public static readonly string RoPEFull = TryLoadOrInline("rope_full", _inlineRoPEFull);
-    public static readonly string CausalMask = TryLoadOrInline("causal_mask", _inlineCausalMask);
-    public static readonly string Copy = TryLoadOrInline("copy", _inlineCopy);
-    public static readonly string RepeatColumns = TryLoadOrInline("repeat_columns", _inlineRepeatColumns);
-
-    // Correct GQA K/V expansion: repeats groups of head_dim columns (not individual columns).
-    // K[seq, numKvHeads*headDim] → K_expanded[seq, numQHeads*headDim]
-    // Each KV head's headDim-block is repeated repeat_factor times.
-    public static readonly string RepeatKVHeads = TryLoadOrInline("repeat_kv_heads", _inlineRepeatKVHeads);
-
-    // Extract a contiguous column slice from a 2D tensor.
-    // Src: [rows, srcCols], colStart: first column index, colCount: number of columns
-    // Dst: [rows, colCount]
-    public static readonly string SliceCols = TryLoadOrInline("slice_cols", _inlineSliceCols);
-
-    // Scatter (write) src [rows, colCount] into dst [rows, dstCols] starting at colStart.
-    public static readonly string ScatterCols = TryLoadOrInline("scatter_cols", _inlineScatterCols);
-
-    // Fused multi-head (GQA) attention for a SINGLE QUERY token (seqLen=1).
-    // Avoids per-head SliceCols/ScatterCols/Transpose allocations.
-    // Dispatch: globalWorkSize = { numQHeads } (one workgroup per Q head, 256 threads each)
-    public static readonly string FusedMHAGenerate = TryLoadOrInline("fused_mha_generate", _inlineFusedMHAGenerate);
-
-    // ── SSM/GDN shaders ─────────────────────────────────────────────────────
-    // Part 1: conv1d — computes z, beta, alpha, gate, qkv_mixed, conv1d, SiLU → scratch
-    // Dispatch: 48 workgroups × 128 threads
-    public static readonly string SsmGdnDecode = TryLoadOrInline("ssm_gdn_decode", _inlineSsmGdnDecode);
-
-    // Part 2: recurrence — reads scratch, L2 norm, Delta Net, Gated norm → output
-    // Dispatch: 48 workgroups × 128 threads
-    public static readonly string SsmGdnRecur = TryLoadOrInline("ssm_gdn_recur", _inlineSsmGdnRecur);
-
-    // De-interleave Q+gate from attn_q.weight output for TypeB (Qwen3Next/qwen35) attention layers.
-    // Input : [sl, n_head * 2 * head_dim] — [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
-    // Output: [sl, n_head * 2 * head_dim] — [Q_all(n_head*hd), gate_all(n_head*hd)]
-    // Dispatch: ceil(sl * n_head * 2 * head_dim / 256) workgroups × 256 threads
-    public static readonly string DeinterleaveQGate = TryLoadOrInline("deinterleave_q_gate", _inlineDeinterleaveQGate);
-
-    private static string TryLoadOrInline(string shaderName, string inlineSource)
-    {
-        try
-        {
-            return ShaderLoader.Load(DefaultProvider, shaderName);
-        }
-        catch (FileNotFoundException)
-        {
-            return inlineSource;
-        }
-    }
-
-    // Inline fallbacks for backward compatibility
-
     // Weight matrices from GGUF use column-major layout: B[k, n] = data[k + n * K].
     // This variant replaces the row-major read B[k,n]=data[k*N+n] with the column-major
     // read B[k,n]=data[k + n*K], fixing out-of-bounds access and wrong computation
     // for non-square weight matrices (wK, wV, wGate, wUp, wDown, etc.).
-    private const string _inlineMatMulWeights = @"
-#version 450
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) readonly buffer MatrixA  { float data[]; } A;
-layout(set = 0, binding = 1) readonly buffer MatrixB  { float data[]; } B;
-layout(set = 0, binding = 2) buffer MatrixC           { float data[]; } C;
-layout(set = 0, binding = 3) readonly buffer Params   { uint M; uint K; uint N; } params;
-shared float tileA[16][16];
-shared float tileB[16][16];
-void main() {
-    uint row     = gl_GlobalInvocationID.y;
-    uint col     = gl_GlobalInvocationID.x;
-    uint tileRow = gl_LocalInvocationID.y;
-    uint tileCol = gl_LocalInvocationID.x;
-    float sum    = 0.0;
-    uint numTiles = (params.K + 15u) / 16u;
-    for (uint t = 0u; t < numTiles; t++) {
-        uint aRow = row;
-        uint aCol = t * 16u + tileCol;
-        uint bRow = t * 16u + tileRow;   // K index
-        uint bCol = col;                  // N index
-        tileA[tileRow][tileCol] = (aRow < params.M && aCol < params.K)
-            ? A.data[aRow * params.K + aCol] : 0.0;
-        // B is GGUF column-major: B[bRow, bCol] = data[bRow + bCol * K]
-        tileB[tileRow][tileCol] = (bRow < params.K && bCol < params.N)
-            ? B.data[bRow + bCol * params.K] : 0.0;
-        barrier();
-        for (uint k = 0u; k < 16u; k++) {
-            sum += tileA[tileRow][k] * tileB[k][tileCol];
-        }
-        barrier();
-    }
-    if (row < params.M && col < params.N) {
-        C.data[row * params.N + col] = sum;
-    }
-}
-";
-
+    public static readonly string MatMulWeightsF32 = TryLoadOrInline("matmul_weights");
+    /// <summary>
+    /// C[M,J] = A[M,K] @ B^T where B[J,K] is GGUF col-major (B[j,k]=data[j+k*J]).
+    /// Used for gated attention output projection when W_gate is stored transposed.
+    /// </summary>
     // C[M,J] = A[M,K] @ B^T  where B[J,K] stored GGUF col-major: B[j,k]=data[j+k*J].
     // C[i,j] = sum_k  A[i*K+k] * B[j+k*J].
     // Used for gated attention output projection (attn_gate stored as W_o^T).
-    private const string _inlineMatMulWeightsT = @"
-#version 450
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) readonly buffer MatrixA { float data[]; } A;
-layout(set = 0, binding = 1) readonly buffer MatrixB { float data[]; } B;
-layout(set = 0, binding = 2) buffer MatrixC          { float data[]; } C;
-layout(set = 0, binding = 3) readonly buffer Params  { uint M; uint K; uint J; } params;
-shared float tileA[16][16];
-shared float tileB[16][16];
-void main() {
-    uint row     = gl_GlobalInvocationID.y;  // output row  (0..M-1)
-    uint col     = gl_GlobalInvocationID.x;  // output col  (0..J-1)
-    uint tileRow = gl_LocalInvocationID.y;
-    uint tileCol = gl_LocalInvocationID.x;
-    float sum    = 0.0;
-    uint numTiles = (params.K + 15u) / 16u;
-    for (uint t = 0u; t < numTiles; t++) {
-        uint aRow = row;
-        uint aCol = t * 16u + tileCol;  // k-index in A
-        uint bCol = t * 16u + tileRow;  // k-index in B
-        uint bRow = col;                // j-index in B (B[j,k]=data[j+k*J])
-        tileA[tileRow][tileCol] = (aRow < params.M && aCol < params.K)
-            ? A.data[aRow * params.K + aCol] : 0.0;
-        // B^T: B[j,k] = data[j + k*J]
-        tileB[tileRow][tileCol] = (bRow < params.J && bCol < params.K)
-            ? B.data[bRow + bCol * params.J] : 0.0;
-        barrier();
-        for (uint k = 0u; k < 16u; k++) {
-            sum += tileA[tileRow][k] * tileB[k][tileCol];
-        }
-        barrier();
-    }
-    if (row < params.M && col < params.J) {
-        C.data[row * params.J + col] = sum;
-    }
-}
-";
+    public static readonly string MatMulWeightsTF32 = TryLoadOrInline("matmul_weights_t");
+    public static readonly string Softmax = TryLoadOrInline("softmax");
+    public static readonly string SiLU = TryLoadOrInline("silu");
+    public static readonly string Sigmoid = TryLoadOrInline("sigmoid");
+    public static readonly string ElementWiseAdd = TryLoadOrInline("add");
+    public static readonly string ConcatAxis1 = TryLoadOrInline("concat_axis1");
+    public static readonly string ConcatAxis0 = TryLoadOrInline("concat_axis0");
 
-    private const string _inlineMatMul = @"
-#version 450
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) readonly buffer MatrixA { float data[]; } A;
-layout(set = 0, binding = 1) readonly buffer MatrixB { float data[]; } B;
-layout(set = 0, binding = 2) buffer MatrixC { float data[]; } C;
-layout(set = 0, binding = 3) readonly buffer Params { uint M; uint K; uint N; } params;
-shared float tileA[16][16];
-shared float tileB[16][16];
-void main() {
-    uint row = gl_GlobalInvocationID.y;
-    uint col = gl_GlobalInvocationID.x;
-    uint tileRow = gl_LocalInvocationID.y;
-    uint tileCol = gl_LocalInvocationID.x;
-    float sum = 0.0;
-    uint numTiles = (params.K + 15u) / 16u;
-    for (uint t = 0u; t < numTiles; t++) {
-        uint aRow = row;
-        uint aCol = t * 16u + tileCol;
-        uint bRow = t * 16u + tileRow;
-        uint bCol = col;
-        // All threads must participate in shared memory loads to avoid garbage reads.
-        // Out-of-bounds threads load 0.0 so they don't pollute the tile.
-        tileA[tileRow][tileCol] = (aRow < params.M && aCol < params.K) ? A.data[aRow * params.K + aCol] : 0.0;
-        tileB[tileRow][tileCol] = (bRow < params.K && bCol < params.N) ? B.data[bRow * params.N + bCol] : 0.0;
-        barrier();
-        for (uint k = 0u; k < 16u; k++) {
-            sum += tileA[tileRow][k] * tileB[k][tileCol];
-        }
-        barrier();
-    }
-    // Only write result for valid output positions
-    if (row < params.M && col < params.N) {
-        C.data[row * params.N + col] = sum;
-    }
-}
-";
-
-    private const string _inlineSoftmax = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params { uint size; } params;
-shared float sMax[256];
-shared float sSum[256];
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
-    float val = (gid < params.size) ? buf.data[gid] : -1e38;
-    sMax[lid] = val;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) sMax[lid] = max(sMax[lid], sMax[lid + s]);
-        barrier();
-    }
-    float maxVal = sMax[0];
-    if (gid < params.size) {
-        val = exp(buf.data[gid] - maxVal);
-        buf.data[gid] = val;
-    } else {
-        val = 0.0;
-    }
-    sSum[lid] = val;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) sSum[lid] += sSum[lid + s];
-        barrier();
-    }
-    float sumVal = sSum[0];
-    if (gid < params.size && sumVal > 0.0) {
-        buf.data[gid] /= sumVal;
-    }
-}
-";
+    // Additional operations
 
     // Row-wise RMSNorm (as used in LLaMA): each workgroup handles one row (token).
     // out[row,i] = x[row,i] / sqrt(mean(x[row]^2) + eps) * weight[i]
-    private const string _inlineLayerNorm = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer WeightBuf { float data[]; } weight;
-layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint cols; float eps; } params;
-shared float sharedMem[256];
-void main() {
-    uint row = gl_WorkGroupID.x;
-    uint tid = gl_LocalInvocationID.x;
-    if (row >= params.rows) return;
-    uint rowOffset = row * params.cols;
-    float localSumSq = 0.0;
-    for (uint i = tid; i < params.cols; i += 256u) {
-        float x = buf.data[rowOffset + i];
-        localSumSq += x * x;
-    }
-    sharedMem[tid] = localSumSq;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) sharedMem[tid] += sharedMem[tid + s];
-        barrier();
-    }
-    float rms = sqrt(sharedMem[0] / float(params.cols) + params.eps);
-    barrier();
-    for (uint i = tid; i < params.cols; i += 256u) {
-        buf.data[rowOffset + i] = (buf.data[rowOffset + i] / rms) * weight.data[i];
-    }
-}
-";
+    public static readonly string LayerNorm = TryLoadOrInline("layernorm");
+    public static readonly string ElementWiseMul = TryLoadOrInline("elementwise_mul");
+    public static readonly string RoPE = TryLoadOrInline("rope");
+    public static readonly string Transpose = TryLoadOrInline("transpose");
+    public static readonly string RowwiseSoftmax = TryLoadOrInline("rowwise_softmax");
+    public static readonly string Scale = TryLoadOrInline("scale");
+    public static readonly string EmbeddingLookup = TryLoadOrInline("embedding_lookup");
+    public static readonly string RoPEFull = TryLoadOrInline("rope_full");
+    public static readonly string CausalMask = TryLoadOrInline("causal_mask");
+    public static readonly string Copy = TryLoadOrInline("copy");
+    // Each output element (row, outCol) gathers from srcCol = outCol / repeatFactor.
+    public static readonly string RepeatColumns = TryLoadOrInline("repeat_columns");
 
-    private const string _inlineSiLU = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params { uint size; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.size) return;
-    float x = buf.data[gid];
-    float sigmoid = 1.0 / (1.0 + exp(-x));
-    buf.data[gid] = x * sigmoid;
-}
-";
-
-    private const string _inlineSigmoid = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params { uint size; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.size) return;
-    buf.data[gid] = 1.0 / (1.0 + exp(-buf.data[gid]));
-}
-";
-
-    private const string _inlineElementWiseMul = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer BufA { float data[]; } A;
-layout(set = 0, binding = 1) readonly buffer BufB { float data[]; } B;
-layout(set = 0, binding = 2) buffer BufC { float data[]; } C;
-layout(set = 0, binding = 3) readonly buffer Params { uint size; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.size) return;
-    C.data[gid] = A.data[gid] * B.data[gid];
-}
-";
-
-    private const string _inlineAdd = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer BufA { float data[]; } A;
-layout(set = 0, binding = 1) readonly buffer BufB { float data[]; } B;
-layout(set = 0, binding = 2) buffer BufC { float data[]; } C;
-layout(set = 0, binding = 3) readonly buffer Params { uint size; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.size) return;
-    C.data[gid] = A.data[gid] + B.data[gid];
-}
-";
-
-    private const string _inlineConcat = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer BufA { float data[]; } A;
-layout(set = 0, binding = 1) readonly buffer BufB { float data[]; } B;
-layout(set = 0, binding = 2) buffer BufC { float data[]; } C;
-layout(set = 0, binding = 3) readonly buffer Params { 
-    uint dim0; 
-    uint dim1_a; 
-    uint dim1_b; 
-} params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint dim1_total = params.dim1_a + params.dim1_b;
-    uint total_size = params.dim0 * dim1_total;
-    
-    if (gid >= total_size) return;
-    
-    uint i = gid / dim1_total;  // which row
-    uint j = gid % dim1_total;  // position in row
-    
-    if (j < params.dim1_a) {
-        // Copy from A
-        C.data[gid] = A.data[i * params.dim1_a + j];
-    } else {
-        // Copy from B
-        C.data[gid] = B.data[i * params.dim1_b + (j - params.dim1_a)];
-    }
-}
-";
-
-    private const string _inlineConcatAxis0 = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer InputA { float a[]; };
-layout(set = 0, binding = 1) readonly buffer InputB { float b[]; };
-layout(set = 0, binding = 2) writeonly buffer Output { float result[]; };
-layout(set = 0, binding = 3) readonly buffer Params {
-    uint rows_a;
-    uint rows_b;
-    uint cols;
-};
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint total_rows = rows_a + rows_b;
-    uint total_elements = total_rows * cols;
-    
-    if (gid >= total_elements) return;
-    
-    uint row = gid / cols;
-    uint col = gid % cols;
-    
-    if (row < rows_a) {
-        result[gid] = a[row * cols + col];
-    } else {
-        uint b_row = row - rows_a;
-        result[gid] = b[b_row * cols + col];
-    }
-}
-";
-
-    private const string _inlineRoPE = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer ParamsBuffer {
-    uint seq_len;
-    uint head_dim;
-    uint position;
-    float theta;
-} params;
-
-void main() {
-    uint pair_idx = gl_GlobalInvocationID.x;
-    if (pair_idx >= params.head_dim / 2u) return;
-    
-    float freq = 1.0 / pow(params.theta, float(pair_idx * 2u) / float(params.head_dim));
-    float angle = float(params.position) * freq;
-    
-    float cos_val = cos(angle);
-    float sin_val = sin(angle);
-    
-    uint idx1 = pair_idx * 2u;
-    uint idx2 = pair_idx * 2u + 1u;
-    
-    float x1 = buf.data[idx1];
-    float x2 = buf.data[idx2];
-    
-    buf.data[idx1] = x1 * cos_val - x2 * sin_val;
-    buf.data[idx2] = x1 * sin_val + x2 * cos_val;
-}
-";
-
-    private const string _inlineTranspose = @"
-#version 450
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) readonly buffer MatrixA { float data[]; } A;
-layout(set = 0, binding = 1) buffer MatrixB { float data[]; } B;
-layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint cols; } params;
-void main() {
-    uint row = gl_GlobalInvocationID.y;
-    uint col = gl_GlobalInvocationID.x;
-    if (row >= params.rows || col >= params.cols) return;
-    B.data[col * params.rows + row] = A.data[row * params.cols + col];
-}
-";
-
-    private const string _inlineRowwiseSoftmax = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params { uint rows; uint cols; } params;
-shared float sharedMem[256];
-void main() {
-    uint row = gl_WorkGroupID.x;
-    uint tid = gl_LocalInvocationID.x;
-    if (row >= params.rows) return;
-    
-    uint rowOffset = row * params.cols;
-    
-    // Find max
-    float localMax = -1e38;
-    for (uint i = tid; i < params.cols; i += gl_WorkGroupSize.x) {
-        localMax = max(localMax, buf.data[rowOffset + i]);
-    }
-    sharedMem[tid] = localMax;
-    barrier();
-    
-    // Reduce max
-    for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            sharedMem[tid] = max(sharedMem[tid], sharedMem[tid + s]);
-        }
-        barrier();
-    }
-    float rowMax = sharedMem[0];
-    barrier();
-    
-    // Compute exp and sum
-    float localSum = 0.0;
-    for (uint i = tid; i < params.cols; i += gl_WorkGroupSize.x) {
-        float val = exp(buf.data[rowOffset + i] - rowMax);
-        buf.data[rowOffset + i] = val;
-        localSum += val;
-    }
-    sharedMem[tid] = localSum;
-    barrier();
-    
-    // Reduce sum
-    for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            sharedMem[tid] += sharedMem[tid + s];
-        }
-        barrier();
-    }
-    float rowSum = sharedMem[0];
-    barrier();
-    
-    // Normalize
-    for (uint i = tid; i < params.cols; i += gl_WorkGroupSize.x) {
-        buf.data[rowOffset + i] /= rowSum;
-    }
-}
-";
-
-    private const string _inlineScale = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params { uint size; float scale; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.size) return;
-    buf.data[gid] *= params.scale;
-}
-";
-
-    private const string _inlineEmbeddingLookup = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer TokenIds { int ids[]; } tokenIds;
-layout(set = 0, binding = 1) readonly buffer EmbTable { float data[]; } table;
-layout(set = 0, binding = 2) writeonly buffer Output { float data[]; } output_buf;
-layout(set = 0, binding = 3) readonly buffer Params { uint seqLen; uint dModel; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.seqLen * params.dModel) return;
-    uint seq = gid / params.dModel;
-    uint dim = gid % params.dModel;
-    int tokenId = tokenIds.ids[seq];
-    if (tokenId < 0) return;
-    output_buf.data[gid] = table.data[uint(tokenId) * params.dModel + dim];
-}
-";
-
-    private const string _inlineRoPEFull = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params {
-    uint seqLen; uint numHeads; uint headDim; uint startPosition; float theta; uint ropeDim;
-} params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint halfRope = params.ropeDim / 2u;
-    uint pairsPerSeq = params.numHeads * halfRope;
-    if (gid >= params.seqLen * pairsPerSeq) return;
-    uint seq  = gid / pairsPerSeq;
-    uint rem  = gid % pairsPerSeq;
-    uint head = rem / halfRope;
-    uint pair = rem % halfRope;
-    uint pos = params.startPosition + seq;
-    float freq = 1.0 / pow(params.theta, float(pair * 2u) / float(params.ropeDim));
-    float angle = float(pos) * freq;
-    float c = cos(angle), s = sin(angle);
-    // base = start of this token's head; offset within head = pair*2 (within ropeDim range)
-    uint base = (seq * params.numHeads + head) * params.headDim + pair * 2u;
-    float x1 = buf.data[base];
-    float x2 = buf.data[base + 1u];
-    buf.data[base]     = x1 * c - x2 * s;
-    buf.data[base + 1u] = x1 * s + x2 * c;
-}
-";
-
-    private const string _inlineCausalMask = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) buffer InOutBuf { float data[]; } buf;
-layout(set = 0, binding = 1) readonly buffer Params {
-    uint seqLen_q; uint seqLen_k; uint startPosition;
-} params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.seqLen_q * params.seqLen_k) return;
-    uint i = gid / params.seqLen_k;
-    uint j = gid % params.seqLen_k;
-    if (j > params.startPosition + i) {
-        buf.data[gid] = -1e38;
-    }
-}
-";
-
-    private const string _inlineCopy = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
-layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
-layout(set = 0, binding = 2) readonly buffer Params { uint size; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.size) return;
-    dst.data[gid] = src.data[gid];
-}
-";
-
+    // Correct GQA K/V expansion: repeats groups of head_dim columns (not individual columns).
+    // K[seq, numKvHeads*headDim] → K_expanded[seq, numQHeads*headDim]
+    // Each KV head's headDim-block is repeated repeat_factor times.
     // GQA K/V expansion: repeat each head_dim block repeatFactor times.
     // output[row, j] = src[row, (j / (repeatFactor * headDim)) * headDim + j % headDim]
     // Params: rows, srcCols (=numKvHeads*headDim), headDim, repeatFactor
-    private const string _inlineRepeatKVHeads = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
-layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
-layout(set = 0, binding = 2) readonly buffer Params {
-    uint rows; uint srcCols; uint headDim; uint repeatFactor;
-} params;
-void main() {
-    uint dstCols = params.srcCols * params.repeatFactor;
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.rows * dstCols) return;
-    uint row = gid / dstCols;
-    uint j   = gid % dstCols;
-    uint groupStride = params.repeatFactor * params.headDim;  // cols per kv-head in dst
-    uint kvHead      = j / groupStride;
-    uint dimInHead   = j % params.headDim;
-    uint srcCol      = kvHead * params.headDim + dimInHead;
-    dst.data[gid] = src.data[row * params.srcCols + srcCol];
-}
-";
+    public static readonly string RepeatKVHeads = TryLoadOrInline("repeat_kv_heads");
 
-    // Each output element (row, outCol) gathers from srcCol = outCol / repeatFactor.
-    private const string _inlineRepeatColumns = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
-layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
-layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint cols; uint repeatFactor; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint newCols = params.cols * params.repeatFactor;
-    if (gid >= params.rows * newCols) return;
-    uint row    = gid / newCols;
-    uint outCol = gid % newCols;
-    uint srcCol = outCol / params.repeatFactor;
-    dst.data[gid] = src.data[row * params.cols + srcCol];
-}
-";
-
+    // Extract a contiguous column slice from a 2D tensor.
+    // Src: [rows, srcCols], colStart: first column index, colCount: number of columns
+    // Dst: [rows, colCount]
     // Extract columns [colStart, colStart+colCount) from src[rows, srcCols] -> dst[rows, colCount]
-    private const string _inlineSliceCols = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
-layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
-layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint srcCols; uint colStart; uint colCount; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.rows * params.colCount) return;
-    uint row = gid / params.colCount;
-    uint col = gid % params.colCount;
-    dst.data[gid] = src.data[row * params.srcCols + params.colStart + col];
-}
-";
+    public static readonly string SliceCols = TryLoadOrInline("slice_cols");
 
+    // Scatter (write) src [rows, colCount] into dst [rows, dstCols] starting at colStart.
     // Write src[rows, colCount] into dst[rows, dstCols] at column offset colStart.
-    private const string _inlineScatterCols = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer Src { float data[]; } src;
-layout(set = 0, binding = 1) writeonly buffer Dst { float data[]; } dst;
-layout(set = 0, binding = 2) readonly buffer Params { uint rows; uint dstCols; uint colStart; uint colCount; } params;
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    if (gid >= params.rows * params.colCount) return;
-    uint row = gid / params.colCount;
-    uint col = gid % params.colCount;
-    dst.data[row * params.dstCols + params.colStart + col] = src.data[gid];
-}
-";
+    public static readonly string ScatterCols = TryLoadOrInline("scatter_cols");
 
+    // Fused multi-head (GQA) attention for a SINGLE QUERY token (seqLen=1).
+    // Avoids per-head SliceCols/ScatterCols/Transpose allocations.
+    // Dispatch: globalWorkSize = { numQHeads } (one workgroup per Q head, 256 threads each)
     // Fused GQA attention for a single query token (seqLen=1).
     // One workgroup per Q head (gl_WorkGroupID.x = h), local_size_x = 256 threads.
     // Threads cooperate: round-robin over kvSeqLen for scores, per-dim for V sum.
     // Shared mem: 256 floats for reductions + 4096 floats for scores.
     // Max supported kvSeqLen = 4096 (increase shared array if needed).
-    private const string _inlineFusedMHAGenerate = @"
-#version 450
-layout(local_size_x = 256) in;
-layout(set = 0, binding = 0) readonly buffer QBuf   { float data[]; } q_buf;
-layout(set = 0, binding = 1) readonly buffer KBuf   { float data[]; } k_buf;
-layout(set = 0, binding = 2) readonly buffer VBuf   { float data[]; } v_buf;
-layout(set = 0, binding = 3) buffer       OutBuf  { float data[]; } out_buf;
-layout(set = 0, binding = 4) readonly buffer Params {
-    uint numQHeads; uint numKvHeads; uint headDim; uint kvSeqLen; float scale;
-} params;
+    public static readonly string FusedMHAGenerate = TryLoadOrInline("fused_mha_generate");
 
-shared float sharedMem[256];
-shared float scores[4096];
+    // ── SSM/GDN shaders ─────────────────────────────────────────────────────
+    // Part 1: conv1d — computes z, beta, alpha, gate, qkv_mixed, conv1d, SiLU → scratch
+    // Dispatch: 48 workgroups × 128 threads
+    public static readonly string SsmGdnDecode = TryLoadOrInline("ssm_gdn_decode");
 
-void main() {
-    uint h   = gl_WorkGroupID.x;          // Q head index (0..numQHeads-1)
-    uint tid = gl_LocalInvocationID.x;    // thread index (0..255)
+    // Part 2: recurrence — reads scratch, L2 norm, Delta Net, Gated norm → output
+    // Dispatch: 48 workgroups × 128 threads
+    public static readonly string SsmGdnRecur = TryLoadOrInline("ssm_gdn_recur");
 
-    uint repeatFactor = params.numQHeads / params.numKvHeads;
-    uint kvH     = h / repeatFactor;
-    uint kvStride = params.numKvHeads * params.headDim;
-    uint q_base   = h    * params.headDim;
-    uint kv_off   = kvH  * params.headDim;
+    // De-interleave Q+gate from attn_q.weight output for TypeB (Qwen3Next/qwen35) attention layers.
+    // Input : [sl, n_head * 2 * head_dim] — [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+    // Output: [sl, n_head * 2 * head_dim] — [Q_all(n_head*hd), gate_all(n_head*hd)]
+    // Dispatch: ceil(sl * n_head * 2 * head_dim / 256) workgroups × 256 threads
+    public static readonly string DeinterleaveQGate = TryLoadOrInline("deinterleave_q_gate");
 
-    // -- Step 1: scaled dot-product Q . K^T --
-    for (uint j = tid; j < params.kvSeqLen; j += 256u) {
-        float s = 0.0;
-        for (uint d = 0u; d < params.headDim; d++) {
-            s += q_buf.data[q_base + d] *
-                 k_buf.data[j * kvStride + kv_off + d];
-        }
-        scores[j] = s * params.scale;
+    private static string TryLoadOrInline(string shaderName)
+    {
+        return ShaderLoader.Load(DefaultProvider, shaderName);
     }
-    barrier();
-
-    // -- Step 2: stable softmax (parallel max then exp-sum) --
-    float localMax = -1e38;
-    for (uint j = tid; j < params.kvSeqLen; j += 256u)
-        localMax = max(localMax, scores[j]);
-    sharedMem[tid] = localMax;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) sharedMem[tid] = max(sharedMem[tid], sharedMem[tid + s]);
-        barrier();
-    }
-    float rowMax = sharedMem[0];
-    barrier();
-
-    float localSum = 0.0;
-    for (uint j = tid; j < params.kvSeqLen; j += 256u) {
-        float e = exp(scores[j] - rowMax);
-        scores[j] = e;
-        localSum += e;
-    }
-    sharedMem[tid] = localSum;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) sharedMem[tid] += sharedMem[tid + s];
-        barrier();
-    }
-    float rowSum = max(sharedMem[0], 0.000001);
-    barrier();
-
-    for (uint j = tid; j < params.kvSeqLen; j += 256u)
-        scores[j] /= rowSum;
-    barrier();
-
-    // -- Step 3: weighted V sum --
-    // Thread tid owns output dimension tid (tid < headDim only).
-    if (tid < params.headDim) {
-        float acc = 0.0;
-        for (uint j = 0u; j < params.kvSeqLen; j++) {
-            acc += scores[j] * v_buf.data[j * kvStride + kv_off + tid];
-        }
-        out_buf.data[h * params.headDim + tid] = acc;
-    }
-}
-";
-
-    private const string _inlineSsmGdnDecode = @"
-#version 450
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint HEAD_V_DIM = 128u;
-const uint N_V_HEADS  = 48u;
-const uint N_K_HEADS  = 16u;
-const uint KEY_DIM    = 2048u;
-const uint VALUE_DIM  = 6144u;
-const uint CONV_DIM   = 10240u;
-const uint CONV_KERNEL = 4u;
-const uint CONV_STATE_LEN = 3u;
-const uint DMODEL     = 5120u;
-layout(set = 0, binding = 0) readonly  buffer XNormBuf    { float data[]; } xNorm;
-layout(set = 0, binding = 1) readonly  buffer ConvWBuf    { float data[]; } convW;
-layout(set = 0, binding = 2)          buffer ConvStateBuf { float data[]; } convState;
-layout(set = 0, binding = 3) readonly  buffer WQKVBuf     { float data[]; } wQKV;
-layout(set = 0, binding = 4) readonly  buffer WZBuf       { float data[]; } wZ;
-layout(set = 0, binding = 5) readonly  buffer WBetaBuf    { float data[]; } wBeta;
-layout(set = 0, binding = 6) readonly  buffer WAlphaBuf   { float data[]; } wAlpha;
-layout(set = 0, binding = 7) readonly  buffer DtBiasBuf   { float data[]; } dtBias;
-layout(set = 0, binding = 8) readonly  buffer SsABuf      { float data[]; } ssA;
-layout(set = 0, binding = 9)          buffer ScratchBuf   { float data[]; } scratch;
-layout(set = 0, binding = 10) readonly buffer RowIdxBuf   { uint rowIdx; } rowIdxBuf;
-float silu(float x) { return x / (1.0 + exp(-x)); }
-void main() {
-    uint n = gl_WorkGroupID.x;
-    uint d = gl_LocalInvocationID.x;
-    uint qkvIdx = n * HEAD_V_DIM + d;
-    uint rowOff = rowIdxBuf.rowIdx * DMODEL;
-    float zVal = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) zVal += xNorm.data[rowOff + k] * wZ.data[k + qkvIdx * DMODEL];
-    float betaSum = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) betaSum += xNorm.data[rowOff + k] * wBeta.data[k + n * DMODEL];
-    float beta = 1.0 / (1.0 + exp(-betaSum));
-    float alphaSum = 0.0;
-    for (uint k = 0u; k < DMODEL; k++) alphaSum += xNorm.data[rowOff + k] * wAlpha.data[k + n * DMODEL];
-    float alpha = log(1.0 + exp(alphaSum + dtBias.data[n]));
-    float gate = alpha * ssA.data[n];
-    float qkvVal = 0.0;
-    if (qkvIdx < CONV_DIM) {
-        for (uint k = 0u; k < DMODEL; k++) qkvVal += xNorm.data[rowOff + k] * wQKV.data[k + qkvIdx * DMODEL];
-    }
-    float convOut = 0.0;
-    if (qkvIdx < CONV_DIM) {
-        // convW GGUF shape [CONV_KERNEL=4, CONV_DIM=10240], column-major: data[slot + ch * CONV_KERNEL]
-        convOut += convState.data[0u * CONV_DIM + qkvIdx] * convW.data[0u + qkvIdx * CONV_KERNEL];
-        convOut += convState.data[1u * CONV_DIM + qkvIdx] * convW.data[1u + qkvIdx * CONV_KERNEL];
-        convOut += convState.data[2u * CONV_DIM + qkvIdx] * convW.data[2u + qkvIdx * CONV_KERNEL];
-        convOut += qkvVal * convW.data[3u + qkvIdx * CONV_KERNEL];
-    }
-    float siluVal = silu(convOut);
-    if (qkvIdx < CONV_DIM) scratch.data[qkvIdx] = siluVal;
-    scratch.data[CONV_DIM + qkvIdx] = zVal;
-    if (d == 0u) {
-        scratch.data[CONV_DIM + VALUE_DIM + n] = beta;
-        scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n] = gate;
-    }
-    if (qkvIdx < CONV_DIM) {
-        convState.data[0u * CONV_DIM + qkvIdx] = convState.data[1u * CONV_DIM + qkvIdx];
-        convState.data[1u * CONV_DIM + qkvIdx] = convState.data[2u * CONV_DIM + qkvIdx];
-        convState.data[2u * CONV_DIM + qkvIdx] = qkvVal;
-    }
-}
-";
-
-    private const string _inlineSsmGdnRecur = @"
-#version 450
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-const uint HEAD_V_DIM = 128u;
-const uint N_V_HEADS  = 48u;
-const uint N_K_HEADS  = 16u;
-const uint KEY_DIM    = 2048u;
-const uint VALUE_DIM  = 6144u;
-const uint CONV_DIM   = 10240u;
-const float EPS       = 1e-5;
-const float SCALE     = 0.08838834764831845;
-layout(set = 0, binding = 0) readonly  buffer ScratchBuf { float data[]; } scratch;
-layout(set = 0, binding = 1)          buffer SsmStateBuf { float data[]; } ssmState;
-layout(set = 0, binding = 2) readonly  buffer SsmNormBuf { float data[]; } ssmNorm;
-layout(set = 0, binding = 3) writeonly buffer OutputBuf  { float data[]; } outBuf;
-shared float sharedMem[128];
-float silu(float x) { return x / (1.0 + exp(-x)); }
-void main() {
-    uint n = gl_WorkGroupID.x;
-    uint d = gl_LocalInvocationID.x;
-    uint h = n / (N_V_HEADS / N_K_HEADS);   // repeat-interleave: v_head n -> k_head n/3
-    uint qkvIdx = n * HEAD_V_DIM + d;
-    float zVal = scratch.data[CONV_DIM + qkvIdx];
-    float beta = scratch.data[CONV_DIM + VALUE_DIM + n];
-    float gate = scratch.data[CONV_DIM + VALUE_DIM + N_V_HEADS + n];
-    uint qkIdx = h * HEAD_V_DIM + d;
-    float qConvVal = 0.0, kConvVal = 0.0;
-    if (qkIdx < KEY_DIM) {
-        qConvVal = scratch.data[qkIdx];
-        kConvVal = scratch.data[KEY_DIM + qkIdx];
-    }
-    float vConvVal = scratch.data[2u * KEY_DIM + qkvIdx];
-    sharedMem[d] = qConvVal * qConvVal;
-    barrier();
-    for (uint s = 64u; s > 0u; s >>= 1u) { if (d < s) sharedMem[d] += sharedMem[d + s]; barrier(); }
-    float sumSqQ = sharedMem[0]; barrier();
-    sharedMem[d] = kConvVal * kConvVal;
-    barrier();
-    for (uint s = 64u; s > 0u; s >>= 1u) { if (d < s) sharedMem[d] += sharedMem[d + s]; barrier(); }
-    float sumSqK = sharedMem[0]; barrier();
-    float qNorm = qConvVal / sqrt(sumSqQ + EPS);
-    float kNorm = kConvVal / sqrt(sumSqK + EPS);
-    uint stateBase = n * HEAD_V_DIM * HEAD_V_DIM;
-    float gExp = exp(gate);
-    for (uint i = d; i < HEAD_V_DIM; i += 128u) {
-        uint rowBase = stateBase + i * HEAD_V_DIM;
-        for (uint j = 0u; j < HEAD_V_DIM; j++) ssmState.data[rowBase + j] *= gExp;
-    }
-    barrier();
-    sharedMem[d] = kNorm; barrier();
-    float sk = 0.0;
-    for (uint i = 0u; i < HEAD_V_DIM; i++) sk += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
-    barrier();
-    float dVec = (vConvVal - sk) * beta;
-    sharedMem[d] = dVec; barrier();
-    uint rowBaseD = stateBase + d * HEAD_V_DIM;
-    for (uint j = 0u; j < HEAD_V_DIM; j++) ssmState.data[rowBaseD + j] += kNorm * sharedMem[j];
-    barrier();
-    sharedMem[d] = qNorm; barrier();
-    float oVal = 0.0;
-    for (uint i = 0u; i < HEAD_V_DIM; i++) oVal += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
-    oVal *= SCALE;
-    float zSilu = silu(zVal);
-    sharedMem[d] = oVal * oVal;
-    barrier();
-    for (uint s = 64u; s > 0u; s >>= 1u) { if (d < s) sharedMem[d] += sharedMem[d + s]; barrier(); }
-    float sumSq = sharedMem[0]; barrier();
-    float rmsInv = 1.0 / sqrt(sumSq / float(HEAD_V_DIM) + EPS);
-    float yVal = oVal * rmsInv * ssmNorm.data[qkvIdx] * zSilu;
-    outBuf.data[qkvIdx] = yVal;
-}
-";
-
-    private const string _inlineDeinterleaveQGate = @"
-#version 450
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0) readonly  buffer InBuf     { float data[]; } inBuf;
-layout(set = 0, binding = 1) writeonly buffer OutBuf    { float data[]; } outBuf;
-layout(set = 0, binding = 2) readonly  buffer ParamsBuf { uint sl; uint n_head; uint head_dim; } params;
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    uint full_stride = params.n_head * params.head_dim * 2u;
-    if (idx >= params.sl * full_stride) return;
-    uint t        = idx / full_stride;
-    uint tok_local = idx % full_stride;
-    uint half_stride = params.n_head * params.head_dim;
-    uint part  = tok_local / half_stride;
-    uint rem   = tok_local % half_stride;
-    uint h     = rem / params.head_dim;
-    uint d     = rem % params.head_dim;
-    uint in_local = h * (2u * params.head_dim) + part * params.head_dim + d;
-    outBuf.data[idx] = inBuf.data[t * full_stride + in_local];
-}
-";
 }

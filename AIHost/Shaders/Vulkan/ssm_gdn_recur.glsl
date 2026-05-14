@@ -56,10 +56,13 @@ void main() {
         for (uint j = 0u; j < HEAD_V_DIM; j++) ssmState.data[rowBase + j] *= gExp;
     }
     barrier();
+    // Correct matrix-vector product: S @ k (not S^T @ k).
+    // S[row][col] = stateBase + row * HEAD_V_DIM + col.
     sharedMem[d] = kNorm;
     barrier();
     float sk = 0.0;
-    for (uint i = 0u; i < HEAD_V_DIM; i++) sk += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
+    uint sdRowBase = stateBase + d * HEAD_V_DIM;
+    for (uint j = 0u; j < HEAD_V_DIM; j++) sk += ssmState.data[sdRowBase + j] * sharedMem[j];
     barrier();
     float dVec = (vConvVal - sk) * beta;
     sharedMem[d] = dVec;
@@ -70,7 +73,8 @@ void main() {
     sharedMem[d] = qNorm;
     barrier();
     float oVal = 0.0;
-    for (uint i = 0u; i < HEAD_V_DIM; i++) oVal += ssmState.data[stateBase + i * HEAD_V_DIM + d] * sharedMem[i];
+    uint soRowBase = stateBase + d * HEAD_V_DIM;
+    for (uint j = 0u; j < HEAD_V_DIM; j++) oVal += ssmState.data[soRowBase + j] * sharedMem[j];
     oVal *= SCALE;
     float zSilu = silu(zVal);
     sharedMem[d] = oVal * oVal;
@@ -82,6 +86,7 @@ void main() {
     float sumSq = sharedMem[0];
     barrier();
     float rmsInv = 1.0 / sqrt(sumSq / float(HEAD_V_DIM) + EPS);
-    float yVal = oVal * rmsInv * ssmNorm.data[qkvIdx] * zSilu;
+    // ssmNorm is [HEAD_V_DIM] = [128], applied per-head (d is the intra-head index).
+    float yVal = oVal * rmsInv * ssmNorm.data[d] * zSilu;
     outBuf.data[qkvIdx] = yVal;
 }

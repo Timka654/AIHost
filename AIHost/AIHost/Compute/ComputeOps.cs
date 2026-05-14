@@ -198,7 +198,7 @@ public class ComputeOps : IDisposable
                                                  BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("matmul_weights_t_f32", ComputeShaders.MatMulWeightsTF32);
+        var kernel = GetOrCreateKernel("matmul_weights_t_f32", () => ComputeShaders.MatMulWeightsTF32);
         kernel.SetArgument(0, a.Buffer);
         kernel.SetArgument(1, b.Buffer);
         kernel.SetArgument(2, result.Buffer);
@@ -294,7 +294,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("matmul_weights_f32", ComputeShaders.MatMulWeightsF32);
+        var kernel = GetOrCreateKernel("matmul_weights_f32", () => ComputeShaders.MatMulWeightsF32);
         kernel.SetArgument(0, a.Buffer);
         kernel.SetArgument(1, b.Buffer);
         kernel.SetArgument(2, result.Buffer);
@@ -335,7 +335,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("matmul_f32", ComputeShaders.MatMulF32);
+        var kernel = GetOrCreateKernel("matmul_f32", () => ComputeShaders.MatMulF32);
         kernel.SetArgument(0, a.Buffer);
         kernel.SetArgument(1, b.Buffer);
         kernel.SetArgument(2, result.Buffer);
@@ -372,7 +372,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("elemwise_mul", ComputeShaders.ElementWiseMul);
+        var kernel = GetOrCreateKernel("elemwise_mul", () => ComputeShaders.ElementWiseMul);
         kernel.SetArgument(0, a.Buffer);
         kernel.SetArgument(1, b.Buffer);
         kernel.SetArgument(2, result.Buffer);
@@ -401,7 +401,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("elemwise_add", ComputeShaders.ElementWiseAdd);
+        var kernel = GetOrCreateKernel("elemwise_add", () => ComputeShaders.ElementWiseAdd);
         kernel.SetArgument(0, a.Buffer);
         kernel.SetArgument(1, b.Buffer);
         kernel.SetArgument(2, result.Buffer);
@@ -442,7 +442,7 @@ public class ComputeOps : IDisposable
             var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
             paramsBuffer.Write(paramsData);
 
-            var kernel = GetOrCreateKernel("concat_axis0", ComputeShaders.ConcatAxis0);
+            var kernel = GetOrCreateKernel("concat_axis0", () => ComputeShaders.ConcatAxis0);
             kernel.SetArgument(0, a.Buffer);
             kernel.SetArgument(1, b.Buffer);
             kernel.SetArgument(2, result.Buffer);
@@ -472,7 +472,7 @@ public class ComputeOps : IDisposable
             var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
             paramsBuffer.Write(paramsData);
 
-            var kernel = GetOrCreateKernel("concat_axis1", ComputeShaders.ConcatAxis1);
+            var kernel = GetOrCreateKernel("concat_axis1", () => ComputeShaders.ConcatAxis1);
             kernel.SetArgument(0, a.Buffer);
             kernel.SetArgument(1, b.Buffer);
             kernel.SetArgument(2, result.Buffer);
@@ -500,7 +500,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("silu", ComputeShaders.SiLU);
+        var kernel = GetOrCreateKernel("silu", () => ComputeShaders.SiLU);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -520,7 +520,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("sigmoid", ComputeShaders.Sigmoid);
+        var kernel = GetOrCreateKernel("sigmoid", () => ComputeShaders.Sigmoid);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -553,7 +553,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(eps).CopyTo(paramBytes, 8);
         paramsBuffer.Write(paramBytes);
 
-        var kernel = GetOrCreateKernel("layer_norm", ComputeShaders.LayerNorm);
+        var kernel = GetOrCreateKernel("layer_norm", () => ComputeShaders.LayerNorm);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, weight.Buffer);
         kernel.SetArgument(2, paramsBuffer);
@@ -580,7 +580,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         BitConverter.GetBytes(eps).CopyTo(paramBytes, 8);
         paramsBuffer.Write(paramBytes);
-        var kernel = GetOrCreateKernel("layer_norm", ComputeShaders.LayerNorm);
+        var kernel = GetOrCreateKernel("layer_norm", () => ComputeShaders.LayerNorm);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, weight.Buffer);
         kernel.SetArgument(2, paramsBuffer);
@@ -598,7 +598,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("softmax", ComputeShaders.Softmax);
+        var kernel = GetOrCreateKernel("softmax", () => ComputeShaders.Softmax);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -631,7 +631,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer(16, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsBytes);
 
-        var kernel = GetOrCreateKernel("rope", ComputeShaders.RoPE);
+        var kernel = GetOrCreateKernel("rope", () => ComputeShaders.RoPE);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -657,7 +657,7 @@ public class ComputeOps : IDisposable
 
         var result = Tensor.Create(_device, quantized.Shape, DataType.F32, resultName);
 
-        var kernel = GetOrCreateKernel("dequant_q2k", ComputeShaders.DequantizeQ2K);
+        var kernel = GetOrCreateKernel("dequant_q2k", () => ComputeShaders.DequantizeQ2K);
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
@@ -685,7 +685,7 @@ public class ComputeOps : IDisposable
 
         var result = Tensor.Create(_device, quantized.Shape, DataType.F32, resultName);
 
-        var kernel = GetOrCreateKernel("dequant_q3k", ComputeShaders.DequantizeQ3K);
+        var kernel = GetOrCreateKernel("dequant_q3k", () => ComputeShaders.DequantizeQ3K);
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
@@ -710,7 +710,7 @@ public class ComputeOps : IDisposable
 
         var result = Tensor.Create(_device, quantized.Shape, DataType.F32, resultName);
 
-        var kernel = GetOrCreateKernel("dequant_q4k", ComputeShaders.DequantizeQ4K);
+        var kernel = GetOrCreateKernel("dequant_q4k", () => ComputeShaders.DequantizeQ4K);
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
@@ -735,7 +735,7 @@ public class ComputeOps : IDisposable
 
         var result = Tensor.Create(_device, quantized.Shape, DataType.F32, resultName);
 
-        var kernel = GetOrCreateKernel("dequant_q5k", ComputeShaders.DequantizeQ5K);
+        var kernel = GetOrCreateKernel("dequant_q5k", () => ComputeShaders.DequantizeQ5K);
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
@@ -760,7 +760,7 @@ public class ComputeOps : IDisposable
 
         var result = Tensor.Create(_device, quantized.Shape, DataType.F32, resultName);
 
-        var kernel = GetOrCreateKernel("dequant_q6k", ComputeShaders.DequantizeQ6K);
+        var kernel = GetOrCreateKernel("dequant_q6k", () => ComputeShaders.DequantizeQ6K);
         kernel.SetArgument(0, quantized.Buffer);
         kernel.SetArgument(1, result.Buffer);
 
@@ -822,7 +822,7 @@ public class ComputeOps : IDisposable
             _ => throw new NotSupportedException($"DequantizeInto not supported for {quantized.DataType}")
         };
 
-        string shaderSource = quantized.DataType switch
+        var kernel = GetOrCreateKernel(kernelName, ()=> quantized.DataType switch
         {
             DataType.Q2_K => ComputeShaders.DequantizeQ2K,
             DataType.Q3_K => ComputeShaders.DequantizeQ3K,
@@ -830,9 +830,7 @@ public class ComputeOps : IDisposable
             DataType.Q5_K => ComputeShaders.DequantizeQ5K,
             DataType.Q6_K => ComputeShaders.DequantizeQ6K,
             _ => throw new NotSupportedException()
-        };
-
-        var kernel = GetOrCreateKernel(kernelName, shaderSource);
+        });
 
         uint totalElements = (uint)quantized.Shape.TotalElements;
         uint totalGroups = (totalElements + 255) / 256;
@@ -938,7 +936,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("transpose", ComputeShaders.Transpose);
+        var kernel = GetOrCreateKernel("transpose", () => ComputeShaders.Transpose);
         kernel.SetArgument(0, input.Buffer);
         kernel.SetArgument(1, result.Buffer);
         kernel.SetArgument(2, paramsBuffer);
@@ -966,7 +964,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("rowwise_softmax", ComputeShaders.RowwiseSoftmax);
+        var kernel = GetOrCreateKernel("rowwise_softmax", () => ComputeShaders.RowwiseSoftmax);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -989,7 +987,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsBytes);
 
-        var kernel = GetOrCreateKernel("scale", ComputeShaders.Scale);
+        var kernel = GetOrCreateKernel("scale", () => ComputeShaders.Scale);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -1021,7 +1019,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)ropeDim).CopyTo(p, 20);
         paramsBuffer.Write(p);
 
-        var kernel = GetOrCreateKernel("rope_full", ComputeShaders.RoPEFull);
+        var kernel = GetOrCreateKernel("rope_full", () => ComputeShaders.RoPEFull);
         kernel.SetArgument(0, tensor.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -1049,7 +1047,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(startPosition).CopyTo(p, 8);
         paramsBuffer.Write(p);
 
-        var kernel = GetOrCreateKernel("causal_mask", ComputeShaders.CausalMask);
+        var kernel = GetOrCreateKernel("causal_mask", () => ComputeShaders.CausalMask);
         kernel.SetArgument(0, scores.Buffer);
         kernel.SetArgument(1, paramsBuffer);
 
@@ -1081,7 +1079,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(scale).CopyTo(p, 16);
         paramsBuffer.Write(p);
 
-        var kernel = GetOrCreateKernel("fused_mha_generate", ComputeShaders.FusedMHAGenerate);
+        var kernel = GetOrCreateKernel("fused_mha_generate", () => ComputeShaders.FusedMHAGenerate);
         kernel.SetArgument(0, Q.Buffer);
         kernel.SetArgument(1, K.Buffer);
         kernel.SetArgument(2, V.Buffer);
@@ -1166,7 +1164,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)rows).CopyTo(p, 0); BitConverter.GetBytes((uint)srcCols).CopyTo(p, 4);
         BitConverter.GetBytes((uint)colStart).CopyTo(p, 8); BitConverter.GetBytes((uint)colCount).CopyTo(p, 12);
         paramsBuffer.Write(p);
-        var kernel = GetOrCreateKernel("slice_cols", ComputeShaders.SliceCols);
+        var kernel = GetOrCreateKernel("slice_cols", () => ComputeShaders.SliceCols);
         kernel.SetArgument(0, input.Buffer); kernel.SetArgument(1, result.Buffer); kernel.SetArgument(2, paramsBuffer);
         _queue.Dispatch(kernel, new[] { ((uint)(rows * colCount) + 255u) / 256u }, null);
         MaybeFlush(); Defer(paramsBuffer);
@@ -1188,7 +1186,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(nHead).CopyTo(p, 4);
         BitConverter.GetBytes(headDim).CopyTo(p, 8);
         paramsBuffer.Write(p);
-        var kernel = GetOrCreateKernel("deinterleave_q_gate", ComputeShaders.DeinterleaveQGate);
+        var kernel = GetOrCreateKernel("deinterleave_q_gate", () => ComputeShaders.DeinterleaveQGate);
         kernel.SetArgument(0, input.Buffer);
         kernel.SetArgument(1, result.Buffer);
         kernel.SetArgument(2, paramsBuffer);
@@ -1207,7 +1205,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)rows).CopyTo(p, 0); BitConverter.GetBytes((uint)dstCols).CopyTo(p, 4);
         BitConverter.GetBytes((uint)colStart).CopyTo(p, 8); BitConverter.GetBytes((uint)colCount).CopyTo(p, 12);
         paramsBuffer.Write(p);
-        var kernel = GetOrCreateKernel("scatter_cols", ComputeShaders.ScatterCols);
+        var kernel = GetOrCreateKernel("scatter_cols", () => ComputeShaders.ScatterCols);
         kernel.SetArgument(0, src.Buffer); kernel.SetArgument(1, dst.Buffer); kernel.SetArgument(2, paramsBuffer);
         _queue.Dispatch(kernel, new[] { ((uint)(rows * colCount) + 255u) / 256u }, null);
         MaybeFlush(); Defer(paramsBuffer);
@@ -1238,7 +1236,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)repeatFactor).CopyTo(p, 12);
         paramsBuffer.Write(p);
 
-        var kernel = GetOrCreateKernel("repeat_kv_heads", ComputeShaders.RepeatKVHeads);
+        var kernel = GetOrCreateKernel("repeat_kv_heads", () => ComputeShaders.RepeatKVHeads);
         kernel.SetArgument(0, input.Buffer);
         kernel.SetArgument(1, result.Buffer);
         kernel.SetArgument(2, paramsBuffer);
@@ -1274,7 +1272,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)repeatFactor).CopyTo(p, 8);
         paramsBuffer.Write(p);
 
-        var kernel = GetOrCreateKernel("repeat_columns", ComputeShaders.RepeatColumns);
+        var kernel = GetOrCreateKernel("repeat_columns", () => ComputeShaders.RepeatColumns);
         kernel.SetArgument(0, input.Buffer);
         kernel.SetArgument(1, result.Buffer);
         kernel.SetArgument(2, paramsBuffer);
@@ -1437,12 +1435,12 @@ public class ComputeOps : IDisposable
 
     #region Kernel Management
 
-    private IComputeKernel GetOrCreateKernel(string name, string source)
+    private IComputeKernel GetOrCreateKernel(string name, Func<string> source)
     {
         if (_kernelCache.TryGetValue(name, out var cached))
             return cached;
 
-        var kernel = _device.CreateKernel(source, "main");
+        var kernel = _device.CreateKernel(source(), "main");
         kernel.Compile();
         _kernelCache[name] = kernel;
         
@@ -1869,7 +1867,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer((ulong)(paramsData.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("embedding_lookup", ComputeShaders.EmbeddingLookup);
+        var kernel = GetOrCreateKernel("embedding_lookup", () => ComputeShaders.EmbeddingLookup);
         kernel.SetArgument(0, tokenBuf);
         kernel.SetArgument(1, table.Buffer);
         kernel.SetArgument(2, result.Buffer);
@@ -1934,7 +1932,7 @@ public class ComputeOps : IDisposable
         uint headDim = 256)
     {
         // ── Part 1: conv1d ───────────────────────────────────────────────────
-        var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", ComputeShaders.SsmGdnDecode);
+        var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", () => ComputeShaders.SsmGdnDecode);
         kernelDecode.SetArgument(0, xNorm.Buffer);
         kernelDecode.SetArgument(1, convW.Buffer);
         kernelDecode.SetArgument(2, convState.Buffer);
@@ -1959,7 +1957,7 @@ public class ComputeOps : IDisposable
         _queue.InsertMemoryBarrier();
 
         // ── Part 2: recurrence ───────────────────────────────────────────────
-        var kernelRecur = GetOrCreateKernel("ssm_gdn_recur", ComputeShaders.SsmGdnRecur);
+        var kernelRecur = GetOrCreateKernel("ssm_gdn_recur", () => ComputeShaders.SsmGdnRecur);
         kernelRecur.SetArgument(0, scratch.Buffer);
         kernelRecur.SetArgument(1, ssmState.Buffer);
         kernelRecur.SetArgument(2, ssmNorm.Buffer);
@@ -1996,7 +1994,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramsData);
 
-        var kernel = GetOrCreateKernel("copy", ComputeShaders.Copy);
+        var kernel = GetOrCreateKernel("copy", () => ComputeShaders.Copy);
         kernel.SetArgument(0, input.Buffer);
         kernel.SetArgument(1, result.Buffer);
         kernel.SetArgument(2, paramsBuffer);

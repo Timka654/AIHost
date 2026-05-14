@@ -230,7 +230,7 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         }
 
         throw new InvalidOperationException(
-            "No GLSL compiler available. Install libshaderc-dev, glslang-tools, or vulkan-tools.");
+            "Cannot find GLSL compiler for correct compilation. If warnings do not exist - check for install libshaderc-dev, glslang-tools, or vulkan-tools.");
     }
 
     private static byte[] CompileWithGlslangCli(string glslSource, string exe, string entryPoint)
@@ -253,7 +253,9 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
             // Read both streams BEFORE WaitForExit to avoid deadlocks
             var stdout = proc.StandardOutput.ReadToEnd();
             var stderr = proc.StandardError.ReadToEnd();
+
             proc.WaitForExit(30_000);
+
             if (proc.ExitCode != 0)
             {
                 string detail = !string.IsNullOrWhiteSpace(stderr) ? stderr
@@ -261,6 +263,7 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
                     : "(no output)";
                 throw new InvalidOperationException($"{exe}: {detail}");
             }
+
             return File.ReadAllBytes(spvFile);
         }
         finally

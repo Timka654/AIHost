@@ -1,3 +1,4 @@
+using Silk.NET.Vulkan;
 using System.Reflection;
 
 namespace AIHost.Compute;
@@ -13,6 +14,12 @@ public static class ShaderLoader
         "Shaders"
     );
 
+    static readonly Dictionary<string, string> _extensions = new()
+    {
+        { "vulkan", ".glsl" },
+        { "rocm", ".hip" }
+    };
+
     /// <summary>
     /// Load shader source code for specified provider
     /// </summary>
@@ -22,30 +29,34 @@ public static class ShaderLoader
     public static string Load(string provider, string shaderName)
     {
         string key = $"{provider}/{shaderName}";
-        
+
         if (_cache.TryGetValue(key, out string? cached))
             return cached;
 
-        string[] extensions = provider.ToLower() switch
-        {
-            "vulkan" => new[] { ".glsl", ".comp" },
-            "rocm" => new[] { ".hip", ".cu" },
-            _ => new[] { ".glsl" }
-        };
+        string path = CombinePath(provider, shaderName);
 
-        foreach (var ext in extensions)
+        if (File.Exists(path))
         {
-            string path = Path.Combine(_shaderBasePath, provider, shaderName + ext);
-            
-            if (File.Exists(path))
-            {
-                string source = File.ReadAllText(path);
-                _cache[key] = source;
-                return source;
-            }
+            string source = File.ReadAllText(path);
+            _cache[key] = source;
+            return source;
         }
 
         throw new FileNotFoundException($"Shader not found: {provider}/{shaderName}");
+    }
+
+    private static string GetExtension(string provider)
+    {
+        if (_extensions.TryGetValue(provider.ToLower(), out string? ext))
+            return ext;
+
+        throw new InvalidOperationException($"Not found extension for provider '{provider}'");
+    }
+
+    private static string CombinePath(string provider, string shaderName)
+    {
+        string ext = GetExtension(provider);
+        return Path.Combine(_shaderBasePath, provider, shaderName + ext);
     }
 
     /// <summary>
@@ -53,15 +64,8 @@ public static class ShaderLoader
     /// </summary>
     public static bool Exists(string provider, string shaderName)
     {
-        try
-        {
-            Load(provider, shaderName);
-            return true;
-        }
-        catch (FileNotFoundException)
-        {
-            return false;
-        }
+        string path = CombinePath(provider, shaderName);
+        return File.Exists(path);
     }
 
     /// <summary>
@@ -78,7 +82,7 @@ public static class ShaderLoader
     public static string[] GetAvailableShaders(string provider)
     {
         string providerPath = Path.Combine(_shaderBasePath, provider);
-        
+
         if (!Directory.Exists(providerPath))
             return Array.Empty<string>();
 
