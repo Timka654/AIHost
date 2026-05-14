@@ -260,8 +260,27 @@ public class ComputeOps : IDisposable
             // Dequantize and matmul
             var chunkF32    = Dequantize(chunkTensor);
             chunkTensor.Dispose();
-            var partialLogits = MatMulWeights(a, chunkF32, "partial_logits");
+            // FIX: Dequantize produces row-major F32, NOT column-major (GGUF).
+            // Must use MatMul (row-major), not MatMulWeights (expects column-major GGUF layout).
+            var partialLogits = MatMul(a, chunkF32, "partial_logits");
             chunkF32.Dispose();
+
+            // DIAG: verify first chunk produces reasonable logits
+            if (c == 0)
+            {
+                try
+                {
+                    int checkN = Math.Min(actual, 16);
+                    var firstChunkVals = partialLogits.Buffer.ReadRange<float>(0, checkN);
+                    float maxV = firstChunkVals.Max();
+                    float minV = firstChunkVals.Min();
+                    int maxIdx = Array.IndexOf(firstChunkVals, maxV);
+                    // Use Console.Write so it appears in docker logs
+                    Console.WriteLine($"[DIAG_CHUNK0] actual={actual} range=[{minV:F3},{maxV:F3}] maxIdx={maxIdx} vals=[{string.Join(",", firstChunkVals.Take(8).Select(v=>v.ToString("F3")))}]");
+                    Console.Out.Flush();
+                }
+                catch { }
+            }
 
             // Scatter partial [M, actual] into result [M, N] at column offset `start`
             ScatterCols(result, partialLogits, start);

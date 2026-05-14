@@ -212,9 +212,21 @@ public class TransformerBase : IDisposable
         _ops.LayerNorm(x, normF32);
         if (!normScratch) normF32.Dispose();
 
+        // DIAG: post-norm hidden state (first 16 values)
+        try
+        {
+            var postNorm = x.Buffer.ReadRange<float>(0, 16);
+            float rms = MathF.Sqrt(postNorm.Sum(v => v * v) / 16);
+            _logger.LogWarning("[DIAG_HEAD] Post-norm rms={Rms:F4} vals=[{Vals}]",
+                rms, string.Join(",", postNorm.Select(v => v.ToString("F4"))));
+        }
+        catch { }
+
         // Use chunked matmul if output.weight would need >1 GB F32 (large-vocab models).
         var outWeightCached = _weightCache[_nameMapper.OutputWeight];
         long outF32Bytes = (long)outWeightCached.Shape.TotalElements * sizeof(float);
+        _logger.LogWarning("[DIAG_HEAD] outWeight shape=[{D0},{D1}] dtype={DT} f32Bytes={Bytes}",
+            outWeightCached.Shape[0], outWeightCached.Shape[1], outWeightCached.DataType, outF32Bytes);
         if (outF32Bytes > 1L * 1024 * 1024 * 1024)
         {
             var chunkedLogits = _ops.MatMulWeightsLarge(x, outWeightCached, "logits");
@@ -275,6 +287,19 @@ public class TransformerBase : IDisposable
         }
         _logger.LogInformation("[FWD] Layer loop done");
         DiagHidden("before_head", x, diagEnabled);
+
+        // Unconditional DIAG: dump final hidden state (first 32 values) before lm_head
+        {
+            try
+            {
+                int take = Math.Min(x.Shape[1], 32);
+                var v = x.Buffer.ReadRange<float>(0, take);
+                float rms = MathF.Sqrt(v.Sum(val => val * val) / take);
+                _logger.LogWarning("[DIAG_FINAL_HIDDEN] rms={Rms:F4} vals=[{Vals}]",
+                    rms, string.Join(",", v.Select(f => f.ToString("F4"))));
+            }
+            catch (Exception diagEx) { _logger.LogWarning("[DIAG_FINAL_HIDDEN] err={Err}", diagEx.Message); }
+        }
 
         // 3. Final layer norm + vocab projection
         //    Delegates to ForwardHead which has chunked MatMulWeightsLarge path

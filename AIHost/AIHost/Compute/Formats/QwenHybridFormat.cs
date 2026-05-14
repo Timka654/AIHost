@@ -130,39 +130,39 @@ public class QwenHybridFormat : ITransformerFormat
         if (!qW.isScratch) o.DeferExternal(qW.tensor); if (!kW.isScratch) o.DeferExternal(kW.tensor); if (!vW.isScratch) o.DeferExternal(vW.tensor);
         if (b) o.DeferExternal(xn); else xn.Dispose();
         int kd = K.Shape[1], qtd = rq.Shape[1], hd = t._headDim;
-        // Per-head QK-norm: norm weight is [head_k_dim=128] (ssm_d_state), NOT t._headDim (256).
-        // Qwen3.5 attn_q.weight output is 48×(128Q+128gate)=12288;  attn_output.weight is [6144,5120].
-        // FIX: Determine real Q/K head dimension from norm weight size; use it for gate detection,
-        // deinterleave, RoPE, and MHA.  t._headDim is 256 (attention.key_length) but actual
-        // per-head dimension after QK-norm is 128.
+        // Per-head QK-norm: norm weight dimension = actual head dim (128 for Qwen3.5, 256 for Qwen3.6).
         int qknDim = t.HasWeight($"blk.{g}.attn_q_norm.weight")
             ? t._weightCache[$"blk.{g}.attn_q_norm.weight"].Shape[0] : hd;
         int kknDim = t.HasWeight($"blk.{g}.attn_k_norm.weight")
             ? t._weightCache[$"blk.{g}.attn_k_norm.weight"].Shape[0] : hd;
-        int totalHeads = qtd / (qknDim * 2);  // 12288 / 256 = 48 heads, each head 256 = 128(Q)+128(gate)
-        int qd = totalHeads * qknDim;           // 48 * 128 = 6144 = pure Q part
-        // Only log during decode (sl==1): in non-batch mode every MaybeFlush() does a full GPU sync,
-        // so ReadRange after each op sees correct values. In prefill batch mode the command buffer
-        // is not yet submitted when Row0 is called — reads would return stale GPU memory.
+        int totalHeads = t._numHeads;   // always 48 for Qwen3.5/3.6
+        // Gate detection: per-head Q output = qtd / totalHeads.
+        // Qwen3.5: per-head = 12288/48 = 256 = qknDim*2 → fused Q(128)+gate(128)
+        // Qwen3.6: per-head = 12288/48 = 256 = qknDim    → Q only, no gate
+        // Qwen3Next: detachable gate via attn_gate.weight.
+        bool fusedGate = (qtd / totalHeads) == qknDim * 2;
+        bool detachableGate = t.HasWeight($"blk.{g}.attn_gate.weight");
+        bool ig = fusedGate || detachableGate;
+        int qd = totalHeads * qknDim;  // pure Q part: 48*128=6144 (Qwen3.5), 48*256=12288 (Qwen3.6, no gate)
+        // Only log during decode (sl==1): in non-batch mode every MaybeFlush() does a full GPU sync.
         bool dbg = sl == 1 && QwenDbgTrace.Once("TypeB", g);
-        if (dbg) QwenDbgTrace.Row0($"rq_raw_g{g}", rq, 16); // interleaved layout visible here
-        // Gate detection: Qwen3.5 Q weight has 2× output per head — Q(128) + gate(128) interleaved.
-        // attn_q.weight output layout: [Q_h0(128), gate_h0(128), Q_h1(128), gate_h1(128), ...]
-        // Qwen3Next: detachable gate via attn_gate.weight (qtd == 2*qd where qd = output_weight.Shape[0]).
-        bool ig = t.HasWeight($"blk.{g}.attn_gate.weight") && qtd == 2 * qd;
-        if (!ig && qtd > qd) ig = true; // Qwen3.5: fused gate without separate weight
+        if (dbg) QwenDbgTrace.Row0($"rq_raw_g{g}", rq, 16);
         Tensor gq; Tensor? attnOutGate = null; int nqh;
         if (ig) {
-            // De-interleave using real Q head dim (qknDim=128): 48 heads × (128 Q + 128 gate) stride
             var rqDi = o.DeinterleaveQGate(rq, (uint)totalHeads, (uint)qknDim, "rqDiB");
-            if (dbg) QwenDbgTrace.Row0($"rqDi_g{g}", rqDi, 16); // should be de-interleaved
+            if (dbg) QwenDbgTrace.Row0($"rqDi_g{g}", rqDi, 16);
             if (b) o.DeferExternal(rq); else rq.Dispose();
-            gq = o.SliceCols(rqDi, 0, qd, "qpB");          // pure Q: 48×128 = 6144
-            attnOutGate = o.SliceCols(rqDi, qd, qd, "qgB"); // gate: 48×128 = 6144
-            if (dbg) { QwenDbgTrace.Row0($"Q_g{g}", gq, 8); QwenDbgTrace.Row0($"gate_g{g}", attnOutGate, 8); }
+            gq = o.SliceCols(rqDi, 0, qd, "qpB");
+            attnOutGate = o.SliceCols(rqDi, qd, qd, "qgB");
+            if (dbg) {
+                QwenDbgTrace.Row0($"Q_g{g}", gq, 8);
+                QwenDbgTrace.Slice($"Q_g{g}_mid", gq, 128, 8);
+                QwenDbgTrace.Row0($"gate_g{g}", attnOutGate, 8);
+                QwenDbgTrace.Msg($"[DIAG Deinterleave g={g}] qknDim={qknDim} fusedGate={fusedGate} detachableGate={detachableGate} totalHeads={totalHeads} qd={qd}");
+            }
             if (b) o.DeferExternal(rqDi); else rqDi.Dispose();
             nqh = totalHeads;
-        } else { gq = rq; nqh = qtd / hd; }
+        } else { gq = rq; nqh = totalHeads; }
         if (t.HasWeight($"blk.{g}.attn_q_norm.weight"))
         {
             var (qnW, qnS) = t.TempF32Named($"blk.{g}.attn_q_norm.weight");
@@ -227,6 +227,8 @@ public class QwenHybridFormat : ITransformerFormat
         var (wQKV, _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
 
         // ── z-projection ──────────────────────────────────────────────
+        // Qwen3.5: ssm_gate.weight   Qwen3.6: attn_gate.weight (renamed, same dims)
+        // Both are [5120, 6144] = d_model × (NVH*HVD).  Dimensionally verified.
         string wzName = "";
         foreach (var c in new[] { "ssm_gate.weight","ssm_z.weight","ssm_in.weight",
             "ssm_in_proj.weight","ssm_a_proj.weight","attn_gate.weight" })
@@ -234,11 +236,7 @@ public class QwenHybridFormat : ITransformerFormat
         if (wzName == "")
         {
             var known = new[] { "ssm_gate.weight","ssm_z.weight","ssm_in.weight",
-                "ssm_in_proj.weight","ssm_a_proj.weight","ssm_alpha.weight","ssm_beta.weight",
-                "ssm_conv1d.weight","ssm_dt.bias","ssm_norm.weight","ssm_out.weight","ssm_a",
-                "attn_qkv.weight","attn_norm.weight","attn_gate.weight","attn_output.weight",
-                "attn_q.weight","ffn_gate.weight","ffn_up.weight","ffn_down.weight",
-                "ffn_norm.weight","post_attention_norm.weight" };
+                "ssm_in_proj.weight","ssm_a_proj.weight","attn_gate.weight" };
             var found = known.Where(k => t.HasWeight($"blk.{g}.{k}")).ToList();
             throw new InvalidOperationException(
                 $"Layer {g}: no SSM z-projection weight. Available: [{string.Join(", ", found)}]");
