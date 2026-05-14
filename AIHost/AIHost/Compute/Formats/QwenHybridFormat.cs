@@ -15,11 +15,16 @@ public class QwenHybridFormat : ITransformerFormat
     {
         var _ts = GlobalProfiler.Start();
         int g = t.GlobalLayer(li); var nm = t._nameMapper!;
-        bool hc = t.HasWeight($"blk.{g}.attn_qkv.weight"), hs = t.HasWeight($"blk.{g}.attn_q.weight");
+        // Qwen3.5: attn_qkv.weight exists on ALL 64 layers (SSM + attention).
+        // Discriminate: SSM layers have ssm_conv1d.weight; attention layers have attn_output.weight.
+        bool hasQkv = t.HasWeight($"blk.{g}.attn_qkv.weight");
+        bool hasQ   = t.HasWeight($"blk.{g}.attn_q.weight");
+        bool isSsm  = t.HasWeight($"blk.{g}.ssm_conv1d.weight"); // only SSM layers
         Tensor result;
-        if (!hc && !hs) result = Fallback(t, x, g, nm);
-        else if (hs) result = TypeB(t, x, g, li, pos, kvc, nm);
-        else result = TypeA(t, x, g, li, pos, kvc, nm, ss);
+        if (!hasQkv && !hasQ) result = Fallback(t, x, g, nm);
+        else if (hasQ)        result = TypeB(t, x, g, li, pos, kvc, nm);
+        else if (isSsm)       result = TypeA(t, x, g, li, pos, kvc, nm, ss);
+        else                  result = TypeB(t, x, g, li, pos, kvc, nm); // attention layer w/ attn_qkv
         GlobalProfiler.End(_ts, "Qwen.ApplyLayer");
         return result;
     }
