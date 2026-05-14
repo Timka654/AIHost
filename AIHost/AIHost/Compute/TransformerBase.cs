@@ -29,6 +29,7 @@ public class TransformerBase : IDisposable
     /// </summary>
     protected internal readonly int _ropeDimCount;
     protected bool _disposed;
+    private bool _hiddenDiagFired;
     protected internal readonly ILogger<TransformerBase> _logger = AppLogger.Create<TransformerBase>();
 
     /// <summary>Max context length from GGUF metadata (0 = unknown).</summary>
@@ -222,6 +223,12 @@ public class TransformerBase : IDisposable
         Tensor x = EmbeddingLookupOptimized(tokenIds);
         _logger.LogInformation("[FWD] EmbeddingLookup OK shape=[{D0},{D1}]", x.Shape[0], x.Shape[1]);
 
+        // Diagnostic: log last-token hidden state at key checkpoints (decode only, first call)
+        bool diagEnabled = tokenIds.Length == 1 && !_hiddenDiagFired;
+        if (diagEnabled) _hiddenDiagFired = true;
+
+        DiagHidden("embed", x, diagEnabled);
+
         // 2. All transformer layers
         _logger.LogInformation("[FWD] Entering layer loop ({Count} layers)", _numLayers);
         for (int i = 0; i < _numLayers; i++)
@@ -237,13 +244,32 @@ public class TransformerBase : IDisposable
                 throw;
             }
             _logger.LogInformation("[FWD] Layer {Layer} OK", i);
+            if (i == 0) DiagHidden("after_layer0", x, diagEnabled);
+            if (i == 3) DiagHidden("after_layer3", x, diagEnabled);
+            if (i == 15) DiagHidden("after_layer15", x, diagEnabled);
+            if (i == 31) DiagHidden("after_layer31", x, diagEnabled);
         }
         _logger.LogInformation("[FWD] Layer loop done");
+        DiagHidden("before_head", x, diagEnabled);
 
         // 3. Final layer norm + vocab projection
         //    Delegates to ForwardHead which has chunked MatMulWeightsLarge path
         //    for large-vocab models (Qwen 248K, etc.).
         return ForwardHead(x);
+    }
+
+    private void DiagHidden(string tag, Tensor t, bool enabled)
+    {
+        if (!enabled) return;
+        try
+        {
+            int cols = t.Shape.Rank >= 2 ? t.Shape[1] : t.Shape[0];
+            var row = t.Buffer.ReadRange<float>(0, Math.Min(cols, 16));
+            float rms = MathF.Sqrt(row.Sum(v => v * v) / row.Length);
+            _logger.LogWarning("[DIAG_HIDDEN {Tag}] rms={Rms:F4} first8=[{V}]",
+                tag, rms, string.Join(",", row.Take(8).Select(v => v.ToString("F3"))));
+        }
+        catch { /* ignore */ }
     }
 
     // ── Protected helpers for formats ─────────────────────────────────────────
