@@ -50,14 +50,14 @@ void main() {
     float qNorm = qConvVal / sqrt(sumSqQ + EPS);
     float kNorm = kConvVal / sqrt(sumSqK + EPS);
     uint stateBase = n * HEAD_V_DIM * HEAD_V_DIM;
+    // Step 1: decay state S *= gExp.
     float gExp = exp(gate);
     for (uint i = d; i < HEAD_V_DIM; i += 128u) {
         uint rowBase = stateBase + i * HEAD_V_DIM;
         for (uint j = 0u; j < HEAD_V_DIM; j++) ssmState.data[rowBase + j] *= gExp;
     }
     barrier();
-    // Correct matrix-vector product: S @ k (not S^T @ k).
-    // S[row][col] = stateBase + row * HEAD_V_DIM + col.
+    // Step 2: compute sk = S_decayed @ k  (row d × cols j).
     sharedMem[d] = kNorm;
     barrier();
     float sk = 0.0;
