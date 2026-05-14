@@ -6,8 +6,10 @@ namespace AIHost.Compute;
 /// <summary>
 /// Lazy loader for shader source code from embedded files
 /// </summary>
-public static class ShaderLoader
+public class ShaderLoader
 {
+    private static readonly ILogger _logger = AppLogger.Create<ShaderLoader>();
+
     private static readonly Dictionary<string, string> _cache = new();
     private static readonly string _shaderBasePath = Path.Combine(
         Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "",
@@ -28,44 +30,42 @@ public static class ShaderLoader
     /// <returns>Shader source code</returns>
     public static string Load(string provider, string shaderName)
     {
-        string key = $"{provider}/{shaderName}";
-
-        if (_cache.TryGetValue(key, out string? cached))
+        if (_cache.TryGetValue(shaderName, out string? cached))
             return cached;
 
-        string path = CombinePath(provider, shaderName);
+        string[] pathes = CombinePath(provider, shaderName);
 
-        if (File.Exists(path))
+        foreach (string path in pathes)
         {
-            string source = File.ReadAllText(path);
-            _cache[key] = source;
-            return source;
+            _logger.LogInformation($"Try loading shader \"{path}\" for {provider}.{shaderName}");
+
+            if (File.Exists(path))
+            {
+                string source = File.ReadAllText(path);
+                _cache[shaderName] = source;
+            _logger.LogInformation($"Try loading shader - success for {provider}.{shaderName}");
+                return source;
+            }
         }
+
+        _logger.LogError($"Try loading shader - failed for {provider}.{shaderName}");
 
         throw new FileNotFoundException($"Shader not found: {provider}/{shaderName}");
     }
 
-    private static string GetExtension(string provider)
+    private static string[] CombinePath(string provider, string shaderName)
     {
-        if (_extensions.TryGetValue(provider.ToLower(), out string? ext))
-            return ext;
+        if (!_extensions.TryGetValue(provider.ToLower(), out string? ext))
+        {
+            _logger.LogError($"Try loading shader for {provider}.{shaderName} - unknown provider \"{provider}\"");
 
-        throw new InvalidOperationException($"Not found extension for provider '{provider}'");
-    }
+            throw new InvalidOperationException($"Not found extension for provider '{provider}'");
+        }
 
-    private static string CombinePath(string provider, string shaderName)
-    {
-        string ext = GetExtension(provider);
-        return Path.Combine(_shaderBasePath, provider, shaderName + ext);
-    }
+        var p1 = Path.Combine(_shaderBasePath, "override", provider);
+        var p2 = Path.Combine(_shaderBasePath, provider);
 
-    /// <summary>
-    /// Check if shader exists
-    /// </summary>
-    public static bool Exists(string provider, string shaderName)
-    {
-        string path = CombinePath(provider, shaderName);
-        return File.Exists(path);
+        return [Path.Combine(p1, shaderName + ext), Path.Combine(p2, shaderName + ext)];
     }
 
     /// <summary>
@@ -74,21 +74,5 @@ public static class ShaderLoader
     public static void ClearCache()
     {
         _cache.Clear();
-    }
-
-    /// <summary>
-    /// Get all available shaders for a provider
-    /// </summary>
-    public static string[] GetAvailableShaders(string provider)
-    {
-        string providerPath = Path.Combine(_shaderBasePath, provider);
-
-        if (!Directory.Exists(providerPath))
-            return Array.Empty<string>();
-
-        return Directory.GetFiles(providerPath)
-            .Select(Path.GetFileNameWithoutExtension)
-            .Where(name => !string.IsNullOrEmpty(name))
-            .ToArray()!;
     }
 }
