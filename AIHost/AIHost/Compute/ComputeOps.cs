@@ -1990,30 +1990,21 @@ public class ComputeOps : IDisposable
         // in batch mode (multiple tokens per GPU submit during prefill).
         _queue.InsertMemoryBarrier();
 
+        MaybeFlush();
+
         // ── Debug tracing for layers 0-2 ────────────────────────────────────
+        // MUST be AFTER MaybeFlush — GPU must finish before reading buffers.
         if (dbg && Formats.QwenDbgTrace.Once("ssm_phase", (int)debugLayer))
         {
             string p = $"L{debugLayer}";
-            // scratch layout:
-            //   [0..CD)           = qkv_conv (post-SiLU)
-            //   [CD..CD+VD)       = z
-            //   [CD+VD..CD+VD+NVH)= beta
-            //   [CD+VD+NVH..end)  = gate (alpha * ssA)
-            // state layout: [NVH][HVD][HVD] = [48*128*128] = 786432 floats
-            Formats.QwenDbgTrace.Slice($"{p}_qkvConv", scratch, 0, 8);
-            Formats.QwenDbgTrace.Slice($"{p}_qkvConv_end", scratch, (int)(ssmCD - 8), 8);
-            Formats.QwenDbgTrace.Slice($"{p}_z", scratch, (int)ssmCD, 8);
-            Formats.QwenDbgTrace.Slice($"{p}_beta", scratch, (int)(ssmCD + ssmVD), 6);
-            Formats.QwenDbgTrace.Slice($"{p}_gate", scratch, (int)(ssmCD + ssmVD + ssmNVH), 6);
-            // ssmState: first head [128*128] region, first 12 values
+            // scratch is arena-allocated and invalid after Flush → skip
+            // state: [NVH][HVD][HVD] = [48*128*128] = 786432 floats, first 12 values of head 0
             Formats.QwenDbgTrace.Slice($"{p}_state_h0", ssmState, 0, 12);
-            Formats.QwenDbgTrace.Slice($"{p}_state_h0_mid", ssmState, (int)(ssmHVD * ssmHVD / 2), 12);
-            // output: VD=6144, log first 8
+            // output: [VD=6144], log first 8 and middle 8
             Formats.QwenDbgTrace.Slice($"{p}_out", output, 0, 8);
             Formats.QwenDbgTrace.Slice($"{p}_out_mid", output, (int)(ssmVD / 2), 8);
         }
 
-        MaybeFlush();
         Defer(rowIndexBuf);
         Defer(ssmParams);
         Defer(ssmParams2);

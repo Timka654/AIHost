@@ -203,6 +203,11 @@ public class QwenHybridFormat : ITransformerFormat
         int dm = xn.Shape[1];
         bool b = sl > 1;
 
+        // ── Debug: log key params for first few layers ────────────────
+        if (g <= 2 && QwenDbgTrace.Once("ssm_params", g))
+            t._logger.LogWarning("[SSM_DBG] L{L} HVD={HVD} NVH={NVH} NKH={NKH} KD={KD} VD={VD} CD={CD} dm={dm}",
+                g, HVD, NVH, NKH, KD, VD, CD, dm);
+
         var (convW, _) = t.TempF32Named($"blk.{g}.ssm_conv1d.weight");
         var (wQKV, _) = t.TempF32Named($"blk.{g}.attn_qkv.weight");
 
@@ -342,6 +347,13 @@ public class QwenHybridFormat : ITransformerFormat
             // Flush the sub-batch so GPU finishes this group before next
             // Note: Flush() also calls _arena.Reset() which reclaims all temp arena memory
             if (b) o.Flush();
+            // Trace ssmState after first sub-batch flush (GPU has executed).
+            if (g <= 2 && ti == 0 && QwenDbgTrace.Once("ssm_state_post", g))
+            {
+                QwenDbgTrace.Slice($"L{g}_state_h0", ssmStateTensor, 0, 16);
+                QwenDbgTrace.Slice($"L{g}_state_mid", ssmStateTensor,
+                    SSMState.STATE_DIM / 2, 8);
+            }
         }
         GlobalProfiler.End(_tsP, "SSM_GPU.Total");
         result ??= Tensor.Create(o.Device, TensorShape.Matrix(1, VD), DataType.F32, "ssm_empty");
@@ -349,6 +361,9 @@ public class QwenHybridFormat : ITransformerFormat
         var _tsP2 = GlobalProfiler.Start();
         var projected = o.MatMulWeights(result, wOut, "ssm_proj");
         var residual = o.Add(xr, projected, "ssm_out");
+        // Trace residual for first 3 layers (decode mode: GPU completed, values readable)
+        if (g <= 2 && !b && QwenDbgTrace.Once("ssm_residual", g))
+            QwenDbgTrace.Row0($"ssm_res_g{g}", residual, 16);
         if (b) { o.DeferExternal(result); o.DeferExternal(projected); }
         else { result.Dispose(); projected.Dispose(); }
         // Arena scratch is auto-reclaimed by Flush → Reset — no explicit Dispose needed

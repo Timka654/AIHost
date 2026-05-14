@@ -53,13 +53,14 @@ void main() {
         for (uint j = 0u; j < smp.HVD; j++) ssmState.data[rowBase + j] *= gExp;
     }
     barrier();
-    // Step 2: compute sk = S^T @ k.
-    // sharedMem still holds kNorm from earlier (set before first barrier).
+    // Load kNorm into shared memory (sharedMem currently holds sumSqK reduction residues).
+    sharedMem[d] = kNorm;
+    barrier();
+    // Step 2: compute sk = S^T @ k  (column d of state × per-thread k value).
     float sk = 0.0;
     for (uint j = 0u; j < smp.HVD; j++) sk += ssmState.data[stateBase + j * smp.HVD + d] * sharedMem[j];
     float dVec = (vConvVal - sk) * beta;
     // Step 3: update state column d: S[j][d] += k[j] * dVec for each row j.
-    // CRITICAL: use sharedMem (still = kNorm) BEFORE overwriting it with dVec!
     for (uint j = 0u; j < smp.HVD; j++)
         ssmState.data[stateBase + j * smp.HVD + d] += sharedMem[j] * dVec;
     barrier();
