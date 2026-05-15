@@ -1,4 +1,6 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
+using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
 
 namespace AIHost.Logging;
@@ -119,4 +121,21 @@ public class InMemoryLoggerProvider : ILoggerProvider
     }
 
     public void Dispose() { _loggers.Clear(); }
+}
+
+internal class ILoggerConsoleWrapper(ILogger logger) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+    {
+        return null;
+    }
+
+    public bool IsEnabled(LogLevel logLevel)
+        => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        logger.Log<TState>(logLevel, eventId, state, exception, formatter);
+        Console.WriteLine(formatter(state, exception));
+    }
 }

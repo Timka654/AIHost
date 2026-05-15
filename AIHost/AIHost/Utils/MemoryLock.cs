@@ -1,3 +1,4 @@
+using AIHost.ICompute.Vulkan;
 using System.Runtime.InteropServices;
 
 namespace AIHost.Utils;
@@ -5,8 +6,10 @@ namespace AIHost.Utils;
 /// <summary>
 /// Platform-specific memory locking to prevent swapping to disk
 /// </summary>
-public static class MemoryLock
+public class MemoryLock
 {
+    private static readonly ILogger _logger = AppLogger.Create<MemoryLock>();
+
     // Windows API
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool VirtualLock(IntPtr lpAddress, UIntPtr dwSize);
@@ -43,7 +46,7 @@ public static class MemoryLock
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠ Failed to lock memory: {ex.Message}");
+            _logger.LogError($"⚠ Failed to lock memory: {ex.Message}");
             return false;
         }
 
@@ -72,7 +75,7 @@ public static class MemoryLock
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠ Failed to unlock memory: {ex.Message}");
+            _logger.LogError($"⚠ Failed to unlock memory: {ex.Message}");
             return false;
         }
 

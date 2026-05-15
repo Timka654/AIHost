@@ -696,7 +696,7 @@ public class ManagementController : ControllerBase
             Directory.CreateDirectory(_modelManager.CacheDirectory);
 
             // Download
-            Console.WriteLine($"Downloading {request.Name} from {request.Url} to cache...");
+            _logger.LogInformation($"Downloading {request.Name} from {request.Url} to cache...");
             using var client = new HttpClient();
             client.Timeout = TimeSpan.FromHours(2);
 
@@ -706,7 +706,7 @@ public class ManagementController : ControllerBase
             using var fileStream = System.IO.File.Create(cachePath);
             await response.Content.CopyToAsync(fileStream);
 
-            Console.WriteLine($"Downloaded {request.Name} to {cachePath}");
+            _logger.LogInformation($"Downloaded {request.Name} to {cachePath}");
 
             // Create model config in models directory
             var modelDir = Path.Combine(_modelManager.ModelsDirectory, request.Name);

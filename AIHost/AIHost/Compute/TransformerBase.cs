@@ -220,8 +220,7 @@ public class TransformerBase : IDisposable
         if (outF32Bytes > 1L * 1024 * 1024 * 1024)
         {
             // FIX: Force GPU flush before chunked matmul to ensure LayerNorm
-            // results on 'x' are visible.  Without this, MatMulWeightsLarge may
-            // read stale data from previous operations in batch/prefill mode.
+            // results on 'x' are visible.
             _ops.Flush();
             var chunkedLogits = _ops.MatMulWeightsLarge(x, outWeightCached, "logits");
             x.Dispose();

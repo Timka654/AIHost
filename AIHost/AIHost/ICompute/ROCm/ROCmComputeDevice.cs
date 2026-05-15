@@ -1,3 +1,5 @@
+using AIHost.ICompute.CUDA;
+
 namespace AIHost.ICompute.ROCm;
 
 /// <summary>
@@ -8,6 +10,8 @@ public class ROCmComputeDevice : ComputeProviderBase
     private readonly int _deviceId;
     private readonly string? _gcnArch; // e.g. "gfx1030" — passed to kernels at compile time
     private bool _disposed;
+
+    private static readonly ILogger _logger = AppLogger.Create<ROCmComputeDevice>();
 
     public override string ProviderName => "ROCm/HIP";
     public override string ApiVersion { get; }
@@ -42,11 +46,11 @@ public class ROCmComputeDevice : ComputeProviderBase
         // We build gfx{major}{minor:D2} and let --offload-arch=native override if available.
         _gcnArch = null; // null → kernel uses --offload-arch=native (auto-detect at compile time)
 
-        Console.WriteLine($"ROCm Device: {deviceName}");
-        Console.WriteLine($"API Version: {ApiVersion}");
-        Console.WriteLine($"Compute Capability: {props.major}.{props.minor}");
-        Console.WriteLine($"Multiprocessors: {props.multiProcessorCount}");
-        Console.WriteLine($"Global Memory: {props.totalGlobalMem / (1024 * 1024)} MB\n");
+        _logger.LogInformation($"ROCm Device: {deviceName}");
+        _logger.LogInformation($"API Version: {ApiVersion}");
+        _logger.LogInformation($"Compute Capability: {props.major}.{props.minor}");
+        _logger.LogInformation($"Multiprocessors: {props.multiProcessorCount}");
+        _logger.LogInformation($"Global Memory: {props.totalGlobalMem / (1024 * 1024)} MB\n");
     }
 
     public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)

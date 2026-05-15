@@ -262,10 +262,41 @@ public class ComputeOps : IDisposable
             // massively overrunning the chunk buffer and producing garbage logits.
             var chunkTensor = new Tensor(chunkBuf, TensorShape.Matrix(actual, K), quantized.DataType, "w_chunk");
 
-            // Dequantize → [actual, K] row-major F32.  Use MatMulWeightsT which
-            // treats B as [actual, K] row-major and computes A × B^T = [M, actual].
+            // Dequantize → [actual, K] row-major F32.
             var chunkF32    = Dequantize(chunkTensor);
             chunkTensor.Dispose();
+
+            // ── CPU REFERENCE for first chunk: verify Dequantize + MatMul correctness ──
+            if (c == 0 && actual > 0)
+            {
+                try
+                {
+                    int refV = Math.Min(actual, 16);
+                    var hRead = a.Buffer.ReadRange<float>(0, K);   // hidden state row 0
+                    var gRead = chunkF32.Buffer.ReadRange<float>(0, K * refV); // GPU output rows
+                    var cpuRef = new float[refV];
+                    float[] wRow = new float[K];
+                    for (int v = 0; v < refV; v++)
+                    {
+                        DequantizeRowCpu(quantized.DataType, rawBytes, v * (int)bytesPerRow, wRow, 0, K);
+                        float dot = 0f;
+                        for (int j = 0; j < K; j++) dot += hRead[j] * wRow[j];
+                        cpuRef[v] = dot;
+                    }
+                    // Compare CPU ref vs GPU chunkF32 (dequantized weight) — compute dot on GPU data
+                    var gpuRef = new float[refV];
+                    for (int v = 0; v < refV; v++)
+                    {
+                        float dot = 0f;
+                        for (int j = 0; j < K; j++) dot += hRead[j] * gRead[v * K + j]; // [actual,K] layout
+                        gpuRef[v] = dot;
+                    }
+                    _logger.LogError($"[DIAG_CHUNK0_REF] refV={refV} cpuTop=[{string.Join(",", cpuRef.Select((x,i)=>(x,i)).OrderByDescending(p=>p.x).Take(5).Select(p=>$"{p.i}={p.Item1:F3}"))}] gpuMatch=[{string.Join(",", cpuRef.Zip(gpuRef,(c,g)=>Math.Abs(c-g)<0.001f?"✓":$"{(c-g):F3}"))}]");
+                    Console.Error.Flush();
+                }
+                catch (Exception ex) { _logger.LogError($"[DIAG_CHUNK0_REF] err={ex.Message}"); Console.Error.Flush(); }
+            }
+
             var partialLogits = MatMulWeightsT(a, chunkF32, "partial_logits");
             chunkF32.Dispose();
 
@@ -1365,7 +1396,7 @@ public class ComputeOps : IDisposable
         ApplyRoPEFull(K, position, numKVHeads, headDim);
 
 #if DEEP_DEBUG
-        Console.WriteLine($"  [TransLayer] Q={Q.Shape} K={K.Shape} V={V.Shape}");
+        _logger.LogDebug($"  [TransLayer] Q={Q.Shape} K={K.Shape} V={V.Shape}");
 #endif
 
         // 1.3 Multi-head attention with KV-cache
@@ -1373,7 +1404,7 @@ public class ComputeOps : IDisposable
         if (kvCache != null)
         {
 #if DEEP_DEBUG
-            Console.WriteLine($"  [KVCache] layer={layerIdx} K={K.Shape} V={V.Shape}");
+            _logger.LogDebug($"  [KVCache] layer={layerIdx} K={K.Shape} V={V.Shape}");
 #endif
             kvCache.Add(layerIdx, K, V);
 
@@ -1381,7 +1412,7 @@ public class ComputeOps : IDisposable
             if (cachedK == null || cachedV == null)
                 throw new InvalidOperationException($"Failed to retrieve cached K,V for layer {layerIdx}");
 #if DEEP_DEBUG
-            Console.WriteLine($"  [KVCache] cached K={cachedK.Shape} V={cachedV.Shape} Q={Q.Shape}");
+            _logger.LogDebug($"  [KVCache] cached K={cachedK.Shape} V={cachedV.Shape} Q={Q.Shape}");
 #endif
             attnOut = MultiHeadAttention(Q, cachedK, cachedV, numHeads, position, "attn_out");
             Defer(Q);
@@ -1557,7 +1588,7 @@ public class ComputeOps : IDisposable
     }
 
     /// <summary>CPU dequantization of one K-quant row (Q2_K..Q6_K, block size 256).</summary>
-    private static void DequantizeRowCpu(DataType dtype, byte[] src, int srcOff,
+    public static void DequantizeRowCpu(DataType dtype, byte[] src, int srcOff,
         float[] dst, int dstOff, int dModel)
     {
         switch (dtype)

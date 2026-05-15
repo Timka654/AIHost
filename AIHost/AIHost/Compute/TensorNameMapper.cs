@@ -12,6 +12,8 @@ public class TensorNameMapper
     private readonly string _arch;
     private readonly HashSet<string> _allTensorNames;
 
+    private static readonly ILogger _logger = AppLogger.Create<TensorNameMapper>();
+
     public string Architecture => _arch;
 
     public TensorNameMapper(IGGUFModel model)
@@ -19,7 +21,7 @@ public class TensorNameMapper
         _arch = model.Metadata.GetValue<string>("general.architecture", "llama").ToLowerInvariant();
         _allTensorNames = model.Tensors.Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
 
-        Console.WriteLine($"[Arch] model architecture = '{_arch}'");
+        _logger.LogDebug($"[Arch] model architecture = '{_arch}'");
         PrintDiagnostics(model);
     }
 
@@ -32,15 +34,15 @@ public class TensorNameMapper
 
         if (layer0.Count > 0)
         {
-            Console.WriteLine("[Arch] Layer-0 tensors in GGUF:");
-            foreach (var n in layer0) Console.WriteLine($"  {n}");
+            _logger.LogDebug("[Arch] Layer-0 tensors in GGUF:");
+            foreach (var n in layer0) _logger.LogDebug($"  {n}");
         }
         else
         {
-            Console.WriteLine("[Arch] Warning: no 'blk.0.*' tensors found — tensor name format may differ");
-            Console.WriteLine("[Arch] First 20 tensor names:");
+            _logger.LogDebug("[Arch] Warning: no 'blk.0.*' tensors found — tensor name format may differ");
+            _logger.LogDebug("[Arch] First 20 tensor names:");
             foreach (var n in _allTensorNames.OrderBy(x => x).Take(20))
-                Console.WriteLine($"  {n}");
+                _logger.LogDebug($"  {n}");
         }
 
         // Print shapes for key tensors in layers 0 and 3 (Type A and Type B representatives)
@@ -52,38 +54,38 @@ public class TensorNameMapper
                 .ToList();
             if (layerTensors.Count > 0)
             {
-                Console.WriteLine($"[Arch] Layer-{layer} tensor shapes:");
+                _logger.LogDebug($"[Arch] Layer-{layer} tensor shapes:");
                 foreach (var t in layerTensors)
                 {
                     var shapeStr = string.Join("×", t.Shape.Select(s => s.ToString()));
-                    Console.WriteLine($"  {t.Name} [{shapeStr}] type={t.Type}");
+                    _logger.LogDebug($"  {t.Name} [{shapeStr}] type={t.Type}");
                 }
             }
         }
 
         // Print SSM metadata
         var meta = model.Metadata;
-        Console.WriteLine("[Arch] SSM metadata:");
+        _logger.LogDebug("[Arch] SSM metadata:");
         foreach (var key in new[] { "ssm.inner_size", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank",
                                      "attention.key_length", "attention.value_length",
                                      "attention.head_count", "attention.head_count_kv",
                                      "embedding_length", "block_count" })
         {
             var val = meta.GetArchValue<object>(key);
-            Console.WriteLine($"  {key} = {val ?? "(not found)"}");
+            _logger.LogDebug($"  {key} = {val ?? "(not found)"}");
         }
 
         // Detect and warn about special architectures
         if (HasAny("attn_q_a.weight", "attn_kv_a_mqa.weight"))
-            Console.WriteLine("[Arch] MLA attention detected (DeepSeek-style) — not fully supported");
+            _logger.LogDebug("[Arch] MLA attention detected (DeepSeek-style) — not fully supported");
         if (HasAny("ffn_gate_exps.weight", ".ffn_exp.0."))
-            Console.WriteLine("[Arch] MoE FFN detected — expert 0 used for single-path inference");
+            _logger.LogDebug("[Arch] MoE FFN detected — expert 0 used for single-path inference");
         if (HasCombinedQKV)
-            Console.WriteLine("[Arch] Combined QKV weight — using ApplyLayerCombinedQKV");
+            _logger.LogDebug("[Arch] Combined QKV weight — using ApplyLayerCombinedQKV");
         if (HasAny("attn_q.weight") && !HasCombinedQKV)
-            Console.WriteLine("[Arch] Separate Q/K/V weights — standard attention path");
+            _logger.LogDebug("[Arch] Separate Q/K/V weights — standard attention path");
         if (IsHybridSSM)
-            Console.WriteLine("[Arch] Hybrid SSM+Attention model detected — SSM layers use ApplySSMRecurrence (Gated Delta Net), attention layers use standard GQA");
+            _logger.LogDebug("[Arch] Hybrid SSM+Attention model detected — SSM layers use ApplySSMRecurrence (Gated Delta Net), attention layers use standard GQA");
     }
 
     // ── Attention layout ─────────────────────────────────────────────────────
@@ -177,7 +179,7 @@ public class TensorNameMapper
     public void DumpMatching(string substring)
     {
         foreach (var n in _allTensorNames.Where(n => n.Contains(substring)).OrderBy(n => n))
-            Console.WriteLine($"  [Tensor] {n}");
+            _logger.LogDebug($"  [Tensor] {n}");
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
@@ -192,7 +194,7 @@ public class TensorNameMapper
         // Log once per missing set to avoid spamming on every token generation
         string key = candidates[0];
         if (_warnedMissing.Add(key))
-            Console.WriteLine($"[Arch] Warning: none of [{string.Join(", ", candidates)}] found in GGUF");
+            _logger.LogDebug($"[Arch] Warning: none of [{string.Join(", ", candidates)}] found in GGUF");
         return candidates[0];
     }
 
@@ -221,7 +223,7 @@ public class TensorNameMapper
         string dense = $"blk.{layer}.ffn_{role}.weight";
         if (_allTensorNames.Contains(dense)) return dense;
 
-        Console.WriteLine($"[Arch] Warning: no FFN {role} weight found for layer {layer}");
+        _logger.LogDebug($"[Arch] Warning: no FFN {role} weight found for layer {layer}");
         return dense; // let CacheWeight throw a clear error
     }
 }

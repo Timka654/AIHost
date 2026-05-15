@@ -1,3 +1,4 @@
+using AIHost.ICompute.ROCm;
 using Silk.NET.Vulkan;
 
 namespace AIHost.ICompute.Vulkan;
@@ -12,7 +13,9 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
     private readonly VulkanDeviceContext _deviceContext;
     private bool _disposed;
 
-    public override string ProviderName => "Vulkan";
+	private static readonly ILogger _logger = AppLogger.Create<VulkanComputeDevice>();
+
+	public override string ProviderName => "Vulkan";
     public override string ApiVersion { get; }
 
     /// <summary>
@@ -117,8 +120,8 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
         ApiVersion = $"{apiVer >> 22}.{(apiVer >> 12) & 0x3ff}.{apiVer & 0xfff}";
         DeviceName = _deviceContext.DeviceName;
         
-        Console.WriteLine($"Vulkan Device [{deviceIndex}]: {DeviceName}");
-        Console.WriteLine($"API Version: {ApiVersion}");
+        _logger.LogInformation($"Vulkan Device [{deviceIndex}]: {DeviceName}");
+        _logger.LogInformation($"API Version: {ApiVersion}");
     }
 
     public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)

@@ -8,8 +8,11 @@ namespace AIHost.Compute;
 /// Factory that creates the appropriate TransformerBase with the correct format
 /// for a given model architecture.
 /// </summary>
-public static class TransformerFactory
+public class TransformerFactory
 {
+
+    private static readonly ILogger _logger = AppLogger.Create<TransformerFactory>();
+
     /// <summary>
     /// Create a TransformerBase instance with the correct format for the given model.
     /// </summary>
@@ -34,39 +37,39 @@ public static class TransformerFactory
         bool hasMoeShexp = allTensorNames.Any(n => n.Contains("ffn_gate_shexp.weight"));
         bool hasMoeRouter = allTensorNames.Any(n => n.Contains("ffn_gate_inp.weight"));
 
-        Console.WriteLine($"[Factory] arch='{arch}' combinedQKV={hasCombinedQKV} separateQKV={hasSeparateQKV} SSM={hasSSM} QKNorm={hasQKNorm} gatedQ={hasGatedQ} postNorm={hasAttnPostNorm}/{hasFfnPostNorm} MLA={hasMLA} MoE={hasMoeShexp}/{hasMoeRouter}");
+        _logger.LogDebug($"[Factory] arch='{arch}' combinedQKV={hasCombinedQKV} separateQKV={hasSeparateQKV} SSM={hasSSM} QKNorm={hasQKNorm} gatedQ={hasGatedQ} postNorm={hasAttnPostNorm}/{hasFfnPostNorm} MLA={hasMLA} MoE={hasMoeShexp}/{hasMoeRouter}");
 
         ITransformerFormat format;
 
         if (hasSSM && hasSeparateQKV && hasQKNorm)
         {
             // Qwen3.6 hybrid: SSM + Type A (combined QKV) + Type B (separate QKV + QK-norm)
-            Console.WriteLine("[Factory] Selected: QwenHybridFormat (SSM + Attention hybrid)");
+            _logger.LogDebug("[Factory] Selected: QwenHybridFormat (SSM + Attention hybrid)");
             format = new QwenHybridFormat();
         }
         else if (hasAttnPostNorm && hasFfnPostNorm && hasQKNorm && !hasSSM)
         {
             // Gemma 4: separate Q/K/V, QK-norm, attn_post_norm, ffn_post_norm
             // Also: arch == "gemma4" or weight layout matches Gemma 4
-            Console.WriteLine("[Factory] Selected: Gemma4Format (Gemma 4: QK-norm + post-norm + GELU)");
+            _logger.LogDebug("[Factory] Selected: Gemma4Format (Gemma 4: QK-norm + post-norm + GELU)");
             format = new Gemma4Format();
         }
         else if ((hasMLA || hasMoeShexp || hasMoeRouter) && hasSeparateQKV && !hasSSM)
         {
             // DeepSeek V2/V3/V4: MLA attention + MoE with shared experts
-            Console.WriteLine("[Factory] Selected: DeepSeekV4Format (MLA/MoE fallback)");
+            _logger.LogDebug("[Factory] Selected: DeepSeekV4Format (MLA/MoE fallback)");
             format = new DeepSeekV4Format();
         }
         else if (hasCombinedQKV && !hasSeparateQKV)
         {
             // Phi, Falcon, Qwen2.5: fused QKV
-            Console.WriteLine("[Factory] Selected: CombinedQKVFormat (fused QKV)");
+            _logger.LogDebug("[Factory] Selected: CombinedQKVFormat (fused QKV)");
             format = new CombinedQKVFormat();
         }
         else
         {
             // Default: standard LLaMA (TinyLlama, LLaMA 2/3, Mistral, Qwen2, Gemma)
-            Console.WriteLine("[Factory] Selected: LlamaFormat (standard separate Q/K/V)");
+            _logger.LogDebug("[Factory] Selected: LlamaFormat (standard separate Q/K/V)");
             format = new LlamaFormat();
         }
 

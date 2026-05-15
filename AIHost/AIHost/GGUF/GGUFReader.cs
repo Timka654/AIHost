@@ -11,6 +11,8 @@ public class GGUFReader : IDisposable
     private readonly BinaryReader _reader;
     private bool _disposed;
 
+    private static readonly ILogger _logger = AppLogger.Create<GGUFReader>();
+
     public GGUFHeader Header { get; private set; } = null!;
     public GGUFMetadata Metadata { get; private set; } = new();
     public List<GGUFTensorInfo> Tensors { get; private set; } = new();
@@ -35,19 +37,19 @@ public class GGUFReader : IDisposable
         if (!Header.IsValid())
             throw new InvalidDataException($"Invalid GGUF file: magic=0x{Header.Magic:X8}, version={Header.Version}");
 
-        Console.WriteLine($"Loaded {Header}");
+        _logger.LogDebug($"Loaded {Header}");
 
         // Читаем метаданные
         ReadMetadata();
-        Console.WriteLine($"Metadata: {Metadata}");
+        _logger.LogDebug($"Metadata: {Metadata}");
 
         // Читаем информацию о тензорах
         ReadTensorInfo();
-        Console.WriteLine($"Tensors: {Tensors.Count} total");
+        _logger.LogDebug($"Tensors: {Tensors.Count} total");
 
         // Вычисляем смещение данных (выравнивание по 32 байта)
         DataOffset = AlignOffset((ulong)_fileStream.Position, 32);
-        Console.WriteLine($"Data starts at offset: 0x{DataOffset:X}");
+        _logger.LogDebug($"Data starts at offset: 0x{DataOffset:X}");
     }
 
     private GGUFHeader ReadHeader()

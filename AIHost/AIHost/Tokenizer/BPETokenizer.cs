@@ -1,3 +1,5 @@
+using AIHost.ICompute.Vulkan;
+
 namespace AIHost.Tokenizer;
 
 /// <summary>
@@ -11,6 +13,8 @@ public class BPETokenizer
     private readonly int _eosToken;
     private readonly int _unknownToken;
     private readonly bool _isSentencePiece;
+
+    private static readonly ILogger _logger = AppLogger.Create<BPETokenizer>();
 
     // GPT-2 style bytes_to_unicode mapping for BPE/tiktoken tokenizers
     // Maps each byte (0-255) to a unicode character that exists as a token in the vocabulary
@@ -170,10 +174,10 @@ public class BPETokenizer
         {
             isSentencePiece = modelType.Equals("llama", StringComparison.OrdinalIgnoreCase)
                            || modelType.Equals("sentencepiece", StringComparison.OrdinalIgnoreCase);
-            Console.WriteLine($"Tokenizer model type: '{modelType}' → isSentencePiece={isSentencePiece}");
+            _logger.LogInformation($"Tokenizer model type: '{modelType}' → isSentencePiece={isSentencePiece}");
         }
 
-        Console.WriteLine($"Loaded tokenizer: {tokens.Length} tokens, BOS={bosToken}, EOS={eosToken}, model={modelType ?? "unknown"}");
+        _logger.LogInformation($"Loaded tokenizer: {tokens.Length} tokens, BOS={bosToken}, EOS={eosToken}, model={modelType ?? "unknown"}");
 
         return new BPETokenizer(tokens, bosToken, eosToken, unknownToken, isSentencePiece);
     }

@@ -1,3 +1,4 @@
+using AIHost.GGUF;
 using System.Runtime.InteropServices;
 
 namespace AIHost.ICompute.CUDA;
@@ -9,6 +10,8 @@ public unsafe class CudaComputeDevice : ComputeProviderBase
 {
     private readonly int _deviceId;
     private bool _disposed;
+
+    private static readonly ILogger _logger = AppLogger.Create<CudaComputeDevice>();
 
     public override string ProviderName => "CUDA";
     public override string ApiVersion { get; }
@@ -68,10 +71,10 @@ public unsafe class CudaComputeDevice : ComputeProviderBase
         ComputeCapabilityMinor = prop.minor;
         ApiVersion = $"{prop.major}.{prop.minor}";
 
-        Console.WriteLine($"CUDA Device [{deviceId}]: {DeviceName}");
-        Console.WriteLine($"Compute Capability: {ComputeCapabilityMajor}.{ComputeCapabilityMinor}");
-        Console.WriteLine($"Total Memory: {prop.totalGlobalMem / (1024 * 1024)}MB");
-        Console.WriteLine($"Multiprocessors: {prop.multiProcessorCount}");
+        _logger.LogInformation($"CUDA Device [{deviceId}]: {DeviceName}");
+        _logger.LogInformation($"Compute Capability: {ComputeCapabilityMajor}.{ComputeCapabilityMinor}");
+        _logger.LogInformation($"Total Memory: {prop.totalGlobalMem / (1024 * 1024)}MB");
+        _logger.LogInformation($"Multiprocessors: {prop.multiProcessorCount}");
     }
 
     public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)

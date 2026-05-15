@@ -16,13 +16,15 @@ namespace AIHost.ICompute.Vulkan;
 /// Это решает проблему ErrorDeviceLost при нескольких VulkanComputeDevice
 /// на одном физическом GPU — теперь все используют один VkDevice.
 /// </summary>
-internal static unsafe class VulkanGlobalContext
+internal unsafe class VulkanGlobalContext
 {
     // ── Глобальные ресурсы (один на процесс) ────────────────────────────────
     private static Vk? s_vk;
     private static Instance? s_instance;
     private static bool s_instanceCreated;
     private static readonly object s_instanceLock = new();
+
+    private static readonly ILogger _logger = AppLogger.Create<VulkanGlobalContext>();
 
     // ── Per-physical-device контексты ────────────────────────────────────────
     private static readonly ConcurrentDictionary<int, VulkanDeviceContext> s_deviceContexts = new();
@@ -84,7 +86,7 @@ internal static unsafe class VulkanGlobalContext
 
             s_instance = instance;
             s_instanceCreated = true;
-            Console.WriteLine("[VulkanGlobal] Instance created");
+            _logger.LogDebug("[VulkanGlobal] Instance created");
             return instance;
         }
     }
@@ -195,7 +197,7 @@ internal static unsafe class VulkanGlobalContext
 
         s_deviceContexts[physicalDeviceIndex] = ctx;
 
-        Console.WriteLine($"[VulkanGlobal] Device context created: {deviceName} (idx={physicalDeviceIndex}, queues={actualQueueCount})");
+        _logger.LogDebug($"[VulkanGlobal] Device context created: {deviceName} (idx={physicalDeviceIndex}, queues={actualQueueCount})");
 
         return ctx;
     }
@@ -217,7 +219,7 @@ internal static unsafe class VulkanGlobalContext
         {
             ctx.Vk.DeviceWaitIdle(ctx.Device);
             ctx.Vk.DestroyDevice(ctx.Device, null);
-            Console.WriteLine($"[VulkanGlobal] Device context destroyed: {ctx.DeviceName} (idx={physicalDeviceIndex})");
+            _logger.LogDebug($"[VulkanGlobal] Device context destroyed: {ctx.DeviceName} (idx={physicalDeviceIndex})");
         }
     }
 
@@ -241,7 +243,7 @@ internal static unsafe class VulkanGlobalContext
             GetVk().DestroyInstance(s_instance.Value, null);
             s_instanceCreated = false;
             s_instance = null;
-            Console.WriteLine("[VulkanGlobal] Instance destroyed");
+            _logger.LogDebug("[VulkanGlobal] Instance destroyed");
         }
 
         // Освобождаем Vk API

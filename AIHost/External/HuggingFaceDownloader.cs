@@ -1,3 +1,4 @@
+using AIHost.ICompute.Vulkan;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -45,6 +46,8 @@ public class HuggingFaceDownloader : IDisposable
     private readonly HttpClient _client;
     private bool _disposed;
 
+    private static readonly ILogger _logger = AppLogger.Create<HuggingFaceDownloader>();
+
     public HuggingFaceDownloader()
     {
         _client = new HttpClient();
@@ -73,7 +76,7 @@ public class HuggingFaceDownloader : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"HuggingFace search failed: {ex.Message}");
+            _logger.LogError($"HuggingFace search failed: {ex.Message}");
             return new List<HFModelInfo>();
         }
     }
@@ -92,7 +95,7 @@ public class HuggingFaceDownloader : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Failed to get model files: {ex.Message}");
+            _logger.LogError($"Failed to get model files: {ex.Message}");
             return new List<HFFileInfo>();
         }
     }
@@ -117,7 +120,7 @@ public class HuggingFaceDownloader : IDisposable
             Directory.CreateDirectory(directory);
         }
 
-        Console.WriteLine($"Downloading {modelId}/{fileName}...");
+        _logger.LogInformation($"Downloading {modelId}/{fileName}...");
 
         using var response = await _client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
@@ -144,10 +147,10 @@ public class HuggingFaceDownloader : IDisposable
 
             if (downloadedBytes % (10 * 1024 * 1024) == 0) // Log every 10MB
             {
-                Console.WriteLine($"Downloaded {downloadedBytes / 1024 / 1024}MB / {totalBytes / 1024 / 1024}MB");
+                _logger.LogInformation($"Downloaded {downloadedBytes / 1024 / 1024}MB / {totalBytes / 1024 / 1024}MB");
             }
         }
 
-        Console.WriteLine($"Download complete: {destPath}");
+        _logger.LogInformation($"Download complete: {destPath}");
     }
 }

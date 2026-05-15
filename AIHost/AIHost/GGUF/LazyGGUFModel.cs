@@ -23,6 +23,8 @@ public class LazyGGUFModel : IGGUFModel
     private readonly bool _requireDeviceLocal;
     private readonly Dictionary<IntPtr, ulong> _lockedRegions = new();
 
+    private static readonly ILogger _logger = AppLogger.Create<LazyGGUFModel>();
+
     public GGUFHeader Header => _reader.Header;
     public GGUFMetadata Metadata => _reader.Metadata;
     public IReadOnlyList<GGUFTensorInfo> Tensors => _reader.Tensors;
@@ -44,7 +46,7 @@ public class LazyGGUFModel : IGGUFModel
         
         if (_splitFiles.Count > 1)
         {
-            Console.WriteLine($"Discovered {_splitFiles.Count} split GGUF files");
+            _logger.LogDebug($"Discovered {_splitFiles.Count} split GGUF files");
             // For now, load from first file
             // TODO: Implement proper multi-file support
             filePath = _splitFiles[0];
@@ -68,7 +70,7 @@ public class LazyGGUFModel : IGGUFModel
                     0, 
                     MemoryMappedFileAccess.Read);
                 
-                Console.WriteLine($"Memory-mapped file created for {Path.GetFileName(filePath)}");
+                _logger.LogDebug($"Memory-mapped file created for {Path.GetFileName(filePath)}");
                 
                 // Try to lock memory if requested
                 if (_useMemoryLock)
@@ -78,8 +80,8 @@ public class LazyGGUFModel : IGGUFModel
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Warning: Failed to create memory-mapped file: {ex.Message}");
-                Console.WriteLine("Falling back to standard file I/O");
+                _logger.LogDebug($"Warning: Failed to create memory-mapped file: {ex.Message}");
+                _logger.LogDebug("Falling back to standard file I/O");
                 _memoryMappedFile = null;
                 _useMemoryMapping = false;
                 _useMemoryLock = false;
@@ -87,7 +89,7 @@ public class LazyGGUFModel : IGGUFModel
         }
         else if (_useMemoryLock)
         {
-            Console.WriteLine($"⚠ Warning: Memory locking requires memory mapping to be enabled");
+            _logger.LogDebug($"⚠ Warning: Memory locking requires memory mapping to be enabled");
             _useMemoryLock = false;
         }
     }
@@ -96,7 +98,7 @@ public class LazyGGUFModel : IGGUFModel
     {
         if (!MemoryLock.IsSupported())
         {
-            Console.WriteLine($"⚠ Memory locking not supported on this platform");
+            _logger.LogDebug($"⚠ Memory locking not supported on this platform");
             _useMemoryLock = false;
             return;
         }
@@ -118,18 +120,18 @@ public class LazyGGUFModel : IGGUFModel
                 if (MemoryLock.Lock(address, capacity))
                 {
                     _lockedRegions[address] = capacity;
-                    Console.WriteLine($"✓ Locked {capacity / (1024 * 1024)}MB of model memory");
+                    _logger.LogDebug($"✓ Locked {capacity / (1024 * 1024)}MB of model memory");
                 }
                 else
                 {
-                    Console.WriteLine($"⚠ Failed to lock memory - {MemoryLock.GetRecommendations()}");
+                    _logger.LogDebug($"⚠ Failed to lock memory - {MemoryLock.GetRecommendations()}");
                     _useMemoryLock = false;
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠ Failed to lock memory: {ex.Message}");
+            _logger.LogDebug($"⚠ Failed to lock memory: {ex.Message}");
             _useMemoryLock = false;
         }
     }
@@ -198,7 +200,7 @@ public class LazyGGUFModel : IGGUFModel
         {
             buffer.Dispose();
             _tensorBuffers.Remove(tensorName);
-            Console.WriteLine($"Unloaded tensor: {tensorName}");
+            _logger.LogDebug($"Unloaded tensor: {tensorName}");
         }
     }
 
@@ -212,7 +214,7 @@ public class LazyGGUFModel : IGGUFModel
             buffer.Dispose();
         }
         _tensorBuffers.Clear();
-        Console.WriteLine("Unloaded all tensors");
+        _logger.LogDebug("Unloaded all tensors");
     }
 
     /// <summary>

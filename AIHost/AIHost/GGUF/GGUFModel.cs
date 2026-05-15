@@ -1,3 +1,4 @@
+using AIHost.Compute;
 using AIHost.ICompute;
 
 namespace AIHost.GGUF;
@@ -10,6 +11,8 @@ public class GGUFModel : IGGUFModel
     private readonly GGUFReader _reader;
     private readonly IComputeDevice _device;
     private readonly Dictionary<string, IComputeBuffer> _tensorBuffers = new();
+
+    private static readonly ILogger _logger = AppLogger.Create<GGUFModel>();
     private bool _disposed;
 
     public GGUFHeader Header => _reader.Header;
@@ -58,7 +61,7 @@ public class GGUFModel : IGGUFModel
         // Кэшируем
         _tensorBuffers[tensorName] = buffer;
 
-        Console.WriteLine($"Loaded tensor: {tensor}");
+        _logger.LogDebug($"Loaded tensor: {tensor}");
         return buffer;
     }
 
