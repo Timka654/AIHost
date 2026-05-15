@@ -65,7 +65,8 @@ public class TransformerBase : IDisposable
 
     public TransformerBase(IComputeDevice device, IGGUFModel model, ITransformerFormat format)
     {
-        _ops = new ComputeOps(device);
+        var leasePool = new GpuLeasePool(device);
+        _ops = new ComputeOps(device, leasePool);
         _model = model;
         _format = format;
 

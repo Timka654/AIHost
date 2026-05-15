@@ -400,7 +400,7 @@ void main() {
         // Test RoPE (simplified - single vector)
         Console.WriteLine("Test 1: RoPE (Rotary Position Embedding)\n");
         
-        uint headDim = 64;
+        int headDim = 64;
         
         // Создаем один вектор размерности headDim
         float[] testData = new float[headDim];
