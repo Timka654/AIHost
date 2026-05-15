@@ -188,7 +188,16 @@ public class QwenHybridFormat : ITransformerFormat
             float kNormSq = kd0.Sum(v => v * v);
             QwenDbgTrace.Msg($"[DIAG RoPE g={g}] ropeDim={t._ropeDimCount} headDim={hd} pos={pos} ||Q_h0[:16]||²={qNormSq:F4} ||K_h0[:16]||²={kNormSq:F4}  Q[:4]=[{string.Join(",", qd0.Take(4).Select(v => v.ToString("F3")))}]");
         }
-        Tensor ao; if (kvc != null) { kvc.Add(li, K, V); var (ck, cv) = kvc.Get(li); ao = o.MultiHeadAttention(gq, ck!, cv!, nqh, pos, "aoB"); o.DeferExternal(gq); }
+        Tensor ao;
+        if (kvc != null) {
+            kvc.Add(li, K, V);
+            // FIX: In batch (prefill) mode, K/V buffers are not yet flushed to GPU
+            // when Add() is called. Force a flush so MultiHeadAttention sees valid data.
+            if (b) o.Flush();
+            var (ck, cv) = kvc.Get(li);
+            ao = o.MultiHeadAttention(gq, ck!, cv!, nqh, pos, "aoB");
+            o.DeferExternal(gq);
+        }
         else { ao = o.MultiHeadAttention(gq, K, V, nqh, pos, "aoB"); o.DeferExternal(gq); o.DeferExternal(K); o.DeferExternal(V); }
         if (dbg) QwenDbgTrace.Row0($"ao_pregate_g{g}", ao, 8);
         // Apply sigmoid gate to attention output (qwen3next: sigmoid, not SiLU; after attn, not before).
