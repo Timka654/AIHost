@@ -46,21 +46,23 @@ void main() {
     float qNorm = qConvVal / sqrt(sumSqQ + EPS);
     float kNorm = kConvVal / sqrt(sumSqK + EPS);
     uint stateBase = n * smp.HVD * smp.HVD;
-    // Step 1: decay state S *= gExp.
+    // FIX: Load kNorm into shared memory BEFORE computing sk.
+    // The residual sk = S_old^T @ k MUST use the pre-decay state.
+    sharedMem[d] = kNorm;
+    barrier();
+    // Step 1: compute sk = S_old^T @ k  (column d of old state × per-thread k value).
+    float sk = 0.0;
+    for (uint j = 0u; j < smp.HVD; j++) sk += ssmState.data[stateBase + j * smp.HVD + d] * sharedMem[j];
+    // Step 2: decay state S *= gExp (AFTER sk computation).
     float gExp = exp(gate);
     for (uint i = d; i < smp.HVD; i += 128u) {
         uint rowBase = stateBase + i * smp.HVD;
         for (uint j = 0u; j < smp.HVD; j++) ssmState.data[rowBase + j] *= gExp;
     }
     barrier();
-    // Load kNorm into shared memory (sharedMem currently holds sumSqK reduction residues).
-    sharedMem[d] = kNorm;
-    barrier();
-    // Step 2: compute sk = S^T @ k  (column d of state × per-thread k value).
-    float sk = 0.0;
-    for (uint j = 0u; j < smp.HVD; j++) sk += ssmState.data[stateBase + j * smp.HVD + d] * sharedMem[j];
+    // Step 3: residual dVec = (v - sk) * beta.
     float dVec = (vConvVal - sk) * beta;
-    // Step 3: update state column d: S[j][d] += k[j] * dVec for each row j.
+    // Step 4: update state column d: S[j][d] += k[j] * dVec for each row j.
     for (uint j = 0u; j < smp.HVD; j++)
         ssmState.data[stateBase + j * smp.HVD + d] += sharedMem[j] * dVec;
     barrier();
