@@ -300,8 +300,13 @@ public class ComputeOps : IDisposable
                 catch (Exception ex) { _logger.LogError("[DIAG_CHUNK0_REF] err={Err}", ex.Message); }
             }
 
-            var partialLogits = MatMulWeightsT(a, chunkF32, "partial_logits");
+            // FIX: MatMulWeightsT expects B in GGUF column-major layout (B[j,k]=data[j+k*J]).
+            // chunkF32 is row-major (data[j*K + k]) from Dequantize, causing NaN logits.
+            // Transpose chunkF32 to [K, actual] then use standard MatMul (row-major for both).
+            var chunkF32T = Transpose(chunkF32);
             chunkF32.Dispose();
+            var partialLogits = MatMul(a, chunkF32T, "partial_logits");
+            chunkF32T.Dispose();
 
             // Scatter partial [M, actual] into result [M, N] at column offset `start`
             ScatterCols(result, partialLogits, start);
