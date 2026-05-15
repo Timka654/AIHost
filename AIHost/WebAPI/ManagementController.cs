@@ -198,6 +198,22 @@ public class ManagementController : ControllerBase
     }
 
     /// <summary>
+    /// Get deployed shader source. ?name=dequant_q6k&provider=Vulkan.
+    /// Returns first 4KB for verification.
+    /// </summary>
+    [HttpGet("shader")]
+    public IActionResult GetShader([FromQuery] string name, [FromQuery] string provider = "Vulkan")
+    {
+        try
+        {
+            var source = Compute.ShaderLoader.Load(provider, name);
+            var preview = source.Length > 4096 ? source[..4096] + "\n... [TRUNCATED]" : source;
+            return Ok(new { name, provider, length = source.Length, preview });
+        }
+        catch (Exception ex) { return NotFound(new { name, provider, error = ex.Message }); }
+    }
+
+    /// <summary>
     /// Get all loaded models with statistics
     /// </summary>
     [HttpGet("models")]

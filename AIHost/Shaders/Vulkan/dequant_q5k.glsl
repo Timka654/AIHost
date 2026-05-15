@@ -4,11 +4,22 @@ layout(set = 0, binding = 0) readonly buffer InputBuf { uint data[]; } inBuf;
 layout(set = 0, binding = 1) buffer OutputBuf { float data[]; } outBuf;
 layout(set = 0, binding = 2) readonly buffer OffsetBuf { uint elementOffset; } offBuf;
 
+// Fix: Subnormal F16→F32 — return directly, don't fall through to -15+127
 float f16tof32(uint h) {
-    uint s = (h >> 15u) & 1u; uint e = (h >> 10u) & 31u; uint m = h & 1023u;
-    if (e == 0u) { if (m == 0u) return 0.0; e = 1u; while ((m & 1024u) == 0u) { m <<= 1u; e -= 1u; } m &= 1023u; }
-    else if (e == 31u) { return m != 0u ? uintBitsToFloat(0x7FC00000u) : (s != 0u ? uintBitsToFloat(0xFF800000u) : uintBitsToFloat(0x7F800000u)); }
-    e = e - 15u + 127u; return uintBitsToFloat((s << 31u) | (e << 23u) | (m << 13u));
+    uint s = (h >> 15u) & 1u; uint eu = (h >> 10u) & 31u; uint m = h & 1023u;
+    if (eu == 0u) {
+        if (m == 0u) return 0.0;
+        int e2 = 1; while ((m & 1024u) == 0u) { m <<= 1u; e2 -= 1; }
+        m = (m & 1023u) << 13u;
+        uint exp = uint(e2 - 15 + 127);
+        return uintBitsToFloat((s << 31u) | (exp << 23u) | m);
+    }
+    if (eu == 31u) {
+        return m != 0u ? uintBitsToFloat(0x7FC00000u)
+                       : (s != 0u ? uintBitsToFloat(0xFF800000u) : uintBitsToFloat(0x7F800000u));
+    }
+    eu = eu - 15u + 127u;
+    return uintBitsToFloat((s << 31u) | (eu << 23u) | (m << 13u));
 }
 uint readU8(uint off) { return (inBuf.data[off / 4u] >> ((off % 4u) * 8u)) & 0xFFu; }
 uint readU16(uint off) { return readU8(off) | (readU8(off + 1u) << 8u); }
@@ -50,7 +61,9 @@ void main() {
 
     // High 1 bit from qh[32] at offset 16: qh[ql_idx] bit (j*2+is_upper)
     uint qh_bit = j * 2u + is_upper;
-    uint qh = (readU8(off + 16u + ql_idx) >> qh_bit) & 1u;
+    // FIX: ql_idx ranges 0..127 across all j groups, but qh[] has only 32 bytes.
+    //      Use l (local position 0..31) instead of ql_idx for qh indexing.
+    uint qh = (readU8(off + 16u + l) >> qh_bit) & 1u;
 
     uint q = ql | (qh << 4u);      // 5-bit value 0..31
 

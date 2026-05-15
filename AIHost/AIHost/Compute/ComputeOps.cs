@@ -964,6 +964,10 @@ public class ComputeOps : IDisposable
                 // FIX: pass check (not totalElements) — DequantizeRowCpu writes `dModel` floats into `cpu`,
                 // and `cpu` only has `check` elements allocated.
                 DequantizeRowCpu(dt, raw, 0, cpu, 0, check);
+                // FIX: log raw bytes at the d/dmin offset for debugging GPU vs CPU data mismatch
+                int dOff = dt == DataType.Q6_K ? 208 : 0;
+                _logger.LogError("[DIAG_DEQUANT_{Dtype}] rawBytes[{Off}]={B0} rawBytes[{Off2}]={B1} rawBytes[0]={B2} rawBytes[1]={B3}",
+                    dt, dOff, raw[dOff], dOff+1, raw[dOff+1], raw[0], raw[1]);
                 int mismatches = 0; float maxErr = 0f;
                 for (int i = 0; i < check; i++)
                 {
@@ -1647,6 +1651,10 @@ public class ComputeOps : IDisposable
     // Block size = 256 elements for all K-quant formats.
     // Layouts match the GLSL shaders in QuantizationFormats.cs.
 
+    // FIX: Subnormal F16 → F32: correct exponent is shift+103 (not 1-shift+127)
+    //   F16 subnormal = (-1)^s * 2^(-14) * m/1024
+    //   Normalize: shift m left until bit 10 (0x400) is set, count k = 10-shift
+    //   exp = -14 - k + 127 = -14 - (10-shift) + 127 = shift + 103
     private static float F16ToF32(ushort h)
     {
         uint sign = (uint)((h >> 15) & 1);
@@ -1657,7 +1665,7 @@ public class ComputeOps : IDisposable
             if (mant == 0) return sign == 0 ? 0f : -0f;
             int shift = 10;
             while ((mant & 0x400) == 0) { mant <<= 1; shift--; }
-            exp = (uint)(1 - shift + 127);
+            exp = (uint)(shift + 103);  // FIX: was "1 - shift + 127"
             mant = (mant & 0x3FF) << 13;
         }
         else if (exp == 0x1F)
@@ -1874,9 +1882,10 @@ public class ComputeOps : IDisposable
                 // Lower 4 bits from qs[128] at offset 48
                 int ql = (src[blockOff + 48 + qlIdx] >> (isUpper * 4)) & 0x0F;
 
-                // High 1 bit from qh[32] at offset 16
+                // FIX: qlIdx ranges 0..127 across all j5 groups, but qh[] has only 32 bytes.
+                //      Use l (local position 0..31) instead of qlIdx for qh indexing.
                 int qhBit = j5 * 2 + isUpper;
-                int qh = (src[blockOff + 16 + qlIdx] >> qhBit) & 1;
+                int qh = (src[blockOff + 16 + l] >> qhBit) & 1;
 
                 int q = ql | (qh << 4);
 
