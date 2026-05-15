@@ -51,6 +51,13 @@ public class ComputeOps : IDisposable
     private readonly IComputeBuffer _persistentZeroOffset;
     private bool _persistentOffsetInitialized;
 
+    // OPTIMIZATION: Persistent SSM UBO buffers — eliminated 3× CreateBuffer/Defer per token.
+    // ssmParams = [DMODEL, HVD, NVH, NKH, KD, VD, CD, 0] (32 bytes), shared by decode (binding=11) and recur (binding=4).
+    // rowIndex = [uint] (4 bytes), written per token before dispatch.
+    // Same pattern as _persistentZeroOffset: created once, reused for all SsmGdnDecode calls.
+    private IComputeBuffer? _persistentSsmParams;
+    private IComputeBuffer? _persistentRowIndex;
+
     public IComputeDevice Device => _device;
 
     public ComputeOps(IComputeDevice device)
@@ -856,6 +863,15 @@ public class ComputeOps : IDisposable
     /// </summary>
     public void DequantizeInto(Tensor quantized, Tensor target)
     {
+        string dequantTag = quantized.DataType switch
+        {
+            DataType.Q2_K => "Dequant.Q2K",
+            DataType.Q3_K => "Dequant.Q3K",
+            DataType.Q4_K => "Dequant.Q4K",
+            DataType.Q5_K => "Dequant.Q5K",
+            DataType.Q6_K => "Dequant.Q6K",
+            _ => "Dequant."
+        };
         var _ts = GlobalProfiler.Start();
         if (target.DataType != DataType.F32)
             throw new ArgumentException("Target must be F32");
@@ -919,7 +935,7 @@ public class ComputeOps : IDisposable
                     if (k is VulkanComputeKernel vk)
                         vk.ResetDispatchRing();
             }
-            GlobalProfiler.End(_ts, "ComputeOps.DequantizeInto");
+            GlobalProfiler.End(_ts, dequantTag);
         }
 
         else
@@ -948,7 +964,7 @@ public class ComputeOps : IDisposable
             }
             _logger.LogDebug("[DBG_OPS] DequantizeInto chunked done");
             Defer(reusableOffsetBuf);
-            GlobalProfiler.End(_ts, "ComputeOps.DequantizeInto");
+            GlobalProfiler.End(_ts, dequantTag);
         }
 
         // FIX: One-shot GPU-vs-CPU dequant verification (once per data type).
@@ -2031,6 +2047,20 @@ public class ComputeOps : IDisposable
         uint convGroups = ssmCD / ssmHVD; // 10240/128 = 80
         uint vGroups    = ssmNVH;          // 48
 
+        // OPTIMIZATION: Lazy-init persistent SSM UBO — eliminates 2× CreateBuffer(32) per token.
+        // ssmParams are model-level constants — written once, reused for all layers/all tokens.
+        if (_persistentSsmParams == null)
+        {
+            _persistentSsmParams = _device.CreateBuffer(32, BufferType.Storage, DataType.I32);
+            _persistentSsmParams.Write(new[] { ssmDModel, ssmHVD, ssmNVH, ssmNKH, ssmKD, ssmVD, ssmCD, 0u });
+        }
+        // OPTIMIZATION: Persistent rowIndex buffer — written per token, reused instead of create+defer.
+        if (_persistentRowIndex == null)
+            _persistentRowIndex = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+        _persistentRowIndex.Write(new[] { rowIndex });
+
+        var _tsDecode = GlobalProfiler.Start();
+
         // ── Part 1: conv1d ───────────────────────────────────────────────────
         var kernelDecode = GetOrCreateKernel("ssm_gdn_decode", () => ComputeShaders.SsmGdnDecode);
         kernelDecode.SetArgument(0, xNorm.Buffer);
@@ -2043,22 +2073,18 @@ public class ComputeOps : IDisposable
         kernelDecode.SetArgument(7, dtBias.Buffer);
         kernelDecode.SetArgument(8, ssA.Buffer);
         kernelDecode.SetArgument(9, scratch.Buffer);
-
-        // RowIndex buffer (binding=10) — per-call, small (4 bytes), deferred disposal.
-        var rowIndexBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
-        rowIndexBuf.Write(new[] { rowIndex });
-        kernelDecode.SetArgument(10, rowIndexBuf);
-
-        // SSM params UBO (binding=11): DMODEL, HVD, NVH, NKH, KD, VD, CD (28 bytes, pad to 32).
-        var ssmParams = _device.CreateBuffer(32, BufferType.Storage, DataType.I32);
-        ssmParams.Write(new[] { ssmDModel, ssmHVD, ssmNVH, ssmNKH, ssmKD, ssmVD, ssmCD, 0u });
-        kernelDecode.SetArgument(11, ssmParams);
+        kernelDecode.SetArgument(10, _persistentRowIndex);
+        kernelDecode.SetArgument(11, _persistentSsmParams);
 
         // convGroups workgroups × 128 threads.
         _queue.Dispatch(kernelDecode, new[] { convGroups }, null);
 
+        GlobalProfiler.End(_tsDecode, "SSM_GPU.Decode");
+
         // Memory barrier between part 1 and part 2
         _queue.InsertMemoryBarrier();
+
+        var _tsRecur = GlobalProfiler.Start();
 
         // ── Part 2: recurrence ───────────────────────────────────────────────
         var kernelRecur = GetOrCreateKernel("ssm_gdn_recur", () => ComputeShaders.SsmGdnRecur);
@@ -2066,14 +2092,12 @@ public class ComputeOps : IDisposable
         kernelRecur.SetArgument(1, ssmState.Buffer);
         kernelRecur.SetArgument(2, ssmNorm.Buffer);
         kernelRecur.SetArgument(3, output.Buffer);
-
-        // SSM params UBO (binding=4): same layout as decode binding 11.
-        var ssmParams2 = _device.CreateBuffer(32, BufferType.Storage, DataType.I32);
-        ssmParams2.Write(new[] { ssmDModel, ssmHVD, ssmNVH, ssmNKH, ssmKD, ssmVD, ssmCD, 0u });
-        kernelRecur.SetArgument(4, ssmParams2);
+        kernelRecur.SetArgument(4, _persistentSsmParams);
 
         // vGroups workgroups × 128 threads
         _queue.Dispatch(kernelRecur, new[] { vGroups }, null);
+
+        GlobalProfiler.End(_tsRecur, "SSM_GPU.Recur");
 
         // Barrier after recur: ensures recur_N's writes (ssmState, output) are complete and visible
         // before the next decode_N+1 can start reading/writing scratch or ssmState.
@@ -2096,9 +2120,7 @@ public class ComputeOps : IDisposable
             Formats.QwenDbgTrace.Slice($"{p}_out_mid", output, (int)(ssmVD / 2), 8);
         }
 
-        Defer(rowIndexBuf);
-        Defer(ssmParams);
-        Defer(ssmParams2);
+        // OPTIMIZATION: Persistent buffers — no Defer needed (disposed in ComputeOps.Dispose).
     }
 
     #endregion
@@ -2180,6 +2202,10 @@ public class ComputeOps : IDisposable
         // cycle that triggers GPUVM faults on AMD RADV.
         if (_persistentOffsetInitialized)
             _persistentZeroOffset.Dispose();
+
+        // OPTIMIZATION: Dispose persistent SSM UBO buffers (created once, reused for all tokens).
+        _persistentSsmParams?.Dispose();
+        _persistentRowIndex?.Dispose();
 
         _queue.Dispose();
         _arena?.Dispose();

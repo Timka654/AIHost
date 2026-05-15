@@ -368,7 +368,9 @@ public class QwenHybridFormat : ITransformerFormat
 
             // Flush the sub-batch so GPU finishes this group before next
             // Note: Flush() also calls _arena.Reset() which reclaims all temp arena memory
+            var _tsFlush = GlobalProfiler.Start();
             if (b) o.Flush();
+            GlobalProfiler.End(_tsFlush, "SSM_GPU.FlushSub");
             // Trace ssmState after first sub-batch flush (GPU has executed).
             if (g <= 2 && ti == 0 && QwenDbgTrace.Once("ssm_state_post", g))
             {
