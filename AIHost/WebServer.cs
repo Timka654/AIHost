@@ -23,7 +23,7 @@ class WebServer
 
         builder.Logging.ClearProviders();
         builder.Logging.AddConsole();
-        var inMemoryLoggerProvider = new InMemoryLoggerProvider(maxEntries: 200000);
+        var inMemoryLoggerProvider = new InMemoryLoggerProvider(maxEntries: 900_000);
         builder.Logging.AddProvider(inMemoryLoggerProvider);
         builder.Services.AddSingleton(inMemoryLoggerProvider);
 

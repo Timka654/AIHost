@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Console;
 using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 
 namespace AIHost.Logging;
 
@@ -95,20 +96,32 @@ public class InMemoryLoggerProvider : ILoggerProvider
     }
 
     /// <summary>Get entries filtered by category (substring match).</summary>
-    public LogEntry[] GetEntries(out int count, string? categoryFilter = null, int? skip = null)
+    public LogEntry[] GetEntries(out int count, string? categoryFilter = null, int? skip = null, int? take = null, string? searchExpression = null)
     {
         var selector = _loggers.AsEnumerable();
 
         if (!string.IsNullOrEmpty(categoryFilter))
             selector = selector.Where(kv => kv.Key.Contains(categoryFilter, StringComparison.OrdinalIgnoreCase));
 
-        count = selector.Sum(x => x.Value.Count);
 
-        return selector
+        Regex? regex = null;
+
+        IEnumerable<LogEntry> _logsSelector = selector
             .SelectMany(kv => kv.Value.GetEntries())
-            .OrderBy(e => e.Timestamp)
+            .OrderBy(e => e.Timestamp);
+
+        if (!string.IsNullOrEmpty(searchExpression))
+        {
+            regex = new Regex(searchExpression, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+            _logsSelector = _logsSelector.Where(e => regex.IsMatch(e.Message));
+        }
+
+        count = _logsSelector.Count();
+
+        return _logsSelector
             .Skip(skip ?? 0)
-            .Take(2000)
+            .Take(take ?? 2000)
             .ToArray();
     }
 

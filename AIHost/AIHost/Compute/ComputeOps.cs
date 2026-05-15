@@ -3,6 +3,7 @@ using AIHost.ICompute;
 using AIHost.ICompute.Vulkan;
 using AIHost.Inference;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 
 namespace AIHost.Compute;
@@ -814,6 +815,9 @@ public class ComputeOps : IDisposable
     }
 
 
+    // One-shot GPU-vs-CPU dequant verification per data type.
+    private static readonly ConcurrentDictionary<DataType, bool> _dequantVerified = new();
+
     /// <summary>
     /// Универсальная деквантизация (автоопределение типа)
     /// </summary>
@@ -942,7 +946,41 @@ public class ComputeOps : IDisposable
             GlobalProfiler.End(_ts, "ComputeOps.DequantizeInto");
         }
 
-
+        // FIX: One-shot GPU-vs-CPU dequant verification (once per data type).
+        var dt = quantized.DataType;
+        if (_dequantVerified.TryAdd(dt, true))
+        {
+            try
+            {
+                int check = Math.Min(256, (int)target.Shape.TotalElements);
+                // Read only 1 superblock worth of raw bytes (≤256 elements), NOT entire buffer.
+                int bytesPerBlock = dt switch {
+                    DataType.Q2_K => 84, DataType.Q3_K => 110, DataType.Q4_K => 144,
+                    DataType.Q5_K => 176, DataType.Q6_K => 210, _ => check * 4
+                };
+                var raw = quantized.Buffer.ReadRange<byte>(0, bytesPerBlock);
+                var gpu = target.Buffer.ReadRange<float>(0, check);
+                var cpu = new float[check];
+                // FIX: pass check (not totalElements) — DequantizeRowCpu writes `dModel` floats into `cpu`,
+                // and `cpu` only has `check` elements allocated.
+                DequantizeRowCpu(dt, raw, 0, cpu, 0, check);
+                int mismatches = 0; float maxErr = 0f;
+                for (int i = 0; i < check; i++)
+                {
+                    float err = Math.Abs(gpu[i] - cpu[i]);
+                    if (err > 0.01f) { mismatches++; if (err > maxErr) maxErr = err; }
+                }
+                if (mismatches > 0)
+                {
+                    var s = new string[Math.Min(8, check)];
+                    for (int i = 0; i < s.Length; i++) s[i] = $"{i}:gpu={gpu[i]:F3} cpu={cpu[i]:F3}";
+                    _logger.LogError("[DIAG_DEQUANT_{Dtype}] MISMATCH {M}/{N} maxErr={E:F4} [{S}]",
+                        dt, mismatches, check, maxErr, string.Join(",", s));
+                }
+                else _logger.LogInformation("[DIAG_DEQUANT_{Dtype}] OK {N} elements", dt, check);
+            }
+            catch (Exception ex) { _logger.LogError("[DIAG_DEQUANT_{Dtype}] err={E}", dt, ex.Message); }
+        }
     }
 
     /// <summary>

@@ -157,6 +157,10 @@ public class InMemoryLogGetRequest
     public string? Category { get; set; }
 
     public int? Skip { get; set; }
+
+    public int Take { get; set; } = 2000;
+
+    public string? SearchExpression { get; set; }
 }
 
 /// <summary>
@@ -309,7 +313,7 @@ public class ManagementController : ControllerBase
         {
             LogEntry[] entries;
 
-            entries = _inMemoryLoggerProvider.GetEntries(out var count, data.Category, data.Skip);
+            entries = _inMemoryLoggerProvider.GetEntries(out var count, data.Category, data.Skip, data.Take, data.SearchExpression);
 
             return Ok(new
             {
