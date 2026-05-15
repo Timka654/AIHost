@@ -38,7 +38,9 @@ public class QwenHybridFormat : ITransformerFormat
     // SSM_Gpu IS the full attention mechanism for this layer type.
     static Tensor TypeA(TransformerBase t, Tensor x, int g, int li, uint pos, KVCache? kvc, TensorNameMapper nm, SSMState? ss)
     {
-        var o = t.Ops; int sl = x.Shape[0]; bool b = sl > 1;
+        // OPTIMIZATION: Always use batch mode — eliminates 15-20 GPU fence waits per layer in decode.
+        // Batch accumulates all GPU dispatches into one command buffer, flushed once at layer end.
+        var o = t.Ops; int sl = x.Shape[0]; bool b = true;
         t._logger.LogInformation("[TypeA] Layer {Layer} START sl={SeqLen}", g, sl);
         var _ts = GlobalProfiler.Start();
 
@@ -116,7 +118,8 @@ public class QwenHybridFormat : ITransformerFormat
     // ─── Type B ────────────────────────────────────────────────────────
     static Tensor TypeB(TransformerBase t, Tensor x, int g, int li, uint pos, KVCache? kvc, TensorNameMapper nm)
     {
-        var o = t.Ops; int sl = x.Shape[0]; bool b = sl > 1;
+        // OPTIMIZATION: Always use batch mode (same as TypeA/SSM_Gpu).
+        var o = t.Ops; int sl = x.Shape[0]; bool b = true;
         var anW = t.TempF32Named($"blk.{g}.attn_norm.weight"); var qW = t.TempF32Named($"blk.{g}.attn_q.weight"); var kW = t.TempF32Named($"blk.{g}.attn_k.weight"); var vW = t.TempF32Named($"blk.{g}.attn_v.weight");
         var oW = t.TempF32Named($"blk.{g}.attn_output.weight"); var pW = t.TempF32Named($"blk.{g}.post_attention_norm.weight");
         // MoE fallback: prefer shared-expert weights (ffn_*_shexp) if present (Qwen3Next), else dense ffn_*.weight.
@@ -225,7 +228,8 @@ public class QwenHybridFormat : ITransformerFormat
         int KD = t._ssmKD, VD = t._ssmVD, CD = t._ssmCD;
         const int SUB_BATCH = 8; // tokens per GPU submit
         int dm = xn.Shape[1];
-        bool b = sl > 1;
+        // OPTIMIZATION: Always use batch mode (same as TypeA).
+        bool b = true;
 
         // ── Debug: log key params for first few layers ────────────────
         if (g <= 2 && QwenDbgTrace.Once("ssm_params", g))
