@@ -255,32 +255,19 @@ public class ComputeOps : IDisposable
             // Upload chunk as a temporary quantized tensor (same dtype, shape [K, actual])
             var chunkBuf    = _device.CreateBuffer((ulong)rawBytes.Length, ICompute.BufferType.Storage, DataType.I8);
             chunkBuf.Write(rawBytes);
-            var chunkTensor = new Tensor(chunkBuf, TensorShape.Matrix(K, actual), quantized.DataType, "w_chunk");
+            // FIX: shape must be [actual, K] (vocab_entries × model_dim), NOT [K, actual].
+            // Dequantize processes the FIRST dimension as "rows", and each weight row
+            // is one vocabulary entry with K dimensions.  The old [K, actual] shape
+            // told the dequant shader to process K=5120 rows of actual elements,
+            // massively overrunning the chunk buffer and producing garbage logits.
+            var chunkTensor = new Tensor(chunkBuf, TensorShape.Matrix(actual, K), quantized.DataType, "w_chunk");
 
-            // Dequantize and matmul
+            // Dequantize → [actual, K] row-major F32.  Use MatMulWeightsT which
+            // treats B as [actual, K] row-major and computes A × B^T = [M, actual].
             var chunkF32    = Dequantize(chunkTensor);
             chunkTensor.Dispose();
-            // FIX: Dequantize produces row-major F32, NOT column-major (GGUF).
-            // Must use MatMul (row-major), not MatMulWeights (expects column-major GGUF layout).
-            var partialLogits = MatMul(a, chunkF32, "partial_logits");
+            var partialLogits = MatMulWeightsT(a, chunkF32, "partial_logits");
             chunkF32.Dispose();
-
-            // DIAG: verify first chunk produces reasonable logits
-            if (c == 0)
-            {
-                try
-                {
-                    int checkN = Math.Min(actual, 16);
-                    var firstChunkVals = partialLogits.Buffer.ReadRange<float>(0, checkN);
-                    float maxV = firstChunkVals.Max();
-                    float minV = firstChunkVals.Min();
-                    int maxIdx = Array.IndexOf(firstChunkVals, maxV);
-                    // Use Console.Write so it appears in docker logs
-                    Console.WriteLine($"[DIAG_CHUNK0] actual={actual} range=[{minV:F3},{maxV:F3}] maxIdx={maxIdx} vals=[{string.Join(",", firstChunkVals.Take(8).Select(v=>v.ToString("F3")))}]");
-                    Console.Out.Flush();
-                }
-                catch { }
-            }
 
             // Scatter partial [M, actual] into result [M, N] at column offset `start`
             ScatterCols(result, partialLogits, start);

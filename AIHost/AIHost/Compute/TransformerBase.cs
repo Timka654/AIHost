@@ -212,23 +212,17 @@ public class TransformerBase : IDisposable
         _ops.LayerNorm(x, normF32);
         if (!normScratch) normF32.Dispose();
 
-        // DIAG: post-norm hidden state (first 16 values)
-        try
-        {
-            var postNorm = x.Buffer.ReadRange<float>(0, 16);
-            float rms = MathF.Sqrt(postNorm.Sum(v => v * v) / 16);
-            _logger.LogWarning("[DIAG_HEAD] Post-norm rms={Rms:F4} vals=[{Vals}]",
-                rms, string.Join(",", postNorm.Select(v => v.ToString("F4"))));
-        }
-        catch { }
-
-        // Use chunked matmul if output.weight would need >1 GB F32 (large-vocab models).
         var outWeightCached = _weightCache[_nameMapper.OutputWeight];
         long outF32Bytes = (long)outWeightCached.Shape.TotalElements * sizeof(float);
         _logger.LogWarning("[DIAG_HEAD] outWeight shape=[{D0},{D1}] dtype={DT} f32Bytes={Bytes}",
             outWeightCached.Shape[0], outWeightCached.Shape[1], outWeightCached.DataType, outF32Bytes);
+
         if (outF32Bytes > 1L * 1024 * 1024 * 1024)
         {
+            // FIX: Force GPU flush before chunked matmul to ensure LayerNorm
+            // results on 'x' are visible.  Without this, MatMulWeightsLarge may
+            // read stale data from previous operations in batch/prefill mode.
+            _ops.Flush();
             var chunkedLogits = _ops.MatMulWeightsLarge(x, outWeightCached, "logits");
             x.Dispose();
             return chunkedLogits;
@@ -286,17 +280,23 @@ public class TransformerBase : IDisposable
             if (i == 31) DiagHidden("after_layer31", x, diagEnabled);
         }
         _logger.LogInformation("[FWD] Layer loop done");
-        DiagHidden("before_head", x, diagEnabled);
 
-        // Unconditional DIAG: dump final hidden state (first 32 values) before lm_head
+        // Unconditional DIAG: dump LAST token's hidden state before lm_head
+        // CRITICAL: ReadRange<float> takes BYTE offset (ulong), NOT float index (int).
+        // Prefill (batch) mode: x.Shape[0] = numTokens (e.g. 54)
+        // Decode mode: x.Shape[0] = 1
         {
             try
             {
-                int take = Math.Min(x.Shape[1], 32);
-                var v = x.Buffer.ReadRange<float>(0, take);
+                int dModel = x.Shape[1];
+                int lastRow = x.Shape[0] - 1;
+                ulong byteOff = (ulong)(lastRow * dModel * sizeof(float));
+                int take = Math.Min(dModel, 32);
+                var v = x.Buffer.ReadRange<float>(byteOff, take);
                 float rms = MathF.Sqrt(v.Sum(val => val * val) / take);
-                _logger.LogWarning("[DIAG_FINAL_HIDDEN] rms={Rms:F4} vals=[{Vals}]",
-                    rms, string.Join(",", v.Select(f => f.ToString("F4"))));
+                _logger.LogWarning("[DIAG_FINAL_HIDDEN] seqLen={SeqLen} row={Row} byteOff={Off} rms={Rms:F4} vals=[{Vals}]",
+                    x.Shape[0], lastRow, byteOff, rms,
+                    string.Join(",", v.Select(f => f.ToString("F4"))));
             }
             catch (Exception diagEx) { _logger.LogWarning("[DIAG_FINAL_HIDDEN] err={Err}", diagEx.Message); }
         }
