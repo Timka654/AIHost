@@ -291,10 +291,12 @@ public class ComputeOps : IDisposable
                         for (int j = 0; j < K; j++) dot += hRead[j] * gRead[v * K + j]; // [actual,K] layout
                         gpuRef[v] = dot;
                     }
-                    _logger.LogError($"[DIAG_CHUNK0_REF] refV={refV} cpuTop=[{string.Join(",", cpuRef.Select((x,i)=>(x,i)).OrderByDescending(p=>p.x).Take(5).Select(p=>$"{p.i}={p.Item1:F3}"))}] gpuMatch=[{string.Join(",", cpuRef.Zip(gpuRef,(c,g)=>Math.Abs(c-g)<0.001f?"✓":$"{(c-g):F3}"))}]");
-                    Console.Error.Flush();
+                    _logger.LogError("[DIAG_CHUNK0_REF] refV={RefV} cpuTop=[{CpuTop}] gpuMatch=[{GpuMatch}]",
+                        refV,
+                        string.Join(",", cpuRef.Select((x,i)=>(x,i)).OrderByDescending(p=>p.x).Take(5).Select(p=>$"{p.i}={p.Item1:F3}")),
+                        string.Join(",", cpuRef.Zip(gpuRef,(c,g)=>Math.Abs(c-g)<0.001f?"✓":$"{(c-g):F3}")));
                 }
-                catch (Exception ex) { _logger.LogError($"[DIAG_CHUNK0_REF] err={ex.Message}"); Console.Error.Flush(); }
+                catch (Exception ex) { _logger.LogError("[DIAG_CHUNK0_REF] err={Err}", ex.Message); }
             }
 
             var partialLogits = MatMulWeightsT(a, chunkF32, "partial_logits");
