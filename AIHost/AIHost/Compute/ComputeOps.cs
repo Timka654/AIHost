@@ -709,7 +709,10 @@ public class ComputeOps : IDisposable
 
         uint totalElements = (uint)quantized.Shape.TotalElements;
         uint totalGroups = (totalElements + 255) / 256;
-        const uint MaxGroupsPerDispatch = 32768;
+        // FIX: AMD iGPU (RADV RENOIR) cannot handle 32768 workgroups per dispatch
+        // without triggering GPU timeout → ErrorDeviceLost. Reduce to 4096 groups
+        // per chunk (1M elements) to stay within TDR limits.
+        const uint MaxGroupsPerDispatch = 4096;
         const uint SuperblockElements = 256;
 
         if (totalGroups <= MaxGroupsPerDispatch)
@@ -726,7 +729,10 @@ public class ComputeOps : IDisposable
             // MaybeFlush() only inserts vkCmdPipelineBarrier — all 93 chunks stay in
             // one command buffer → ErrorDeviceLost at vkQueueSubmit.
             // Real Flush() submits, waits for fence, and resets descriptor ring.
-            const uint ChunksPerSubBatch = 16;
+            // FIX: Flush after EVERY chunk on AMD iGPUs.
+            // Any command buffer accumulation >16K workgroups causes GPU
+            // timeout → ErrorDeviceLost (RADV RENOIR, iGPU).
+            const uint ChunksPerSubBatch = 1;
             for (uint chunk = 0; chunk < numChunks; chunk++)
             {
                 uint chunkStartGroup = chunk * groupsPerChunk;

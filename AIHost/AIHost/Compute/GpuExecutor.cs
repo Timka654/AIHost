@@ -150,6 +150,14 @@ internal sealed class GpuExecutor : IDisposable
         _logger.LogInformation("[DBG_EXEC] #{TaskId} DISPATCH kernel={Kernel} tag={Tag} args={ArgCount}",
             task.TaskId, task.KernelName, task.OpTag ?? "?", task.ArgCount);
 
+        // FIX: Clear stale buffer arguments from previous dispatches.
+        // VulkanComputeKernel.SetArgument() only overwrites by index but does not
+        // truncate _bufferArguments. If dispatch N has 3 args and dispatch N+1 has
+        // 2 args, arg #3 from dispatch N persists. UpdateDescriptorSets() then writes
+        // ALL _bufferArguments as descriptor updates, binding a disposed/stale buffer
+        // to the GPU → ErrorDeviceLost on vkQueueSubmit (AMD RADV RENOIR).
+        kernel.ClearArguments();
+
         for (int i = 0; i < task.ArgCount; i++)
         {
             var arg = task.Arguments[i];
