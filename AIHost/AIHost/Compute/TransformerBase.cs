@@ -411,11 +411,25 @@ public class TransformerBase : IDisposable
         if (embCached.DataType == DataType.F32)
         {
             var f32 = _ops.Clone(embCached);
-            var result = _ops.EmbeddingLookup(tokenIds, f32, "embeddings");
+            var resultF32 = _ops.EmbeddingLookup(tokenIds, f32, "embeddings");
             f32.Dispose();
+            return resultF32;
+        }
+        // FIX: Scratch buffer already contains dequantized F32 data from
+        // RunCpuReferenceLayer0 (called during LoadWeights). Re-dequantizing
+        // 4.85 GB token_embd.weight through TempF32 issues 93+ chunk dispatches
+        // that exhaust VRAM on iGPUs (AMD RADV RENOIR: ErrorDeviceLost at vkQueueSubmit).
+        // Use scratch directly — it was filled by the earlier DequantizeInto and
+        // is guaranteed to be valid after the LoadWeights flush.
+        if (_scratchF32.TryGetValue(_nameMapper.TokenEmbd, out var scratchEmb))
+        {
+            var result = _ops.EmbeddingLookup(tokenIds, scratchEmb, "embeddings");
             return result;
         }
-        return _ops.EmbeddingLookupFromQuantized(tokenIds, embCached, "embeddings");
+        // Fallback (should not happen): scratch buffer not available
+        var (embF32, _) = TempF32(_nameMapper.TokenEmbd);
+        var result2 = _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
+        return result2;
     }
 
     private void TryAllocateScratch(string layerPrefix)
@@ -429,7 +443,13 @@ public class TransformerBase : IDisposable
 
     private void TryAllocateScratchHead()
     {
-        foreach (var name in new[] { "output.weight", "token_embd.weight" })
+        // FIX: On iGPUs with limited VRAM (RADV RENOIR, ~24.5 GB), allocating
+        // both token_embd.weight AND output.weight scratches (4.85 GB each = 9.7 GB)
+        // exhausts VRAM before any inference can run.
+        //
+        // token_embd.weight: MUST have scratch — used per forward pass for embedding lookup.
+        // output.weight: handled via MatMulWeightsLarge chunked path — NO scratch needed.
+        foreach (var name in new[] { "token_embd.weight" /*, "output.weight" — skip */ })
         {
             if (!_weightCache.TryGetValue(name, out var cached)) continue;
             if (cached.DataType == DataType.F32) continue;

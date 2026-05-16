@@ -3,17 +3,13 @@ using AIHost.ICompute;
 using AIHost.ICompute.Vulkan;
 using AIHost.Inference;
 using Microsoft.Extensions.Logging;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
 
 namespace AIHost.Compute;
 
-/// <summary>
-/// Channel-only GPU compute API. All dispatches go through GpuExecutor
-/// (dedicated thread) — one command buffer, one fence wait per token.
-/// No fallback — USE_CHANNEL is always true.
-/// </summary>
 public class ComputeOps : IDisposable
 {
     private readonly IComputeDevice _device;
@@ -127,7 +123,6 @@ public class ComputeOps : IDisposable
 
         _logger.LogInformation("[DBG_OPS] #{TaskId} FLUSH_COMPLETE", task.TaskId);
 
-        ResetAllKernelDispatchRings();
         FlushDeferred();
         _arena?.Reset();
     }
@@ -273,7 +268,7 @@ public class ComputeOps : IDisposable
     public unsafe Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedEmb, string? resultName = null)
     {
         var f32 = Dequantize(quantizedEmb);
-        DeferExternal(f32); // FIX: dequantized token_embd F32 (5.1 GB) must be disposed after Flush
+        DeferExternal(f32); // FIX: dequantized token_embd F32 (up to 5 GB) must be disposed after Flush
         var tokenBuf = _device.CreateBuffer((ulong)(tokenIds.Length * sizeof(int)), BufferType.Storage, DataType.I32);
         tokenBuf.Write(tokenIds);
         DeferExternal(tokenBuf); // FIX: temp buffer must be disposed after Flush
@@ -727,6 +722,11 @@ public class ComputeOps : IDisposable
         {
             uint groupsPerChunk = MaxGroupsPerDispatch;
             uint numChunks = (totalGroups + groupsPerChunk - 1) / groupsPerChunk;
+            // FIX: Break giant dequant into sub-batches of 16 chunks with actual Flush().
+            // MaybeFlush() only inserts vkCmdPipelineBarrier — all 93 chunks stay in
+            // one command buffer → ErrorDeviceLost at vkQueueSubmit.
+            // Real Flush() submits, waits for fence, and resets descriptor ring.
+            const uint ChunksPerSubBatch = 16;
             for (uint chunk = 0; chunk < numChunks; chunk++)
             {
                 uint chunkStartGroup = chunk * groupsPerChunk;
@@ -735,11 +735,14 @@ public class ComputeOps : IDisposable
                 uint elementOffset = chunkStartGroup * SuperblockElements;
                 var offsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
                 offsetBuf.Write(new[] { elementOffset });
-                DeferExternal(offsetBuf); // FIX: temp buffer must be disposed after Flush
+                DeferExternal(offsetBuf);
                 EmitDispatch(kernelName,
                     [quantized.Buffer, target.Buffer, offsetBuf], 3,
                     [chunkGroups, 1, 1], "deq_chunk");
-                MaybeFlush();
+
+                // Flush every ChunksPerSubBatch chunks
+                if ((chunk + 1) % ChunksPerSubBatch == 0 && chunk + 1 < numChunks)
+                    Flush();
             }
         }
     }
