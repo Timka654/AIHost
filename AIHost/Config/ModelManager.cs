@@ -277,12 +277,13 @@ public class ModelManager : IDisposable
                 requireDeviceLocal: !config.AllowSharedMemory);
             var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
             var transformer = TransformerFactory.Create(device, ggufModel);
-            // FIX: Attach arena BEFORE LoadWeights so scratch F32 tensors
-            // (output.weight, token_embd.weight = 3.1 GB each) can use the pre-allocated
-            // arena memory instead of separate vkAllocateMemory calls that would exceed VRAM.
-            TryAttachArena(device, transformer, config);
-
             transformer.LoadWeights();
+
+            // Arena allocator (Vulkan only) — created AFTER weights to avoid
+            // VRAM exhaustion. Arena holds KV cache + per-frame scratch; in
+            // channel mode KV cache is managed separately, but arena still
+            // provides temp buffers for SSM (wZ padded, concat, scratch).
+            TryAttachArena(device, transformer, config);
 
             engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize, config.MaxConcurrency);
         }
