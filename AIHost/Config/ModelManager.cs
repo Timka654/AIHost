@@ -276,14 +276,35 @@ public class ModelManager : IDisposable
                 config.EnableMmap, config.EnableMlock,
                 requireDeviceLocal: !config.AllowSharedMemory);
             var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
+
+            // ═══ VRAM BUDGET: build allocation plan BEFORE any allocation ═══
+            long userLimitMb = config.Devices?[0].VramLimitMb ?? 0;
+            long userLimitBytes = userLimitMb > 0 ? userLimitMb * 1024 * 1024 : 0;
+            bool allowShared = config.Devices?[0].AllowSharedMemory ?? config.AllowSharedMemory;
+            var heapInfo = device.GetHeapInfo();
+            var vramLimit = new AIHost.ICompute.DeviceVramLimit(heapInfo, userLimitBytes, allowShared);
+
+            // Build plan from GGUF metadata
+            var plan = BuildAllocationPlan(ggufModel, config, modelName);
+            var validation = plan.Validate(vramLimit);
+
+            if (!validation.IsValid)
+            {
+                _logger.LogError("[VRAM] Budget exceeded for {Model}:\n{Report}", modelName, validation.GetDetailedReport());
+                throw new AIHost.ICompute.InsufficientVramException(
+                    (ulong)plan.TotalBytes,
+                    validation.GetDetailedReport());
+            }
+
+            _logger.LogInformation("[VRAM] Budget OK: {RequiredMB}MB required, {AvailableMB}MB available, " +
+                                   "{TensorCount} tensors, arena={ArenaMB}MB, kv_cache={KvCacheMB}MB",
+                plan.TotalBytes / (1024 * 1024), vramLimit.FreeDeviceLocalBytes / (1024 * 1024),
+                plan.TensorCount, plan.ArenaBytes / (1024 * 1024), plan.KvCacheBytes / (1024 * 1024));
+            // ═══════════════════════════════════════════════════════════════
+
             var transformer = TransformerFactory.Create(device, ggufModel);
 
-            // FIX: Arena MUST be attached BEFORE LoadWeights.
-            // LoadWeights calls AllocateScratchWeights → TryAllocateScratchHead
-            // which creates scratch F32 tensors for output/token_embd.weight (5.1 GB each).
-            // If arena is not yet allocated, these scratch allocations fail,
-            // and later Dequantize(token_embd) tries to allocate 5.1 GB on top of arena,
-            // exceeding 24 GB VRAM (17.6 weights + 2.5 arena + 5.1 dequant = 25.2 > 24).
+            // Arena MUST be attached BEFORE LoadWeights — allocates from budget
             TryAttachArena(device, transformer, config);
 
             transformer.LoadWeights();
@@ -631,6 +652,72 @@ public class ModelManager : IDisposable
         // Round to 64 MB
         long rounded = (long)((total + 64L * 1024 * 1024 - 1) / (64L * 1024 * 1024)) * 64;
         return (int)Math.Max(64, rounded);
+    }
+
+    /// <summary>
+    /// Build a <see cref="ModelAllocationPlan"/> from GGUF metadata before any allocations.
+    /// Calculates: weight bytes, arena size, KV cache size, runtime pool.
+    /// </summary>
+    private static AIHost.ICompute.ModelAllocationPlan BuildAllocationPlan(
+        AIHost.GGUF.IGGUFModel ggufModel, ModelConfig config, string modelName)
+    {
+        long weightBytes = 0;
+        int tensorCount = 0;
+        int? vocabSize = null;
+        int dModel = 0, numLayers = 0, numKVHeads = 0, headDim = 0;
+
+        // Extract model dimensions from GGUF metadata
+        if (ggufModel.Reader.Metadata.TryGetValue<int>("gguf.block_count", out var bc)) numLayers = bc;
+        if (ggufModel.Reader.Metadata.TryGetValue<int>("gguf.embedding_length", out var el)) dModel = el;
+        if (ggufModel.Reader.Metadata.TryGetValue<int>("gguf.attention.head_count_kv", out var kvh)) numKVHeads = kvh;
+        if (ggufModel.Reader.Metadata.TryGetValue<int>("gguf.attention.key_length", out var kl)) headDim = kl;
+
+        // Vocab size: try GGUF metadata or count from tokenizer tokens
+        if (ggufModel.Reader.Metadata.TryGetValue<int>("gguf.vocab_size", out var vs))
+            vocabSize = vs;
+        else if (ggufModel.Reader.Metadata.TryGetValue<string[]>("gguf.tokenizer.ggml.tokens", out var tokens))
+            vocabSize = tokens.Length;
+
+        // Sum all tensor byte sizes
+        foreach (var t in ggufModel.Reader.Tensors)
+        {
+            // Skip alignment padding — GGUF stores only the actual type size
+            weightBytes += (long)t.SizeInBytes;
+            tensorCount++;
+        }
+
+        // Arena: auto-calculate or from config
+        int arenaMb = config.ArenaSizeMb ?? 512; // 512 MB safe default for all models
+        long arenaBytes = (long)arenaMb * 1024 * 1024;
+
+        // KV cache: context_size × kvHeads × headDim × 2 (K+V) × sizeof(float)
+        // Must be at least 1 for default context
+        int ctx = Math.Max(1, config.Parameters.ContextSize);
+        long kvCacheBytes = 0;
+        if (numKVHeads > 0 && headDim > 0)
+            kvCacheBytes = (long)ctx * numKVHeads * headDim * 2L * 4L;
+
+        // Scratch F32: small per-layer dequant buffers (heuristic ≈ 10% of largest layer weight)
+        long scratchF32Bytes = (long)Math.Max(1, numLayers) * dModel * 128L * 4L; // ~65 MB for 64-layer model
+
+        // Runtime pool: largest single allocation = Dequantize(token_embd) = vocabSize × dModel × 4
+        long runtimePoolBytes = (long)(vocabSize ?? 150000) * Math.Max(1, dModel) * 4L;
+
+        return new AIHost.ICompute.ModelAllocationPlan
+        {
+            ModelName = modelName,
+            WeightBytes = weightBytes,
+            ArenaBytes = arenaBytes,
+            KvCacheBytes = kvCacheBytes,
+            ScratchF32Bytes = scratchF32Bytes,
+            RuntimePoolBytes = runtimePoolBytes,
+            TensorCount = tensorCount,
+            LayerMap = new[] { new AIHost.ICompute.LayerAssignment
+            {
+                DeviceIndex = 0, FirstLayer = 0, LastLayerExclusive = numLayers,
+                OwnsEmbedding = true, OwnsHead = true
+            }}
+        };
     }
 
     public void Dispose()

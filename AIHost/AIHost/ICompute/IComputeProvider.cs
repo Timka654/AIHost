@@ -16,6 +16,12 @@ public abstract class ComputeProviderBase : IComputeDevice
     public abstract void Dispose();
 
     /// <summary>
+    /// Получить карту heap'ов устройства. По умолчанию — пустой массив.
+    /// Провайдеры с нативным запросом (Vulkan) переопределяют.
+    /// </summary>
+    public virtual VramHeapInfo[] GetHeapInfo() => Array.Empty<VramHeapInfo>();
+
+    /// <summary>
     /// По умолчанию возвращает информацию только из трекера аллокаций.
     /// Провайдеры, поддерживающие нативный запрос памяти (Vulkan), переопределяют этот метод.
     /// </summary>

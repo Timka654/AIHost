@@ -69,4 +69,11 @@ public interface IComputeDevice : IDisposable
     /// Получить информацию о памяти устройства (VRAM).
     /// </summary>
     DeviceMemoryInfo GetMemoryInfo();
+
+    /// <summary>
+    /// Получить карту heap'ов устройства для системы резервирования VRAM.
+    /// Возвращает все heap'ы с флагами (DEVICE_LOCAL, HOST_VISIBLE, HOST_COHERENT).
+    /// Используется <see cref="VramBudget.DeviceVramLimit"/> для расчёта бюджета.
+    /// </summary>
+    VramHeapInfo[] GetHeapInfo();
 }

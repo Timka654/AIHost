@@ -64,8 +64,10 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             SharingMode = SharingMode.Exclusive
         };
 
-        if (_vk.CreateBuffer(device, &bufferInfo, null, out _buffer) != Result.Success)
-            throw new InvalidOperationException("Failed to create Vulkan buffer");
+        var createResult = _vk.CreateBuffer(device, &bufferInfo, null, out _buffer);
+        if (createResult != Result.Success)
+            throw new InvalidOperationException(
+                $"Failed to create Vulkan buffer: {createResult} (size={size / (1024.0 * 1024.0):F1}MB, type={type}, elementType={elementType})");
 
         MemoryRequirements req;
         _vk.GetBufferMemoryRequirements(device, _buffer, &req);

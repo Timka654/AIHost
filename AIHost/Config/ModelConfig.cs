@@ -169,6 +169,20 @@ public class MultiGpuDeviceConfig
     /// </summary>
     [JsonPropertyName("layers")]
     public int? Layers { get; set; }
+
+    /// <summary>
+    /// VRAM limit in MB for this device. 0 = autodetect from heap.
+    /// Overrides global vram_limit_mb.
+    /// </summary>
+    [JsonPropertyName("vram_limit_mb")]
+    public long VramLimitMb { get; set; } = 0;
+
+    /// <summary>
+    /// Allow HOST_VISIBLE (system RAM) fallback when VRAM is insufficient.
+    /// Overrides model-level allow_shared_memory.
+    /// </summary>
+    [JsonPropertyName("allow_shared_memory")]
+    public bool? AllowSharedMemory { get; set; }
 }
 
 /// <summary>

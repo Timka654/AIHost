@@ -965,6 +965,58 @@ public class ManagementController : ControllerBase
     }
 
     /// <summary>
+    /// List ALL available Vulkan/CUDA/ROCm devices with heap maps.
+    /// Use to identify which device_index maps to which physical GPU.
+    /// </summary>
+    [HttpGet("system/devices")]
+    public IActionResult GetAvailableDevices()
+    {
+        try
+        {
+            var result = new List<object>();
+            const string VULKAN = "vulkan";
+
+            // Vulkan — can query without creating a full device
+            var vkDevices = AIHost.ICompute.Vulkan.VulkanComputeDevice.GetAvailableDevices();
+            foreach (var d in vkDevices)
+            {
+                // Get heap info for each device by creating a temporary context
+                List<object>? heaps = null;
+                try
+                {
+                    var ctx = AIHost.ICompute.Vulkan.VulkanGlobalContext.AcquireDeviceContext(d.Index, queueCount: 1);
+                    var heapInfo = new AIHost.ICompute.Vulkan.VulkanComputeDevice(d.Index).GetHeapInfo();
+                    heaps = heapInfo.Select(h => new
+                    {
+                        index = h.Index,
+                        total_mb = h.TotalSize / (1024 * 1024),
+                        device_local = h.IsDeviceLocal,
+                        host_visible = h.IsHostVisible,
+                        host_coherent = h.IsHostCoherent
+                    }).ToList<object>();
+                }
+                catch { /* some devices may fail to create context */ }
+
+                result.Add(new
+                {
+                    index = d.Index,
+                    name = d.Name,
+                    api_version = d.ApiVersion,
+                    device_type = d.DeviceType,
+                    provider = VULKAN,
+                    heaps
+                });
+            }
+
+            return Ok(new { devices = result, total = result.Count });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
     /// Get performance metrics for all models
     /// </summary>
     [HttpGet("performance")]

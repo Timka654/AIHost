@@ -122,6 +122,18 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
         
         _logger.LogInformation($"Vulkan Device [{deviceIndex}]: {DeviceName}");
         _logger.LogInformation($"API Version: {ApiVersion}");
+
+        // Log device limits for debugging buffer allocation failures
+        PhysicalDeviceProperties2 props2 = new PhysicalDeviceProperties2
+        {
+            SType = StructureType.PhysicalDeviceProperties2,
+            PNext = null
+        };
+        _deviceContext.Vk.GetPhysicalDeviceProperties2(_deviceContext.PhysicalDevice, &props2);
+        _logger.LogInformation("[VkLimits] maxStorageBufferRange={MaxBufMB:F0}MB " +
+                               "maxMemoryAllocationCount={MaxMemAlloc}",
+            props2.Properties.Limits.MaxStorageBufferRange / (1024.0 * 1024.0),
+            props2.Properties.Limits.MaxMemoryAllocationCount);
     }
 
     public override IComputeBuffer CreateBuffer(ulong size, BufferType type, DataType elementType = DataType.F32, bool requireDeviceLocal = false)
@@ -163,18 +175,19 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
         PhysicalDeviceMemoryProperties memProps;
         _deviceContext.Vk.GetPhysicalDeviceMemoryProperties(_deviceContext.PhysicalDevice, &memProps);
 
-        ulong totalHeapSize = 0;
-        ulong usedEstimate = 0;
+        ulong totalDeviceLocalHeaps = 0;
+        ulong totalNonDeviceLocalHeaps = 0;
 
-        // Суммируем все heap'ы, которые являются DEVICE_LOCAL (VRAM)
+        // Sum all heaps, separated by device-local status.
+        // On APUs, DEVICE_LOCAL includes shared system RAM — not all of it is usable.
+        // Non-DEVICE_LOCAL heaps are HOST_VISIBLE fallback.
         for (uint i = 0; i < memProps.MemoryHeapCount; i++)
         {
             var heap = memProps.MemoryHeaps[(int)i];
-            // Проверяем, есть ли хотя бы один memory type в этом heap'е с DEVICE_LOCAL
             bool hasDeviceLocal = false;
             for (uint j = 0; j < memProps.MemoryTypeCount; j++)
             {
-                if ((memProps.MemoryTypes[(int)j].HeapIndex == i) &&
+                if (memProps.MemoryTypes[(int)j].HeapIndex == i &&
                     (memProps.MemoryTypes[(int)j].PropertyFlags & MemoryPropertyFlags.DeviceLocalBit) != 0)
                 {
                     hasDeviceLocal = true;
@@ -183,24 +196,60 @@ public unsafe class VulkanComputeDevice : ComputeProviderBase
             }
 
             if (hasDeviceLocal)
-            {
-                totalHeapSize += heap.Size;
-            }
+                totalDeviceLocalHeaps += heap.Size;
+            else
+                totalNonDeviceLocalHeaps += heap.Size;
         }
 
-        // Используем трекер аллокаций как оценку used
-        usedEstimate = (ulong)ComputeBufferBase.TotalAllocatedBytes;
-        if (usedEstimate > totalHeapSize)
-            usedEstimate = totalHeapSize;
+        ulong tracked = (ulong)ComputeBufferBase.TotalAllocatedBytes;
+        ulong usedDeviceLocal = Math.Min(tracked, totalDeviceLocalHeaps);
+        long availableDeviceLocal = (long)(totalDeviceLocalHeaps - usedDeviceLocal);
 
         return new DeviceMemoryInfo
         {
-            TotalBytes = (long)totalHeapSize,
-            AvailableBytes = (long)(totalHeapSize - usedEstimate),
-            UsedBytes = (long)usedEstimate,
+            TotalBytes = (long)totalDeviceLocalHeaps,
+            AvailableBytes = availableDeviceLocal,
+            UsedBytes = (long)usedDeviceLocal,
             TrackedAllocatedBytes = ComputeBufferBase.TotalAllocatedBytes,
             SupportsNativeQuery = true
         };
+    }
+
+    /// <summary>
+    /// Возвращает карту всех heap'ов для системы резервирования VRAM.
+    /// </summary>
+    public override VramHeapInfo[] GetHeapInfo()
+    {
+        PhysicalDeviceMemoryProperties memProps;
+        _deviceContext.Vk.GetPhysicalDeviceMemoryProperties(_deviceContext.PhysicalDevice, &memProps);
+
+        var heaps = new VramHeapInfo[memProps.MemoryHeapCount];
+        for (uint i = 0; i < memProps.MemoryHeapCount; i++)
+        {
+            var heap = memProps.MemoryHeaps[(int)i];
+
+            // Определяем флаги по memory type'ам в этом heap'е
+            bool isDeviceLocal = false, isHostVisible = false, isHostCoherent = false;
+            for (uint j = 0; j < memProps.MemoryTypeCount; j++)
+            {
+                if (memProps.MemoryTypes[(int)j].HeapIndex != i) continue;
+                var flags = memProps.MemoryTypes[(int)j].PropertyFlags;
+                if ((flags & MemoryPropertyFlags.DeviceLocalBit) != 0) isDeviceLocal = true;
+                if ((flags & MemoryPropertyFlags.HostVisibleBit) != 0) isHostVisible = true;
+                if ((flags & MemoryPropertyFlags.HostCoherentBit) != 0) isHostCoherent = true;
+            }
+
+            heaps[i] = new VramHeapInfo
+            {
+                Index = (int)i,
+                TotalSize = (long)heap.Size,
+                AvailableSize = -1, // Vulkan не даёт available напрямую — используем трекер
+                IsDeviceLocal = isDeviceLocal,
+                IsHostVisible = isHostVisible,
+                IsHostCoherent = isHostCoherent
+            };
+        }
+        return heaps;
     }
 
     internal VulkanDeviceContext DeviceContext => _deviceContext;
