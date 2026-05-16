@@ -45,6 +45,35 @@ public abstract class ComputeBufferBase : IComputeBuffer
     private static long _allocationCount;
     private static long _freeCount;
 
+    // ── Allocation tracking stack traces (for leak debugging) ────────────
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<string> _allocTraces = new();
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<string> _freeTraces = new();
+
+    /// <summary>Last N allocation stack traces (most recent first).</summary>
+    public static string[] GetAllocTraces(int n = 50)
+    {
+        var all = _allocTraces.ToArray();
+        return all.Reverse().Take(n).ToArray();
+    }
+
+    /// <summary>Last N free stack traces (most recent first).</summary>
+    public static string[] GetFreeTraces(int n = 50)
+    {
+        var all = _freeTraces.ToArray();
+        return all.Reverse().Take(n).ToArray();
+    }
+
+    /// <summary>Get allocation stats as a formatted string.</summary>
+    public static string GetStats()
+    {
+        long alloc = Interlocked.Read(ref _allocationCount);
+        long free = Interlocked.Read(ref _freeCount);
+        long active = Interlocked.Read(ref _activeBufferCount);
+        long total = Interlocked.Read(ref _totalAllocatedBytes);
+        long peak = Interlocked.Read(ref _peakAllocatedBytes);
+        return $"alloc={alloc} free={free} active={active} totalMB={total / 1024 / 1024} peakMB={peak / 1024 / 1024}";
+    }
+
     /// <summary>Глобальный трекер выделенной памяти через все буферы (в байтах).</summary>
     public static long TotalAllocatedBytes => Interlocked.Read(ref _totalAllocatedBytes);
 
@@ -74,6 +103,16 @@ public abstract class ComputeBufferBase : IComputeBuffer
         Interlocked.Increment(ref _activeBufferCount);
         Interlocked.Increment(ref _allocationCount);
 
+        // Capture stack trace for leak debugging (truncated to 3 deepest frames)
+        var st = Environment.StackTrace;
+        var lines = st.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var brief = lines.Length > 3
+            ? string.Join(" <- ", lines.Skip(2).Take(3).Select(l => l.TrimStart()))
+            : st.Replace('\n', ' ');
+        _allocTraces.Enqueue($"[ALLOC  +{size / 1024}KB] active={_activeBufferCount} totalMB={_totalAllocatedBytes / 1024 / 1024} {brief}");
+        // Trim excess entries
+        while (_allocTraces.Count > 500) _allocTraces.TryDequeue(out _);
+
         // Обновляем пик
         long current = Interlocked.Read(ref _totalAllocatedBytes);
         long peak;
@@ -94,6 +133,14 @@ public abstract class ComputeBufferBase : IComputeBuffer
         Interlocked.Add(ref _totalAllocatedBytes, -(long)size);
         Interlocked.Decrement(ref _activeBufferCount);
         Interlocked.Increment(ref _freeCount);
+
+        var st = Environment.StackTrace;
+        var lines = st.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var brief = lines.Length > 3
+            ? string.Join(" <- ", lines.Skip(2).Take(3).Select(l => l.TrimStart()))
+            : st.Replace('\n', ' ');
+        _freeTraces.Enqueue($"[FREE  -{size / 1024}KB] active={_activeBufferCount} totalMB={_totalAllocatedBytes / 1024 / 1024} {brief}");
+        while (_freeTraces.Count > 500) _freeTraces.TryDequeue(out _);
     }
 
     public abstract ulong Size { get; }
@@ -105,7 +152,6 @@ public abstract class ComputeBufferBase : IComputeBuffer
 
     public virtual T[] ReadRange<T>(ulong byteOffset, int elementCount) where T : unmanaged
     {
-        // Default: full read + slice (providers can override with a partial transfer)
         var all = Read<T>();
         int start = (int)(byteOffset / (ulong)System.Runtime.InteropServices.Marshal.SizeOf<T>());
         return all.Skip(start).Take(elementCount).ToArray();

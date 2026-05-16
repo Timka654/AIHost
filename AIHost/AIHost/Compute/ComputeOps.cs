@@ -256,12 +256,14 @@ public class ComputeOps : IDisposable
         int sl = tokenIds.Length, dim = weightF32.Shape[1];
         var tokenBuf = _device.CreateBuffer((ulong)(tokenIds.Length * sizeof(int)), BufferType.Storage, DataType.I32);
         tokenBuf.Write(tokenIds);
+        DeferExternal(tokenBuf); // FIX: temp buffer must be disposed after Flush
         var result = Tensor.Create(_device, TensorShape.Matrix(sl, dim), DataType.F32, resultName ?? "emb");
         var paramBytes = new byte[8];
         BitConverter.GetBytes((uint)sl).CopyTo(paramBytes, 0);
         BitConverter.GetBytes((uint)dim).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("embedding_lookup",
             [tokenBuf, weightF32.Buffer, result.Buffer, paramsBuffer], 4,
             [(uint)sl, 1, 1], "emb_lookup");
@@ -271,8 +273,10 @@ public class ComputeOps : IDisposable
     public unsafe Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedEmb, string? resultName = null)
     {
         var f32 = Dequantize(quantizedEmb);
+        DeferExternal(f32); // FIX: dequantized token_embd F32 (5.1 GB) must be disposed after Flush
         var tokenBuf = _device.CreateBuffer((ulong)(tokenIds.Length * sizeof(int)), BufferType.Storage, DataType.I32);
         tokenBuf.Write(tokenIds);
+        DeferExternal(tokenBuf); // FIX: temp buffer must be disposed after Flush
         int sl = tokenIds.Length;
         var result = Tensor.Create(_device, TensorShape.Matrix(sl, quantizedEmb.Shape[1]), DataType.F32, resultName ?? "emb");
         var paramBytes = new byte[8];
@@ -280,6 +284,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)quantizedEmb.Shape[1]).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("embedding_lookup",
             [tokenBuf, f32.Buffer, result.Buffer, paramsBuffer], 4,
             [(uint)sl, 1, 1], "emb_q_lookup");
@@ -430,6 +435,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(eps).CopyTo(paramBytes, 8);
         var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("layer_norm",
             [tensor.Buffer, weight.Buffer, paramsBuffer], 3,
             [(uint)rows, 1, 1], "ln");
@@ -443,6 +449,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(eps).CopyTo(paramBytes, 8);
         var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("layer_norm",
             [tensor.Buffer, weight.Buffer, paramsBuffer], 3,
             [(uint)numRows, 1, 1], "ln_virt");
@@ -466,6 +473,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("rowwise_softmax",
             [tensor.Buffer, paramsBuffer], 2,
             [(uint)rows, 1, 1], "row_softmax");
@@ -486,6 +494,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(theta).CopyTo(paramBytes, 16);
         var paramsBuffer = _device.CreateBuffer(20, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         uint total = (uint)(numHeads * numPairs);
         EmitDispatch("rope_full",
             [tensor.Buffer, paramsBuffer], 2,
@@ -505,6 +514,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(scale).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         uint total = (uint)tensor.Shape.TotalElements;
         EmitDispatch("scale",
             [tensor.Buffer, paramsBuffer], 2,
@@ -523,6 +533,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)startCol).CopyTo(paramBytes, 8);
         var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("slice_cols",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
             [(uint)rows, 1, 1], "slice_cols");
@@ -539,6 +550,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(qDim).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("deinterleave_q_gate",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
             [(uint)sl, 1, 1], "deint_q_gate");
@@ -554,6 +566,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)startCol).CopyTo(paramBytes, 8);
         var paramsBuffer = _device.CreateBuffer(12, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("scatter_cols",
             [src.Buffer, dst.Buffer, paramsBuffer], 3,
             [srcRows, 1, 1], "scatter_cols");
@@ -580,6 +593,7 @@ public class ComputeOps : IDisposable
         var paramBytes = new byte[4]; BitConverter.GetBytes((uint)numRepeats).CopyTo(paramBytes, 0);
         var paramsBuffer = _device.CreateBuffer(4, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("repeat_columns",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
             [(total + 255) / 256, 1, 1], "rep_cols");
@@ -594,6 +608,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         uint total = (uint)(rows * cols);
         EmitDispatch("causal_mask",
             [scores.Buffer, paramsBuffer], 2,
@@ -615,6 +630,7 @@ public class ComputeOps : IDisposable
         var paramBytes = PackAttentionParams(sl, hd, kd, vd, numHeads, position);
         var paramsBuffer = _device.CreateBuffer((uint)paramBytes.Length, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("fused_mha_generate",
             [Q.Buffer, K.Buffer, V.Buffer, result.Buffer, paramsBuffer], 5,
             [(uint)((sl + 15) / 16) * (uint)numHeads, 1, 1], "fused_mha");
@@ -644,6 +660,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("transpose",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
             [(uint)((rows * cols + 255) / 256), 1, 1], "transpose");
@@ -718,6 +735,7 @@ public class ComputeOps : IDisposable
                 uint elementOffset = chunkStartGroup * SuperblockElements;
                 var offsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
                 offsetBuf.Write(new[] { elementOffset });
+                DeferExternal(offsetBuf); // FIX: temp buffer must be disposed after Flush
                 EmitDispatch(kernelName,
                     [quantized.Buffer, target.Buffer, offsetBuf], 3,
                     [chunkGroups, 1, 1], "deq_chunk");
@@ -737,6 +755,7 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
+        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
         EmitDispatch("embedding_lookup",
             [tokenIdx.Buffer, weightF32.Buffer, result.Buffer, paramsBuffer], 4,
             [(uint)sl, 1, 1], "emb_lookup_t");
@@ -841,6 +860,8 @@ public class ComputeOps : IDisposable
         };
         var buf = _device.CreateBuffer((ulong)(data.Length * sizeof(uint)), BufferType.Storage, DataType.I32);
         buf.Write(data);
+        // FIX: Register for deferred disposal after Flush completes
+        DeferExternal(buf);
         return buf;
     }
 

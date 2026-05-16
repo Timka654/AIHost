@@ -949,6 +949,22 @@ public class ManagementController : ControllerBase
     }
 
     /// <summary>
+    /// Get debug allocation traces (stack traces for last N alloc/free calls)
+    /// </summary>
+    [HttpGet("system/buffers-debug")]
+    public IActionResult GetBuffersDebug([FromQuery] int n = 50)
+    {
+        var stats = AIHost.ICompute.ComputeBufferBase.GetStats();
+        var allocTraces = AIHost.ICompute.ComputeBufferBase.GetAllocTraces(n);
+        var freeTraces = AIHost.ICompute.ComputeBufferBase.GetFreeTraces(n);
+        return Ok(new {
+            stats,
+            allocTraces,
+            freeTraces
+        });
+    }
+
+    /// <summary>
     /// Get performance metrics for all models
     /// </summary>
     [HttpGet("performance")]

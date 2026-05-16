@@ -277,13 +277,16 @@ public class ModelManager : IDisposable
                 requireDeviceLocal: !config.AllowSharedMemory);
             var tokenizer = BPETokenizer.FromGGUF(ggufModel.Reader);
             var transformer = TransformerFactory.Create(device, ggufModel);
-            transformer.LoadWeights();
 
-            // Arena allocator (Vulkan only) — created AFTER weights to avoid
-            // VRAM exhaustion. Arena holds KV cache + per-frame scratch; in
-            // channel mode KV cache is managed separately, but arena still
-            // provides temp buffers for SSM (wZ padded, concat, scratch).
+            // FIX: Arena MUST be attached BEFORE LoadWeights.
+            // LoadWeights calls AllocateScratchWeights → TryAllocateScratchHead
+            // which creates scratch F32 tensors for output/token_embd.weight (5.1 GB each).
+            // If arena is not yet allocated, these scratch allocations fail,
+            // and later Dequantize(token_embd) tries to allocate 5.1 GB on top of arena,
+            // exceeding 24 GB VRAM (17.6 weights + 2.5 arena + 5.1 dequant = 25.2 > 24).
             TryAttachArena(device, transformer, config);
+
+            transformer.LoadWeights();
 
             engine = new InferenceEngine(transformer, tokenizer, transformer.Ops, batchSize, config.MaxConcurrency);
         }
@@ -610,27 +613,24 @@ public class ModelManager : IDisposable
         const int HVD = 128, NVH = 48, NKH = 16, KD = NKH * HVD, VD = NVH * HVD, CD = 2 * KD + VD;
         const int SUB_BATCH = 8;
         int dm = t._dModel;
-        int ctx = config.Parameters.ContextSize;
-        int maxT = config.Parameters.MaxTokens;
-        int kvHeads = t._numKVHeads;
-        int headDim = t._headDim;
 
-        long perFrame = (long)dm * VD * 4L                     // wZ padded
-                      + SUB_BATCH * (VD + dm) * 4L            // temp pool
-                      + (CD + VD + NVH * 3) * 4L              // scratch
-                      + (long)ctx * VD * 4L;                  // concat buffer
+        // FIX: Renoir APU has a small DEVICE_LOCAL heap (~4 GB carve-out).
+        // 859 weight buffers (17.6 GB quantized) consume the entire heap.
+        // Arena must be small enough to not exhaust the remaining DEVICE_LOCAL,
+        // otherwise even vkCreateBuffer fails for large temp tensors.
+        // Arena exists only for SSM scratch reuse (~120 MB per-frame).
+        // At 512 MB it provides ample space without blocking large allocations.
+        long arenaTarget = 512L * 1024 * 1024; // 512 MB — enough for SSM scratch, leaves DEVICE_LOCAL for dequant
 
-        // Approximate attention layers: assume half of all layers are Type B (attention)
-        // This is a heuristic for Qwen hybrid models.
-        int attnLayers = t._numLayers / 2;
-        long kvCache = (long)attnLayers * 2L
-                     * (ctx + maxT)
-                     * kvHeads * headDim * 4L;
+        // Minimum per-frame scratch (SSM recurrence, wZ padding, temp pool)
+        long perFrame = (long)dm * VD * 4L                     // wZ padded (~120 MB)
+                      + SUB_BATCH * (VD + dm) * 4L            // temp pool (~360 KB)
+                      + (CD + VD + NVH * 3) * 4L;             // scratch (~64 KB)
 
-        long total = perFrame + kvCache;
-        // Round to 64 MB with 10% safety margin (rounded is already in MB)
-        long rounded = (long)((total * 1.1 + 64L * 1024 * 1024 - 1) / (64L * 1024 * 1024)) * 64;
-        return (int)Math.Max(64, rounded); // minimum 64 MB
+        long total = perFrame + arenaTarget;
+        // Round to 64 MB
+        long rounded = (long)((total + 64L * 1024 * 1024 - 1) / (64L * 1024 * 1024)) * 64;
+        return (int)Math.Max(64, rounded);
     }
 
     public void Dispose()

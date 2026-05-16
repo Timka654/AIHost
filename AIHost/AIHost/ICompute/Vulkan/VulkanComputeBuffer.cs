@@ -93,10 +93,20 @@ internal unsafe class VulkanComputeBuffer : ComputeBufferBase
             MemoryPropertyFlags.DeviceLocalBit,
             out typeIdx))
         {
-            AllocAndBind(req.Size, typeIdx);
-            // _mappedPointer stays IntPtr.Zero — Write/Read use staging
-            TrackAllocate(req.Size);
-            return;
+            try
+            {
+                AllocAndBind(req.Size, typeIdx);
+                // _mappedPointer stays IntPtr.Zero — Write/Read use staging
+                TrackAllocate(req.Size);
+                return;
+            }
+            catch (InvalidOperationException)
+            {
+                // FIX: On APUs (Renoir), DEVICE_LOCAL heap is small (512MB–1GB).
+                // 859 weight buffers fill it completely. Large temp allocations
+                // (Dequantize 3.1 GB) fail here but have 25.8 GB free in HOST_VISIBLE.
+                // Fall through to tier 3 instead of crashing.
+            }
         }
 
         // --- Tier 3: HOST_VISIBLE + HOST_COHERENT (system RAM / shared GPU memory) ---
