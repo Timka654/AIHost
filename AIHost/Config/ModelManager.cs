@@ -641,7 +641,7 @@ public class ModelManager : IDisposable
         // otherwise even vkCreateBuffer fails for large temp tensors.
         // Arena exists only for SSM scratch reuse (~120 MB per-frame).
         // At 512 MB it provides ample space without blocking large allocations.
-        long arenaTarget = 512L * 1024 * 1024; // 512 MB — enough for SSM scratch, leaves DEVICE_LOCAL for dequant
+        long arenaTarget = 2048L * 1024 * 1024; // 2 GB arena as reusable pool for ALL temp tensors in batch mode
 
         // Minimum per-frame scratch (SSM recurrence, wZ padding, temp pool)
         long perFrame = (long)dm * VD * 4L                     // wZ padded (~120 MB)

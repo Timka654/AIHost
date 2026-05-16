@@ -182,6 +182,15 @@ internal sealed class GpuExecutor : IDisposable
     {
         try
         {
+            // Reset all kernel dispatch rings BEFORE vkQueueSubmit.
+            // Without this, dequant_q4k chunks fill descriptor ring (240+ slots),
+            // causing ErrorDeviceLost when old descriptors are reused in-flight.
+            foreach (var kv in _kernels)
+            {
+                if (kv.Value is AIHost.ICompute.Vulkan.VulkanComputeKernel vk)
+                    vk.ResetDispatchRing();
+            }
+
             _queue.Flush();
             Interlocked.Increment(ref _totalFlushes);
 
