@@ -64,14 +64,6 @@ public class QwenHybridFormat : ITransformerFormat
         if (!a.isScratch) o.DeferExternal(a.tensor);
         GlobalProfiler.End(_ts2, "LayerA.AttnNorm");
 
-        // FIX: Flush accumulated dequant dispatches BEFORE SSM_Gpu.
-        // TypeA loads 3 FFN weights (ffn_gate, ffn_up, ffn_down) through TempF32,
-        // each chunked into ~93 dequant dispatches. Without a Flush here, the
-        // GpuExecutor command buffer accumulates 300+ dispatches before the next
-        // FlushAndWait, causing vkQueueSubmit ErrorDeviceLost on AMD iGPUs
-        // (RADV RENOIR) due to oversized command buffer submissions.
-        if (b) o.Flush();
-
         // GDN block (Gated Delta Net) — the sole attention mechanism for recurrent layers.
         var _ts6 = GlobalProfiler.Start();
         Tensor x1;
@@ -136,11 +128,6 @@ public class QwenHybridFormat : ITransformerFormat
         string dwName = nm.FfnDownShexp(g) ?? $"blk.{g}.ffn_down.weight";
         var gW = t.TempF32Named(gwName); var uW = t.TempF32Named(uwName); var dW = t.TempF32Named(dwName);
         if (b) o.BeginBatch();
-        // FIX: Flush accumulated weight dequant dispatches BEFORE attention.
-        // TypeB loads 8+ weights through TempF32 (anW, qW, kW, vW, oW, pW, gW, uW, dW),
-        // each chunked into 16-93 dequant dispatches. Without Flush, the GpuExecutor
-        // accumulates 300+ dispatches → ErrorDeviceLost on AMD iGPUs.
-        if (b) o.Flush();
         var xn = o.Clone(x, "anB"); o.LayerNorm(xn, anW.tensor); if (!anW.isScratch) o.DeferExternal(anW.tensor);
         var rq = o.MatMulWeights(xn, qW.tensor, "rqB"); var K = o.MatMulWeights(xn, kW.tensor, "KB"); var V = o.MatMulWeights(xn, vW.tensor, "VB");
         if (!qW.isScratch) o.DeferExternal(qW.tensor); if (!kW.isScratch) o.DeferExternal(kW.tensor); if (!vW.isScratch) o.DeferExternal(vW.tensor);
@@ -306,13 +293,6 @@ public class QwenHybridFormat : ITransformerFormat
         var convStateTensor = new Tensor(convStateBuf, new TensorShape(new[] { SSMState.CONV_STATE_DIM }), DataType.F32);
         var ssmStateBuf = ss.GetGpuStateBuffer(g);
         var ssmStateTensor = new Tensor(ssmStateBuf, new TensorShape(new[] { SSMState.STATE_DIM }), DataType.F32);
-
-        // FIX: Flush accumulated dequant dispatches BEFORE token loop.
-        // SSM_Gpu loads 8+ weights through TempF32 (convW, wQKV, wZ, wBeta, wAlpha,
-        // dtBias, ssA, wOut), each chunked into 16-93 dequant dispatches. The
-        // resulting 100+ dispatches in one command buffer cause ErrorDeviceLost on
-        // AMD iGPUs (RADV RENOIR).
-        if (b) o.Flush();
 
         var _tsP = GlobalProfiler.Start();
         t._logger.LogInformation("[SSM_GPU] Layer {Layer} sl={SeqLen} dm={DModel} subBatch={Sub}", g, sl, dm, SUB_BATCH);

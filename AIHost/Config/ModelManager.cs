@@ -635,13 +635,10 @@ public class ModelManager : IDisposable
         const int SUB_BATCH = 8;
         int dm = t._dModel;
 
-        // FIX: Renoir APU has a small DEVICE_LOCAL heap (~4 GB carve-out).
-        // 859 weight buffers (17.6 GB quantized) consume the entire heap.
-        // Arena must be small enough to not exhaust the remaining DEVICE_LOCAL,
-        // otherwise even vkCreateBuffer fails for large temp tensors.
-        // Arena exists only for SSM scratch reuse (~120 MB per-frame).
-        // At 512 MB it provides ample space without blocking large allocations.
-        long arenaTarget = 2048L * 1024 * 1024; // 2 GB arena as reusable pool for ALL temp tensors in batch mode
+        // FIX: iGPU VRAM is tight: 16.5 GB model + 4.85 GB token_embd scratch
+        // + 2 GB layer scratches ≈ 23.5 GB. Arena must be kept small (512 MB)
+        // to leave room for scratch allocations and temp tensors.
+        long arenaTarget = 512L * 1024 * 1024;
 
         // Minimum per-frame scratch (SSM recurrence, wZ padding, temp pool)
         long perFrame = (long)dm * VD * 4L                     // wZ padded (~120 MB)
