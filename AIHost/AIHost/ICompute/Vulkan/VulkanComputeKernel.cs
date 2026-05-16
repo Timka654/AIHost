@@ -70,6 +70,11 @@ internal unsafe class VulkanComputeKernel : ComputeKernelBase
         }
     }
 
+    public override void ClearArguments()
+    {
+        _bufferArguments.Clear();
+    }
+
     public override void Compile()
     {
         if (_compiled) return;

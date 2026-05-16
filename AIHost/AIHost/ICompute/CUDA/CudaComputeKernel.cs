@@ -123,6 +123,8 @@ public unsafe class CudaComputeKernel : IComputeKernel
         _arguments[index] = value;
     }
 
+    public void ClearArguments() => _arguments.Clear();
+
     public void Dispatch(uint[] globalWorkSize, uint[]? localWorkSize = null)
     {
         // This requires a command queue - not directly supported

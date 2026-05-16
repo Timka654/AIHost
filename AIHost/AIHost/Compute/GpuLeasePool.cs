@@ -40,14 +40,9 @@ public sealed class GpuLeasePool : IDisposable
     public GpuLeasePool(IComputeDevice device)
     {
         _device = device;
-
-        // Pre-allocate buffers per size class
-        for (int i = 0; i < PRE_ALLOC_PER_CLASS; i++)
-        {
-            PreAllocate(SizeClass.Small,  1, SMALL_MAX_ELEMENTS,  _smallPool);
-            PreAllocate(SizeClass.Medium, 1, MEDIUM_MAX_ELEMENTS, _mediumPool);
-            PreAllocate(SizeClass.Large,  1, LARGE_MAX_ELEMENTS,  _largePool);
-        }
+        // FIX: Lazy allocation — buffers are created on first Rent(),
+        // not at construction. This avoids consuming VRAM that model loading
+        // needs for scratch tensors (e.g. output.weight F32 = 3.1 GB).
     }
 
     private void PreAllocate(SizeClass sizeClass, int rows, int cols, ConcurrentQueue<GpuLease> pool)

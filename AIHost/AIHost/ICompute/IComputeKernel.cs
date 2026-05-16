@@ -27,6 +27,9 @@ public interface IComputeKernel : IDisposable
     /// <param name="localWorkSize">Локальные размеры работы (опционально)</param>
     void Dispatch(uint[] globalWorkSize, uint[]? localWorkSize = null);
 
+    /// <summary>Clear all buffer arguments to prevent stale references between dispatches.</summary>
+    void ClearArguments();
+
     /// <summary>
     /// Компилировать ядро
     /// </summary>

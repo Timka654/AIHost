@@ -558,16 +558,19 @@ public class TransformerBase : IDisposable
             var wvGpu = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
             var xnT = Tensor.FromData(_ops.Device, xn, new TensorShape(new[] { 1, 2048 }), "xn_bos_v");
             var bosVgpu = _ops.MatMulWeights(xnT, wvGpu, "V_bos");
-            float[] gv = bosVgpu.Buffer.ReadRange<float>(0, 4); bosVgpu.Dispose(); xnT.Dispose(); wvGpu.Dispose();
+            float[] gv = bosVgpu.Buffer.ReadRange<float>(0, 4);
+            _ops.DeferExternal(bosVgpu); _ops.DeferExternal(xnT); _ops.DeferExternal(wvGpu);
             _logger.LogTrace("[CPURef] BOS GPU V[:4]=[{V0:F5},{V1:F5},{V2:F5},{V3:F5}] match={Match}", gv[0], gv[1], gv[2], gv[3], Math.Abs(bosV4[0] - gv[0]) < 1e-3f);
 
             var wqF32Tensor = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
             var xnTensor = Tensor.FromData(_ops.Device, xn, new TensorShape(new[] { 1, 2048 }), "xn_bos");
             var gpuQ = _ops.MatMulWeights(xnTensor, wqF32Tensor, "Q_bos");
             float[] gq = gpuQ.Buffer.ReadRange<float>(0, 4);
-            gpuQ.Dispose(); xnTensor.Dispose(); wqF32Tensor.Dispose();
+            _ops.DeferExternal(gpuQ); _ops.DeferExternal(xnTensor); _ops.DeferExternal(wqF32Tensor);
             _logger.LogTrace("[CPURef] GPU Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", gq[0], gq[1], gq[2], gq[3]);
             _logger.LogTrace("[CPURef] Q match={Match} diff={Diff:F6}", Math.Abs(q4[0] - gq[0]) < 1e-3f, Math.Abs(q4[0] - gq[0]));
+
+            _ops.Flush();
         }
         catch (Exception ex) { _logger.LogTrace(ex, "[CPURef] FAILED"); }
     }

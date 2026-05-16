@@ -43,6 +43,8 @@ public class ROCmComputeKernel : IComputeKernel
         _arguments[index] = value;
     }
 
+    public void ClearArguments() => _arguments.Clear();
+
     public void Compile()
     {
         if (_compiled) return;

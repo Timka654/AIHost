@@ -41,6 +41,8 @@ internal sealed class GpuExecutor : IDisposable
     public ChannelWriter<GpuTask> Writer => _taskChannel.Writer;
     public ChannelReader<GpuResult> Reader => _resultChannel.Reader;
 
+    public IReadOnlyDictionary<string, IComputeKernel> Kernels => _kernels;
+
     public GpuExecutor(IComputeDevice device, GpuLeasePool leasePool,
         ILogger? logger = null)
     {
@@ -71,7 +73,6 @@ internal sealed class GpuExecutor : IDisposable
             var reader = _taskChannel.Reader;
             while (!_cts.Token.IsCancellationRequested)
             {
-                // Блокирующее ожидание асинхронно (через GetAwaiter — корректно для Thread)
                 if (!reader.WaitToReadAsync(_cts.Token).AsTask().Result)
                     break;
 
@@ -99,8 +100,13 @@ internal sealed class GpuExecutor : IDisposable
         switch (task.Type)
         {
             case GpuTaskType.BeginLayer:
+                _logger.LogInformation("[DBG_EXEC] #{TaskId} BEGIN_LAYER layer={Layer}",
+                    task.TaskId, task.LayerIndex);
+                break;
+
             case GpuTaskType.EndLayer:
-                // Command buffer is continuously recording between Begin/Flush
+                _logger.LogInformation("[DBG_EXEC] #{TaskId} END_LAYER layer={Layer}",
+                    task.TaskId, task.LayerIndex);
                 break;
 
             case GpuTaskType.DispatchKernel:
@@ -108,10 +114,12 @@ internal sealed class GpuExecutor : IDisposable
                 break;
 
             case GpuTaskType.CopyBuffer:
+                _logger.LogInformation("[DBG_EXEC] #{TaskId} COPY_BUF", task.TaskId);
                 ProcessCopy((CopyBufferTask)task);
                 break;
 
             case GpuTaskType.Barrier:
+                _logger.LogInformation("[DBG_EXEC] #{TaskId} BARRIER", task.TaskId);
                 _queue.InsertMemoryBarrier();
                 break;
 
@@ -124,6 +132,7 @@ internal sealed class GpuExecutor : IDisposable
                 break;
 
             case GpuTaskType.FlushAndWait:
+                _logger.LogInformation("[DBG_EXEC] #{TaskId} FLUSH_AND_WAIT", task.TaskId);
                 ProcessFlushAndWait((FlushAndWaitTask)task);
                 break;
         }
@@ -138,7 +147,9 @@ internal sealed class GpuExecutor : IDisposable
                 "Call RegisterKernel() before dispatching.");
         }
 
-        // Set arguments on the kernel object
+        _logger.LogInformation("[DBG_EXEC] #{TaskId} DISPATCH kernel={Kernel} tag={Tag} args={ArgCount}",
+            task.TaskId, task.KernelName, task.OpTag ?? "?", task.ArgCount);
+
         for (int i = 0; i < task.ArgCount; i++)
         {
             var arg = task.Arguments[i];
@@ -146,15 +157,12 @@ internal sealed class GpuExecutor : IDisposable
                 kernel.SetArgument(i, arg);
         }
 
-        // Dispatch через command queue (NOT kernel.Dispatch — queue manages command buffer)
         _queue.Dispatch(kernel, task.Workgroups, null);
     }
 
     private void ProcessCopy(CopyBufferTask task)
     {
         if (task.Source == null || task.Destination == null) return;
-        // Single float copy — simplest path through Read/Write
-        // For bulk copies, use dedicated Copy kernel
         byte[] temp = new byte[task.ElementCount * sizeof(float)];
         _queue.ReadBuffer(task.Source, 0, temp);
         _queue.WriteBuffer(task.Destination, 0, temp);
@@ -162,14 +170,12 @@ internal sealed class GpuExecutor : IDisposable
 
     private void ProcessAcquireLease(AcquireLeaseTask task)
     {
-        // Lease acquired BEFORE dispatch (CPU side). Executor just tracks.
-        // Actual Rent happens in caller (ComputeOps.EmitTask) for correctness.
+        // Lease acquired BEFORE dispatch (CPU side).
     }
 
     private void ProcessReleaseLease(ReleaseLeaseTask task)
     {
-        // Lease returned AFTER FlushAndWait. Executor just tracks.
-        // Actual Return happens in caller after FlushAndWait.
+        // Lease returned AFTER FlushAndWait.
     }
 
     private void ProcessFlushAndWait(FlushAndWaitTask task)
@@ -179,12 +185,14 @@ internal sealed class GpuExecutor : IDisposable
             _queue.Flush();
             Interlocked.Increment(ref _totalFlushes);
 
+            _logger.LogInformation("[DBG_EXEC] #{TaskId} FLUSH_OK totalFlushes={N}", task.TaskId, _totalFlushes);
+
             task.Completion?.TrySetResult(GpuResult.Ok());
             _resultChannel.Writer.TryWrite(GpuResult.Ok());
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[GpuExecutor] Flush failed");
+            _logger.LogError(ex, "[DBG_EXEC] #{TaskId} FLUSH_FAILED: {Error}", task.TaskId, ex.Message);
             task.Completion?.TrySetResult(GpuResult.Fail(ex.Message));
             _resultChannel.Writer.TryWrite(GpuResult.Fail(ex.Message));
         }
@@ -196,6 +204,7 @@ internal sealed class GpuExecutor : IDisposable
     /// </summary>
     public void RegisterKernel(string name, IComputeKernel kernel)
     {
+        _logger.LogInformation("[DBG_EXEC] REGISTER kernel={Name}", name);
         _kernels[name] = kernel;
     }
 
@@ -215,7 +224,6 @@ internal sealed class GpuExecutor : IDisposable
         _cts.Cancel();
         _taskChannel.Writer.TryComplete();
 
-        // Ждать завершения worker thread
         if (_workerThread.IsAlive)
             _workerThread.Join(TimeSpan.FromSeconds(5));
 

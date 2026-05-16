@@ -123,6 +123,7 @@ public abstract class ComputeKernelBase : IComputeKernel
     public virtual KernelArgumentType[] ArgumentTypes { get; protected set; } = Array.Empty<KernelArgumentType>();
     public abstract void SetArgument(int index, object value);
     public abstract void Dispatch(uint[] globalWorkSize, uint[]? localWorkSize = null);
+    public virtual void ClearArguments() { }
     public abstract void Compile();
     public abstract void Dispose();
 }

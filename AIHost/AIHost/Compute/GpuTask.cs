@@ -23,12 +23,17 @@ public enum GpuTaskType : byte
 /// </summary>
 public abstract class GpuTask
 {
+    private static int s_nextTaskId;
+
     public GpuTaskType Type { get; init; }
     public int LayerIndex { get; set; }
-    public int TaskId { get; set; } // для трассировки
+    public int TaskId { get; set; } // сквозной глобальный ID для трассировки
+
+    /// <summary>Присвоить следующий глобальный ID (вызывается при создании задачи).</summary>
+    protected void AssignTaskId() => TaskId = Interlocked.Increment(ref s_nextTaskId);
 
     /// <summary>Вернуть задачу в пул для переиспользования.</summary>
-    public virtual void Reset() { }
+    public virtual void Reset() { TaskId = 0; }
 
     internal static class Pool<T> where T : GpuTask, new()
     {
@@ -53,6 +58,7 @@ public sealed class BeginLayerTask : GpuTask
     {
         var t = Pool<BeginLayerTask>.Rent();
         t.LayerIndex = layerIndex;
+        t.AssignTaskId();
         return t;
     }
 }
@@ -64,6 +70,7 @@ public sealed class EndLayerTask : GpuTask
     {
         var t = Pool<EndLayerTask>.Rent();
         t.LayerIndex = layerIndex;
+        t.AssignTaskId();
         return t;
     }
 }
@@ -76,9 +83,10 @@ public sealed class FlushAndWaitTask : GpuTask
     {
         var t = Pool<FlushAndWaitTask>.Rent();
         t.Completion = comp;
+        t.AssignTaskId();
         return t;
     }
-    public override void Reset() => Completion = null;
+    public override void Reset() { Completion = null; TaskId = 0; }
 }
 
 public sealed class DispatchKernelTask : GpuTask
@@ -90,16 +98,20 @@ public sealed class DispatchKernelTask : GpuTask
     public IComputeBuffer?[] Arguments { get; } = new IComputeBuffer?[12];
     public int ArgCount { get; set; }
     public uint[] Workgroups { get; } = new uint[3];
+    // Debug: имя операции для трассировки
+    public string? OpTag { get; set; }
 
     public static DispatchKernelTask Create(string kernelName, uint[] workgroups)
     {
         var t = Pool<DispatchKernelTask>.Rent();
         t.KernelName = kernelName;
         t.ArgCount = 0;
+        t.OpTag = null;
         Array.Clear(t.Arguments, 0, t.Arguments.Length);
         t.Workgroups[0] = workgroups.Length > 0 ? workgroups[0] : 1;
         t.Workgroups[1] = workgroups.Length > 1 ? workgroups[1] : 1;
         t.Workgroups[2] = workgroups.Length > 2 ? workgroups[2] : 1;
+        t.AssignTaskId();
         return t;
     }
 
@@ -114,8 +126,10 @@ public sealed class DispatchKernelTask : GpuTask
     {
         KernelName = "";
         ArgCount = 0;
+        OpTag = null;
         Array.Clear(Arguments, 0, Arguments.Length);
         Workgroups[0] = Workgroups[1] = Workgroups[2] = 1;
+        TaskId = 0;
     }
 }
 
@@ -132,6 +146,7 @@ public sealed class CopyBufferTask : GpuTask
         t.Source = src;
         t.Destination = dst;
         t.ElementCount = count;
+        t.AssignTaskId();
         return t;
     }
 
@@ -140,6 +155,7 @@ public sealed class CopyBufferTask : GpuTask
         Source = null;
         Destination = null;
         ElementCount = 0;
+        TaskId = 0;
     }
 }
 
@@ -149,8 +165,10 @@ public sealed class BarrierTask : GpuTask
     public static BarrierTask Create()
     {
         var t = Pool<BarrierTask>.Rent();
+        t.AssignTaskId();
         return t;
     }
+    public override void Reset() { TaskId = 0; }
 }
 
 public sealed class AcquireLeaseTask : GpuTask
@@ -158,7 +176,7 @@ public sealed class AcquireLeaseTask : GpuTask
     public AcquireLeaseTask() => Type = GpuTaskType.AcquireLease;
     public int Rows { get; set; }
     public int Cols { get; set; }
-    public int LeaseSlot { get; set; } = -1; // assigned by executor
+    public int LeaseSlot { get; set; } = -1;
 
     public static AcquireLeaseTask Create(int rows, int cols)
     {
@@ -166,6 +184,7 @@ public sealed class AcquireLeaseTask : GpuTask
         t.Rows = rows;
         t.Cols = cols;
         t.LeaseSlot = -1;
+        t.AssignTaskId();
         return t;
     }
 
@@ -174,6 +193,7 @@ public sealed class AcquireLeaseTask : GpuTask
         Rows = 0;
         Cols = 0;
         LeaseSlot = -1;
+        TaskId = 0;
     }
 }
 
@@ -186,10 +206,11 @@ public sealed class ReleaseLeaseTask : GpuTask
     {
         var t = Pool<ReleaseLeaseTask>.Rent();
         t.Lease = lease;
+        t.AssignTaskId();
         return t;
     }
 
-    public override void Reset() => Lease = null;
+    public override void Reset() { Lease = null; TaskId = 0; }
 }
 
 /// <summary>

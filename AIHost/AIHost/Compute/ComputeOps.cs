@@ -22,7 +22,6 @@ public class ComputeOps : IDisposable
     private readonly ConcurrentDictionary<string, IComputeKernel> _kernelCache = new();
     private bool _disposed;
 
-    // Layer tracking for BeginLayerTask
     private int _currentLayer;
     internal void SetCurrentLayer(int layer) => _currentLayer = layer;
     public bool UseChannelPipeline => true;
@@ -30,11 +29,9 @@ public class ComputeOps : IDisposable
     internal bool _dbgLayer0 = true;
     private readonly ILogger<ComputeOps> _logger = AppLogger.Create<ComputeOps>();
 
-    // ── Arena allocator ────────────────────────────────────────────────────────
     private VulkanArenaAllocator? _arena;
     public bool HasArena => _arena != null;
 
-    // ── Persistent buffers ─────────────────────────────────────────────────────
     private readonly IComputeBuffer _persistentZeroOffset;
     private bool _persistentOffsetInitialized;
     private IComputeBuffer? _persistentSsmParams;
@@ -48,19 +45,16 @@ public class ComputeOps : IDisposable
         _device = device;
         if (logger != null) _logger = logger;
 
-        // Auto-create lease pool if not provided
         var pool = leasePool ?? new GpuLeasePool(device);
         _gpuExecutor = new GpuExecutor(device, pool, _logger);
         _taskWriter = _gpuExecutor.Writer;
 
-        // Persistent zero-offset buffer for K-quant dequantization
         _persistentZeroOffset = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
         uint[] zeroOffset = { 0u };
         _persistentZeroOffset.Write(zeroOffset);
         _persistentOffsetInitialized = true;
     }
 
-    // ── Kernel name → shader source mapping (all kernels must be registered here) ──
     private static readonly IReadOnlyDictionary<string, Func<string>> _kernelSources =
         new Dictionary<string, Func<string>>
         {
@@ -97,7 +91,6 @@ public class ComputeOps : IDisposable
             ["dequant_q6k"] = () => ComputeShaders.DequantizeQ6K,
         };
 
-    // ── Kernel factory (shared between ComputeOps cache and GpuExecutor) ──
     private IComputeKernel GetOrCreateKernel(string name, Func<string> source)
     {
         if (_kernelCache.TryGetValue(name, out var cached))
@@ -110,23 +103,20 @@ public class ComputeOps : IDisposable
         return kernel;
     }
 
-    // ── Batch infrastructure (channel-only) ────────────────────────────────────
-
     public void BeginBatch()
         => _taskWriter.TryWrite(BeginLayerTask.Create(_currentLayer));
 
     public void Flush()
     {
-        // Check if GpuExecutor is already dead
         if (_gpuExecutor.IsFailed)
             throw new InvalidOperationException(
                 $"[ComputeOps] GPU executor is in failed state: {_gpuExecutor.LastError}");
 
         var tcs = new System.Threading.Tasks.TaskCompletionSource<GpuResult>();
         var task = FlushAndWaitTask.Create(tcs);
+        _logger.LogInformation("[DBG_OPS] #{TaskId} EMIT FLUSH", task.TaskId);
         _taskWriter.TryWrite(task);
 
-        // Timeout: 120 seconds should be enough for any reasonable dispatch
         if (!tcs.Task.Wait(TimeSpan.FromSeconds(120)))
             throw new TimeoutException("[ComputeOps] GPU flush timed out after 120s");
 
@@ -135,46 +125,82 @@ public class ComputeOps : IDisposable
             throw new InvalidOperationException(
                 $"[ComputeOps] GPU flush failed: {result.Error}");
 
+        _logger.LogInformation("[DBG_OPS] #{TaskId} FLUSH_COMPLETE", task.TaskId);
+
+        ResetAllKernelDispatchRings();
+        FlushDeferred();
         _arena?.Reset();
+    }
+
+    private void ResetAllKernelDispatchRings()
+    {
+        foreach (var kv in _kernelCache)
+        {
+            if (kv.Value is VulkanComputeKernel vk)
+                vk.ResetDispatchRing();
+        }
     }
 
     private void MaybeFlush()
         => _taskWriter.TryWrite(BarrierTask.Create());
 
-    private void EmitDispatch(string kernelName, IComputeBuffer?[] args, int argCount, uint[] workgroups)
+    /// <summary>Emit dispatch with optional operation tag for tracing.</summary>
+    private void EmitDispatch(string kernelName, IComputeBuffer?[] args, int argCount,
+        uint[] workgroups, string? opTag = null)
     {
-        // Lazy-init: ensure kernel is compiled and registered in GpuExecutor
         if (_kernelSources.TryGetValue(kernelName, out var source))
             GetOrCreateKernel(kernelName, source);
         else
-        {
             _logger.LogWarning("[ComputeOps] EmitDispatch: unknown kernel '{Name}'", kernelName);
-            // Still emit — GpuExecutor will throw with a clear message
-        }
 
         var task = DispatchKernelTask.Create(kernelName, workgroups);
         for (int i = 0; i < argCount; i++)
             task.Arguments[i] = args[i];
         task.ArgCount = argCount;
+        task.OpTag = opTag;
+
+        _logger.LogInformation("[DBG_OPS] #{TaskId} EMIT kernel={Kernel} tag={Tag} args={ArgCount}",
+            task.TaskId, kernelName, opTag ?? "?", argCount);
         _taskWriter.TryWrite(task);
     }
 
-    public void DeferExternal(IDisposable d) { /* no-op in channel mode */ }
+    private readonly List<IDisposable> _deferred = new();
 
-    /// <summary>Insert a compute barrier (channel mode).</summary>
+    public void DeferExternal(IDisposable d)
+    {
+        if (d != null)
+        {
+            lock (_deferred) { _deferred.Add(d); }
+            _logger.LogInformation("[DBG_OPS] DEFER type={Type}", d.GetType().Name);
+        }
+    }
+
+    private void FlushDeferred()
+    {
+        IDisposable[] items;
+        lock (_deferred)
+        {
+            if (_deferred.Count == 0) return;
+            items = _deferred.ToArray();
+            _deferred.Clear();
+        }
+        _logger.LogInformation("[DBG_OPS] FLUSH_DEFERRED count={N}", items.Length);
+        foreach (var d in items)
+        {
+            try { d.Dispose(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[ComputeOps] Deferred dispose failed"); }
+        }
+    }
+
     public void InsertBarrier() => _taskWriter.TryWrite(BarrierTask.Create());
-
-    /// <summary>Attach arena allocator to this ComputeOps instance.</summary>
     internal void AttachArena(VulkanArenaAllocator arena) => _arena = arena;
 
-    /// <summary>Softmax without explicit rows parameter (infers from tensor shape).</summary>
     public void Softmax(Tensor tensor)
     {
         int rows = tensor.Shape.Rank >= 2 ? tensor.Shape[0] : 1;
         Softmax(tensor, rows);
     }
 
-    /// <summary>ApplyRoPE with headDim (infers numHeads from tensor shape).</summary>
     public void ApplyRoPE(Tensor tensor, uint position, int headDim)
     {
         int totalDim = tensor.Shape.Rank >= 2 ? tensor.Shape[1] : tensor.Shape[0];
@@ -182,14 +208,9 @@ public class ComputeOps : IDisposable
         ApplyRoPEFull(tensor, position, numHeads, headDim);
     }
 
-    /// <summary>ApplyRoPE compatibility shim.</summary>
     public void ApplyRoPE(Tensor tensor, uint position, int numHeads, int headDim)
         => ApplyRoPEFull(tensor, position, numHeads, headDim);
 
-    /// <summary>
-    /// Full-fused transformer layer (used by LlamaFormat).
-    /// Channel-mode: emits all individual dispatches.
-    /// </summary>
     public Tensor TransformerLayer(Tensor x,
         Tensor wAttnNorm, Tensor wQ, Tensor wK, Tensor wV, Tensor wAttnOut,
         Tensor wFfnNorm, Tensor wGate, Tensor wUp, Tensor wDown,
@@ -200,25 +221,19 @@ public class ComputeOps : IDisposable
         int kd = wK.Shape[1] / (wK.Shape[1] / hd);
         int vd = wV.Shape[1] / (wV.Shape[1] / hd);
 
-        var xn = Clone(x, "an");
-        LayerNorm(xn, wAttnNorm);
-
-        var q = MatMulWeights(xn, wQ, "q");
-        var k = MatMulWeights(xn, wK, "k");
+        var xn = Clone(x, "an");           LayerNorm(xn, wAttnNorm);
+        var q = MatMulWeights(xn, wQ, "q"); var k = MatMulWeights(xn, wK, "k");
         var v = MatMulWeights(xn, wV, "v");
-
         MaybeFlush();
 
         ApplyRoPEFull(q, position, numHeads, hd);
         ApplyRoPEFull(k, position, 1, kd);
-
         MaybeFlush();
 
         Tensor ao;
         if (kvCache != null)
         {
-            kvCache.Add(layerIdx, k, v);
-            Flush();
+            kvCache.Add(layerIdx, k, v); Flush();
             var (ck, cv) = kvCache.Get(layerIdx);
             ao = MultiHeadAttention(q, ck!, cv!, numHeads, position, "ao");
         }
@@ -228,76 +243,50 @@ public class ComputeOps : IDisposable
         }
 
         var ap = MatMulWeights(ao, wAttnOut, "ap");
-        var x1 = Add(x, ap, "x1");
+        var x1 = Add(x, ap, "x1"); MaybeFlush();
 
-        MaybeFlush();
-
-        var x1n = Clone(x1, "pn");
-        LayerNorm(x1n, wFfnNorm);
-
+        var x1n = Clone(x1, "pn"); LayerNorm(x1n, wFfnNorm);
         var fo = FeedForward(x1n, wGate, wUp, wDown, "fo");
         var ou = Add(x1, fo, "ou");
-
         return ou;
     }
 
-    /// <summary>
-    /// Embedding lookup from int[] token IDs + F32 weight tensor (convenience overload).
-    /// </summary>
     public Tensor EmbeddingLookup(int[] tokenIds, Tensor weightF32, string? resultName = null)
     {
         int sl = tokenIds.Length, dim = weightF32.Shape[1];
         var tokenBuf = _device.CreateBuffer((ulong)(tokenIds.Length * sizeof(int)), BufferType.Storage, DataType.I32);
         tokenBuf.Write(tokenIds);
-
         var result = Tensor.Create(_device, TensorShape.Matrix(sl, dim), DataType.F32, resultName ?? "emb");
         var paramBytes = new byte[8];
         BitConverter.GetBytes((uint)sl).CopyTo(paramBytes, 0);
         BitConverter.GetBytes((uint)dim).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
-
         EmitDispatch("embedding_lookup",
             [tokenBuf, weightF32.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)sl, 1, 1]);
+            [(uint)sl, 1, 1], "emb_lookup");
         return result;
     }
 
-    /// <summary>
-    /// Embedding lookup from quantized tensor. Delegates to Dequantize + EmbeddingLookup.
-    /// </summary>
     public unsafe Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedEmb, string? resultName = null)
     {
-        int vocab = quantizedEmb.Shape[0], dim = quantizedEmb.Shape[1];
         var f32 = Dequantize(quantizedEmb);
-
         var tokenBuf = _device.CreateBuffer((ulong)(tokenIds.Length * sizeof(int)), BufferType.Storage, DataType.I32);
         tokenBuf.Write(tokenIds);
-
         int sl = tokenIds.Length;
-        var result = Tensor.Create(_device, TensorShape.Matrix(sl, dim), DataType.F32, resultName ?? "emb");
-
+        var result = Tensor.Create(_device, TensorShape.Matrix(sl, quantizedEmb.Shape[1]), DataType.F32, resultName ?? "emb");
         var paramBytes = new byte[8];
         BitConverter.GetBytes((uint)sl).CopyTo(paramBytes, 0);
-        BitConverter.GetBytes((uint)dim).CopyTo(paramBytes, 4);
+        BitConverter.GetBytes((uint)quantizedEmb.Shape[1]).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
-
         EmitDispatch("embedding_lookup",
             [tokenBuf, f32.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)sl, 1, 1]);
-
+            [(uint)sl, 1, 1], "emb_q_lookup");
         return result;
     }
 
-    public void AllocateArena(ulong sizeBytes, ulong kvCacheBytes = 0)
-    {
-        if (_device is IComputeDevice)
-        {
-            // Arena allocation through Vulkan-specific path via VulkanDeviceContext
-            // For non-Vulkan providers, arena is skipped (fallback to CreateBuffer)
-        }
-    }
+    public void AllocateArena(ulong sizeBytes, ulong kvCacheBytes = 0) { }
 
     internal Tensor? AllocTempTensor(TensorShape shape, string? name = null)
     {
@@ -312,10 +301,7 @@ public class ComputeOps : IDisposable
         catch { return null; }
     }
 
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  MATMUL OPERATIONS
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ MATMUL ═══════════════════════
 
     public Tensor MatMulWeightsT(Tensor a, Tensor b, string? resultName = null)
     {
@@ -325,7 +311,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer((uint)M, (uint)K, (uint)J);
         EmitDispatch("matmul_weights_t_f32",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)((J + 15) / 16), (uint)((M + 15) / 16), 1]);
+            [(uint)((J + 15) / 16), (uint)((M + 15) / 16), 1], "mm_wt");
         return result;
     }
 
@@ -337,7 +323,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer((uint)M, (uint)K, (uint)N);
         EmitDispatch("matmul_weights_f32",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)((N + 15) / 16), (uint)((M + 15) / 16), 1]);
+            [(uint)((N + 15) / 16), (uint)((M + 15) / 16), 1], "mm_w");
         return result;
     }
 
@@ -349,19 +335,14 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer((uint)M, (uint)K, (uint)N);
         EmitDispatch("matmul_f32",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)((N + 15) / 16), (uint)((M + 15) / 16), 1]);
+            [(uint)((N + 15) / 16), (uint)((M + 15) / 16), 1], "mm");
         return result;
     }
 
     public Tensor MatMulWeightsLarge(Tensor a, Tensor quantized, string? resultName = null)
-    {
-        // Fallback to standard path for now — large tensor support TBD
-        return MatMulWeights(a, quantized, resultName);
-    }
+        => MatMulWeights(a, quantized, resultName);
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  ELEMENT-WISE OPERATIONS
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ ELEMENT-WISE ═══════════════════════
 
     public Tensor Multiply(Tensor a, Tensor b, string? resultName = null)
     {
@@ -372,7 +353,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(total);
         EmitDispatch("elemwise_mul",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "mul");
         return result;
     }
 
@@ -385,7 +366,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(total);
         EmitDispatch("elemwise_add",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "add");
         return result;
     }
 
@@ -395,7 +376,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(total);
         EmitDispatch("silu",
             [tensor.Buffer, paramsBuffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "silu");
     }
 
     public void Sigmoid(Tensor tensor)
@@ -404,17 +385,13 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(total);
         EmitDispatch("sigmoid",
             [tensor.Buffer, paramsBuffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "sigmoid");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  CONCAT
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ CONCAT ═══════════════════════
 
     public Tensor Concat(Tensor a, Tensor b, int axis, string? resultName = null)
-    {
-        return axis == 0 ? ConcatAxis0(a, b, resultName) : ConcatAxis1(a, b, resultName);
-    }
+        => axis == 0 ? ConcatAxis0(a, b, resultName) : ConcatAxis1(a, b, resultName);
 
     private Tensor ConcatAxis0(Tensor a, Tensor b, string? resultName)
     {
@@ -425,7 +402,7 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(total, bRows, bCols);
         EmitDispatch("concat_axis0",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "cat0");
         return result;
     }
 
@@ -437,13 +414,11 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(aCols, bCols);
         EmitDispatch("concat_axis1",
             [a.Buffer, b.Buffer, result.Buffer, paramsBuffer], 4,
-            [aCols + bCols, 1, 1]); // single row approach
+            [aCols + bCols, 1, 1], "cat1");
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  NORMALIZATION & SOFTMAX
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ NORM & SOFTMAX ═══════════════════════
 
     public void LayerNorm(Tensor tensor, Tensor weight, float eps = 1e-5f)
     {
@@ -457,7 +432,7 @@ public class ComputeOps : IDisposable
         paramsBuffer.Write(paramBytes);
         EmitDispatch("layer_norm",
             [tensor.Buffer, weight.Buffer, paramsBuffer], 3,
-            [(uint)rows, 1, 1]);
+            [(uint)rows, 1, 1], "ln");
     }
 
     public void LayerNormVirtual(Tensor tensor, Tensor weight, int numRows, int numCols, float eps = 1e-5f)
@@ -470,7 +445,7 @@ public class ComputeOps : IDisposable
         paramsBuffer.Write(paramBytes);
         EmitDispatch("layer_norm",
             [tensor.Buffer, weight.Buffer, paramsBuffer], 3,
-            [(uint)numRows, 1, 1]);
+            [(uint)numRows, 1, 1], "ln_virt");
     }
 
     public void Softmax(Tensor tensor, int rows)
@@ -479,34 +454,30 @@ public class ComputeOps : IDisposable
         var paramsBuffer = MakeParamsBuffer(total);
         EmitDispatch("softmax",
             [tensor.Buffer, paramsBuffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "softmax");
     }
 
     public void RowwiseSoftmax(Tensor tensor)
     {
         int rows = tensor.Shape.Rank >= 2 ? tensor.Shape[0] : 1;
         int cols = tensor.Shape[1];
-        var paramBytes = new byte[8]; // rows (4) + cols (4)
+        var paramBytes = new byte[8];
         BitConverter.GetBytes((uint)rows).CopyTo(paramBytes, 0);
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
         EmitDispatch("rowwise_softmax",
             [tensor.Buffer, paramsBuffer], 2,
-            [(uint)rows, 1, 1]);
+            [(uint)rows, 1, 1], "row_softmax");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  RoPE
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ RoPE ═══════════════════════
 
     public void ApplyRoPEFull(Tensor tensor, uint startPosition, int numHeads, int headDim,
         float theta = 10000.0f, int ropeDim = 0)
     {
         int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
         int numPairs = effectiveRopeDim / 2;
-
-        // Pack params: numHeads(4) + headDim(4) + ropeDim(4) + startPosition(4) + theta(4) = 20 bytes
         var paramBytes = new byte[20];
         BitConverter.GetBytes((uint)numHeads).CopyTo(paramBytes, 0);
         BitConverter.GetBytes((uint)headDim).CopyTo(paramBytes, 4);
@@ -515,22 +486,17 @@ public class ComputeOps : IDisposable
         BitConverter.GetBytes(theta).CopyTo(paramBytes, 16);
         var paramsBuffer = _device.CreateBuffer(20, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
-
         uint total = (uint)(numHeads * numPairs);
         EmitDispatch("rope_full",
             [tensor.Buffer, paramsBuffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "rope_full");
     }
 
     public void RoPE(Tensor tensor, uint position, int numHeads, int headDim,
         float theta = 10000.0f, int ropeDim = 0)
-    {
-        ApplyRoPEFull(tensor, position, numHeads, headDim, theta, ropeDim);
-    }
+        => ApplyRoPEFull(tensor, position, numHeads, headDim, theta, ropeDim);
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  SCALE
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ SCALE ═══════════════════════
 
     public void Scale(Tensor tensor, float scale)
     {
@@ -542,18 +508,16 @@ public class ComputeOps : IDisposable
         uint total = (uint)tensor.Shape.TotalElements;
         EmitDispatch("scale",
             [tensor.Buffer, paramsBuffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "scale");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  SLICE & SCATTER
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ SLICE & SCATTER ═══════════════════════
 
     public Tensor SliceCols(Tensor input, int startCol, int numCols, string? resultName = null)
     {
         int rows = input.Shape[0];
         var result = Tensor.Create(_device, TensorShape.Matrix(rows, numCols), DataType.F32, resultName);
-        var paramBytes = new byte[12]; // rows(4) + cols(4) + startCol(4)
+        var paramBytes = new byte[12];
         BitConverter.GetBytes((uint)rows).CopyTo(paramBytes, 0);
         BitConverter.GetBytes((uint)numCols).CopyTo(paramBytes, 4);
         BitConverter.GetBytes((uint)startCol).CopyTo(paramBytes, 8);
@@ -561,7 +525,7 @@ public class ComputeOps : IDisposable
         paramsBuffer.Write(paramBytes);
         EmitDispatch("slice_cols",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
-            [(uint)rows, 1, 1]);
+            [(uint)rows, 1, 1], "slice_cols");
         return result;
     }
 
@@ -570,14 +534,14 @@ public class ComputeOps : IDisposable
         int sl = input.Shape[0];
         var result = Tensor.Create(_device, input.Shape, DataType.F32, resultName);
         uint totalCols = (uint)input.Shape[1];
-        var paramBytes = new byte[8]; // numHeads(4) + qDim(4)
+        var paramBytes = new byte[8];
         BitConverter.GetBytes(numHeads).CopyTo(paramBytes, 0);
         BitConverter.GetBytes(qDim).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
         EmitDispatch("deinterleave_q_gate",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
-            [(uint)sl, 1, 1]);
+            [(uint)sl, 1, 1], "deint_q_gate");
         return result;
     }
 
@@ -592,12 +556,10 @@ public class ComputeOps : IDisposable
         paramsBuffer.Write(paramBytes);
         EmitDispatch("scatter_cols",
             [src.Buffer, dst.Buffer, paramsBuffer], 3,
-            [srcRows, 1, 1]);
+            [srcRows, 1, 1], "scatter_cols");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  KV-CACHE & ATTENTION
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ KV-CACHE & ATTENTION ═══════════════════════
 
     public Tensor RepeatKVHeads(Tensor input, int numKVHeadsTarget, string? resultName = null)
     {
@@ -606,7 +568,7 @@ public class ComputeOps : IDisposable
         uint total = (uint)sl * (uint)kd;
         EmitDispatch("repeat_kv_heads",
             [input.Buffer, result.Buffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "rep_kv_heads");
         return result;
     }
 
@@ -620,7 +582,7 @@ public class ComputeOps : IDisposable
         paramsBuffer.Write(paramBytes);
         EmitDispatch("repeat_columns",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "rep_cols");
         return result;
     }
 
@@ -635,18 +597,15 @@ public class ComputeOps : IDisposable
         uint total = (uint)(rows * cols);
         EmitDispatch("causal_mask",
             [scores.Buffer, paramsBuffer], 2,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "causal_mask");
     }
 
     public Tensor MultiHeadAttention(Tensor Q, Tensor K, Tensor V, int numHeads, uint position, string? resultName = null)
     {
         int sl = Q.Shape[0], hd = Q.Shape[1];
         var result = Tensor.Create(_device, TensorShape.Matrix(sl, hd), DataType.F32, resultName);
-
-
-        var paramBytes = CopyBuffer(Q, K, V, numHeads, position, result);
+        CopyBuffer(Q, K, V, numHeads, position, result);
         MaybeFlush();
-        DispatchAndDeferAttention(Q, result);
         return result;
     }
 
@@ -656,21 +615,15 @@ public class ComputeOps : IDisposable
         var paramBytes = PackAttentionParams(sl, hd, kd, vd, numHeads, position);
         var paramsBuffer = _device.CreateBuffer((uint)paramBytes.Length, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
-
         EmitDispatch("fused_mha_generate",
             [Q.Buffer, K.Buffer, V.Buffer, result.Buffer, paramsBuffer], 5,
-            [(uint)((sl + 15) / 16) * (uint)numHeads, 1, 1]);
+            [(uint)((sl + 15) / 16) * (uint)numHeads, 1, 1], "fused_mha");
         return paramBytes;
-    }
-
-    private void DispatchAndDeferAttention(Tensor Q, Tensor result)
-    {
-        // No-op in channel mode — dispatch already emitted
     }
 
     private static byte[] PackAttentionParams(int sl, int hd, int kd, int vd, int numHeads, uint position)
     {
-        var buf = new byte[24]; // 6 × uint32
+        var buf = new byte[24];
         BitConverter.GetBytes((uint)sl).CopyTo(buf, 0);
         BitConverter.GetBytes((uint)hd).CopyTo(buf, 4);
         BitConverter.GetBytes((uint)kd).CopyTo(buf, 8);
@@ -680,9 +633,7 @@ public class ComputeOps : IDisposable
         return buf;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  TRANSPOSE
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ TRANSPOSE ═══════════════════════
 
     public Tensor Transpose(Tensor input, string? resultName = null)
     {
@@ -695,13 +646,11 @@ public class ComputeOps : IDisposable
         paramsBuffer.Write(paramBytes);
         EmitDispatch("transpose",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
-            [(uint)((rows * cols + 255) / 256), 1, 1]);
+            [(uint)((rows * cols + 255) / 256), 1, 1], "transpose");
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  DEQUANTIZATION
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ DEQUANTIZATION ═══════════════════════
 
     public Tensor Dequantize(Tensor quantized, string? resultName = null)
     {
@@ -717,12 +666,12 @@ public class ComputeOps : IDisposable
         if (target.DataType != DataType.F32)
             throw new ArgumentException("Target must be F32");
 
-        // F32 weights — clone via copy shader (no dequant)
         if (quantized.DataType == DataType.F32)
         {
             uint total = (uint)quantized.Shape.TotalElements;
             var p = MakeParamsBuffer(total);
-            EmitDispatch("copy", [quantized.Buffer, target.Buffer, p], 3, [(total + 255) / 256, 1, 1]);
+            EmitDispatch("copy", [quantized.Buffer, target.Buffer, p], 3,
+                [(total + 255) / 256, 1, 1], "deq_copy_f32");
             return;
         }
 
@@ -748,84 +697,66 @@ public class ComputeOps : IDisposable
 
         uint totalElements = (uint)quantized.Shape.TotalElements;
         uint totalGroups = (totalElements + 255) / 256;
-
         const uint MaxGroupsPerDispatch = 32768;
         const uint SuperblockElements = 256;
 
         if (totalGroups <= MaxGroupsPerDispatch)
         {
-            // Single dispatch — zero offset
             EmitDispatch(kernelName,
                 [quantized.Buffer, target.Buffer, _persistentZeroOffset], 3,
-                [totalGroups, 1, 1]);
+                [totalGroups, 1, 1], "deq");
         }
         else
         {
-            // Chunked dispatch — each chunk gets its own offset buffer
             uint groupsPerChunk = MaxGroupsPerDispatch;
             uint numChunks = (totalGroups + groupsPerChunk - 1) / groupsPerChunk;
-
             for (uint chunk = 0; chunk < numChunks; chunk++)
             {
                 uint chunkStartGroup = chunk * groupsPerChunk;
                 uint chunkEndGroup = Math.Min(chunkStartGroup + groupsPerChunk, totalGroups);
                 uint chunkGroups = chunkEndGroup - chunkStartGroup;
                 uint elementOffset = chunkStartGroup * SuperblockElements;
-
                 var offsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
                 offsetBuf.Write(new[] { elementOffset });
-
                 EmitDispatch(kernelName,
                     [quantized.Buffer, target.Buffer, offsetBuf], 3,
-                    [chunkGroups, 1, 1]);
-
-                // Chunked path needs barriers between chunks for correct offset reading
+                    [chunkGroups, 1, 1], "deq_chunk");
                 MaybeFlush();
             }
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  EMBEDDING
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ EMBEDDING ═══════════════════════
 
     public Tensor EmbeddingLookup(Tensor tokenIdx, Tensor weightF32, string? resultName = null)
     {
         int sl = tokenIdx.Shape.TotalElements, cols = weightF32.Shape[1];
         var result = Tensor.Create(_device, TensorShape.Matrix(sl, cols), DataType.F32, resultName);
-
         var paramBytes = new byte[8];
         BitConverter.GetBytes((uint)sl).CopyTo(paramBytes, 0);
         BitConverter.GetBytes((uint)cols).CopyTo(paramBytes, 4);
         var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
         paramsBuffer.Write(paramBytes);
-
         EmitDispatch("embedding_lookup",
             [tokenIdx.Buffer, weightF32.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)sl, 1, 1]);
+            [(uint)sl, 1, 1], "emb_lookup_t");
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  CLONE (GPU memcpy)
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ CLONE ═══════════════════════
 
     public Tensor Clone(Tensor input, string? resultName = null)
     {
-        _logger.LogDebug("[DBG_OPS] Clone name={Name} shape={Shape}",
-            resultName ?? "?", input.Shape);
         var result = Tensor.Create(_device, input.Shape, DataType.F32, resultName);
         uint total = (uint)input.Shape.TotalElements;
         var paramsBuffer = MakeParamsBuffer(total);
         EmitDispatch("copy",
             [input.Buffer, result.Buffer, paramsBuffer], 3,
-            [(total + 255) / 256, 1, 1]);
+            [(total + 255) / 256, 1, 1], "clone");
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  FEED FORWARD
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ FEED FORWARD ═══════════════════════
 
     public Tensor FeedForward(Tensor x, Tensor wGate, Tensor wUp, Tensor wDown, string? resultName = null)
     {
@@ -833,47 +764,34 @@ public class ComputeOps : IDisposable
         var hidden = Tensor.Create(_device, TensorShape.Matrix(sl, inter), DataType.F32, "ffn_hidden");
         var gated = Tensor.Create(_device, TensorShape.Matrix(sl, inter), DataType.F32, "ffn_gated");
 
-        // Gate projection: hidden = x @ wGate
         var paramsBuf1 = MakeParamsBuffer((uint)sl, (uint)dm, (uint)inter);
         EmitDispatch("matmul_weights_f32",
             [x.Buffer, wGate.Buffer, hidden.Buffer, paramsBuf1], 4,
-            [(uint)((inter + 15) / 16), (uint)((sl + 15) / 16), 1]);
-
+            [(uint)((inter + 15) / 16), (uint)((sl + 15) / 16), 1], "ffn_gate");
         MaybeFlush();
 
-        // Up projection: gated = x @ wUp
         var paramsBuf2 = MakeParamsBuffer((uint)sl, (uint)dm, (uint)inter);
         EmitDispatch("matmul_weights_f32",
             [x.Buffer, wUp.Buffer, gated.Buffer, paramsBuf2], 4,
-            [(uint)((inter + 15) / 16), (uint)((sl + 15) / 16), 1]);
-
+            [(uint)((inter + 15) / 16), (uint)((sl + 15) / 16), 1], "ffn_up");
         MaybeFlush();
 
-        // SiLU activation
         SiLU(gated);
-
         MaybeFlush();
 
-        // Gate: hidden *= gated
-        // Multiply produces [sl, inter] result, then MatMulWeights with [inter, dm]
         var gatedResult = Multiply(hidden, gated, "ffn_gated_result");
-
         MaybeFlush();
 
-        // Down projection: result = gatedResult @ wDown
         var result = Tensor.Create(_device, TensorShape.Matrix(sl, dm), DataType.F32, resultName);
         int interD = wDown.Shape[0];
         var paramsBuf3 = MakeParamsBuffer((uint)sl, (uint)interD, (uint)dm);
         EmitDispatch("matmul_weights_f32",
             [gatedResult.Buffer, wDown.Buffer, result.Buffer, paramsBuf3], 4,
-            [(uint)((dm + 15) / 16), (uint)((sl + 15) / 16), 1]);
-
+            [(uint)((dm + 15) / 16), (uint)((sl + 15) / 16), 1], "ffn_down");
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  SSM GATED DELTA NET
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ SSM GATED DELTA NET ═══════════════════════
 
     public void SsmGdnDecode(
         Tensor xNorm, Tensor convW, Tensor convState, Tensor wQKV,
@@ -887,7 +805,6 @@ public class ComputeOps : IDisposable
         uint convGroups = ssmCD / ssmHVD;
         uint vGroups = ssmNVH;
 
-        // Lazy-init persistent SSM UBO
         if (_persistentSsmParams == null)
         {
             _persistentSsmParams = _device.CreateBuffer(32, BufferType.Storage, DataType.I32);
@@ -897,27 +814,21 @@ public class ComputeOps : IDisposable
             _persistentRowIndex = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
         _persistentRowIndex.Write(new[] { rowIndex });
 
-        // Part 1: conv1d + projections (ssm_gdn_decode)
         EmitDispatch("ssm_gdn_decode",
             [xNorm.Buffer, convW.Buffer, convState.Buffer, wQKV.Buffer,
              wZ.Buffer, wBeta.Buffer, wAlpha.Buffer, dtBias.Buffer,
              ssA.Buffer, scratch.Buffer, _persistentRowIndex, _persistentSsmParams], 12,
-            [convGroups, 1, 1]);
-
+            [convGroups, 1, 1], "ssm_decode");
         MaybeFlush();
 
-        // Part 2: recurrence (ssm_gdn_recur)
         EmitDispatch("ssm_gdn_recur",
             [scratch.Buffer, ssmState.Buffer, ssmNorm.Buffer,
              output.Buffer, _persistentSsmParams], 5,
-            [vGroups, 1, 1]);
-
+            [vGroups, 1, 1], "ssm_recur");
         MaybeFlush();
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  UTILITY
-    // ═══════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════ UTILITY ═══════════════════════
 
     private IComputeBuffer MakeParamsBuffer(uint a, uint b = 0, uint c = 0)
     {
