@@ -265,25 +265,179 @@ public class ComputeOps : IDisposable
         return result;
     }
 
+    // ── CPU K-quant dequantization helpers (Q2_K..Q6_K) ──────────────────
+
+    private const long EmbeddingF32SizeThreshold = 512L * 1024 * 1024; // 512 MB
+
+    public static void DequantizeRowCpu(DataType dtype, byte[] src, int srcOff,
+        float[] dst, int dstOff, int dModel)
+    {
+        switch (dtype)
+        {
+            case DataType.Q2_K: DequantizeRowQ2K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q3_K: DequantizeRowQ3K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q4_K: DequantizeRowQ4K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q5_K: DequantizeRowQ5K(src, srcOff, dst, dstOff, dModel); break;
+            case DataType.Q6_K: DequantizeRowQ6K(src, srcOff, dst, dstOff, dModel); break;
+            default: throw new NotSupportedException($"CPU dequant not supported for {dtype}");
+        }
+    }
+
+    private static float F16ToF32(ushort h)
+    {
+        uint sign = (uint)((h >> 15) & 1);
+        uint exp = (uint)((h >> 10) & 0x1F);
+        uint mant = (uint)(h & 0x3FF);
+        if (exp == 0)
+        {
+            if (mant == 0) return sign == 0 ? 0f : -0f;
+            int shift = 10; while ((mant & 0x400) == 0) { mant <<= 1; shift--; }
+            exp = (uint)(shift + 103); mant = (mant & 0x3FF) << 13;
+        }
+        else if (exp == 0x1F) { exp = 0xFF; mant <<= 13; }
+        else { exp = exp - 15 + 127; mant <<= 13; }
+        return BitConverter.Int32BitsToSingle((int)((sign << 31) | (exp << 23) | (mant & 0x7FFFFF)));
+    }
+
+    private static void DequantizeRowQ4K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256, BLOCK_BYTES = 144;
+        int nb = (dModel + QK_K - 1) / QK_K;
+        for (int b = 0; b < nb; b++)
+        {
+            int bo = srcOff + b * BLOCK_BYTES, eb = b * QK_K, cnt = Math.Min(QK_K, dModel - eb);
+            ushort dR = (ushort)(src[bo] | (src[bo + 1] << 8)), dmR = (ushort)(src[bo + 2] | (src[bo + 3] << 8));
+            float d = F16ToF32(dR), dm = F16ToF32(dmR);
+            for (int e = 0; e < cnt; e++)
+            {
+                int g = e / 64, wg = e % 64, up = wg >= 32 ? 1 : 0, lo = wg % 32, si = g * 2 + up;
+                float sc, mn;
+                if (si < 4) { sc = src[bo + 4 + si] & 63; mn = src[bo + 4 + si + 4] & 63; }
+                else { int j = si; sc = ((src[bo + 4 + j + 4] & 0x0F) | ((src[bo + 4 + j - 4] >> 6) << 4)); mn = ((src[bo + 4 + j + 4] >> 4) | ((src[bo + 4 + j] >> 6) << 4)); }
+                int qb = src[bo + 16 + g * 32 + lo], q = (qb >> (up * 4)) & 0x0F;
+                dst[dstOff + eb + e] = d * sc * q - dm * mn;
+            }
+        }
+    }
+
+    private static void DequantizeRowQ6K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256, BLOCK_BYTES = 210;
+        int nb = (dModel + QK_K - 1) / QK_K;
+        for (int b = 0; b < nb; b++)
+        {
+            int bo = srcOff + b * BLOCK_BYTES, eb = b * QK_K, cnt = Math.Min(QK_K, dModel - eb);
+            ushort dR = (ushort)(src[bo + 208] | (src[bo + 209] << 8));
+            float d = F16ToF32(dR);
+            for (int e = 0; e < cnt; e++)
+            {
+                int bh = e / 128, w = e % 128, qtr = w / 32, wq = w % 32;
+                int qlEx = (qtr == 1 || qtr == 3) ? 32 : 0, qlOff = bo + bh * 64 + qlEx + wq;
+                int up = (qtr == 2 || qtr == 3) ? 1 : 0, low4 = (src[qlOff] >> (up * 4)) & 0x0F;
+                int qhOff = bo + 128 + bh * 32 + wq, up2 = (src[qhOff] >> (qtr * 2)) & 0x03;
+                int q = low4 | (up2 << 4), sc = (sbyte)src[bo + 192 + (e / 16)];
+                dst[dstOff + eb + e] = d * sc * (q - 32);
+            }
+        }
+    }
+
+    private static void DequantizeRowQ2K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256, BLOCK_BYTES = 84;
+        int nb = (dModel + QK_K - 1) / QK_K;
+        for (int b = 0; b < nb; b++)
+        {
+            int bo = srcOff + b * BLOCK_BYTES, eb = b * QK_K, cnt = Math.Min(QK_K, dModel - eb);
+            ushort dR = (ushort)(src[bo + 80] | (src[bo + 81] << 8)), dmR = (ushort)(src[bo + 82] | (src[bo + 83] << 8));
+            float d = F16ToF32(dR), dm = F16ToF32(dmR);
+            for (int e = 0; e < cnt; e++)
+            {
+                int sub = e / 16; byte scB = src[bo + sub]; float sl = scB & 0x0F, sh = (scB >> 4) & 0x0F;
+                int ch = e / 128, loc = e % 128, qi = ch * 32 + (loc % 32), shift = (loc / 32) * 2;
+                int qv = (src[bo + 16 + qi] >> shift) & 0x03;
+                dst[dstOff + eb + e] = d * sl * qv - dm * sh;
+            }
+        }
+    }
+
+    private static void DequantizeRowQ3K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256, BLOCK_BYTES = 110;
+        int nb = (dModel + QK_K - 1) / QK_K;
+        for (int b = 0; b < nb; b++)
+        {
+            int bo = srcOff + b * BLOCK_BYTES, eb = b * QK_K, cnt = Math.Min(QK_K, dModel - eb);
+            ushort dR = (ushort)(src[bo + 108] | (src[bo + 109] << 8));
+            float d = F16ToF32(dR);
+            for (int e = 0; e < cnt; e++)
+            {
+                int ch = e / 128, loc = e % 128, qi = ch * 32 + (loc % 32), shift = (loc / 32) * 2;
+                int low2 = (src[bo + 32 + qi] >> shift) & 3, hm = loc % 32, hb = ch * 4 + (loc / 32);
+                int hi1 = (src[bo + hm] >> hb) & 1, qv = (low2 | (hi1 << 2)) - 4;
+                int isc = e / 16, k = isc % 4, ag = isc / 4, so = bo + 96;
+                int tb = src[so + 8 + k], rk, sb;
+                if (ag == 0) { rk = src[so + k]; sb = (rk & 0x0F) | ((tb >> 0) & 3) << 4; }
+                else if (ag == 1) { rk = src[so + k + 4]; sb = (rk & 0x0F) | ((tb >> 2) & 3) << 4; }
+                else if (ag == 2) { rk = src[so + k]; sb = ((rk >> 4) & 0x0F) | ((tb >> 4) & 3) << 4; }
+                else { rk = src[so + k + 4]; sb = ((rk >> 4) & 0x0F) | ((tb >> 6) & 3) << 4; }
+                dst[dstOff + eb + e] = d * (sb - 32) * qv;
+            }
+        }
+    }
+
+    private static void DequantizeRowQ5K(byte[] src, int srcOff, float[] dst, int dstOff, int dModel)
+    {
+        const int QK_K = 256, BLOCK_BYTES = 176;
+        int nb = (dModel + QK_K - 1) / QK_K;
+        for (int b = 0; b < nb; b++)
+        {
+            int bo = srcOff + b * BLOCK_BYTES, eb = b * QK_K, cnt = Math.Min(QK_K, dModel - eb);
+            ushort dR = (ushort)(src[bo] | (src[bo + 1] << 8)), dmR = (ushort)(src[bo + 2] | (src[bo + 3] << 8));
+            float d = F16ToF32(dR), dm = F16ToF32(dmR);
+            for (int e = 0; e < cnt; e++)
+            {
+                int sub = e / 32; float sc, mn;
+                if (sub < 4) { sc = src[bo + 4 + sub] & 63; mn = src[bo + 4 + sub + 4] & 63; }
+                else { int j = sub; sc = ((src[bo + 4 + j + 4] & 0x0F) | ((src[bo + 4 + j - 4] >> 6) << 4)); mn = ((src[bo + 4 + j + 4] >> 4) | ((src[bo + 4 + j] >> 6) << 4)); }
+                int j5 = e / 64, loc = e % 64, up = loc >= 32 ? 1 : 0, l = loc % 32, qi = j5 * 32 + l;
+                int ql = (src[bo + 48 + qi] >> (up * 4)) & 0x0F, qhb = j5 * 2 + up, qh = (src[bo + 16 + l] >> qhb) & 1;
+                dst[dstOff + eb + e] = d * sc * (ql | (qh << 4)) - dm * mn;
+            }
+        }
+    }
+
     public unsafe Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedEmb, string? resultName = null)
     {
-        var f32 = Dequantize(quantizedEmb);
-        DeferExternal(f32); // FIX: dequantized token_embd F32 (up to 5 GB) must be disposed after Flush
-        var tokenBuf = _device.CreateBuffer((ulong)(tokenIds.Length * sizeof(int)), BufferType.Storage, DataType.I32);
-        tokenBuf.Write(tokenIds);
-        DeferExternal(tokenBuf); // FIX: temp buffer must be disposed after Flush
-        int sl = tokenIds.Length;
-        var result = Tensor.Create(_device, TensorShape.Matrix(sl, quantizedEmb.Shape[1]), DataType.F32, resultName ?? "emb");
-        var paramBytes = new byte[8];
-        BitConverter.GetBytes((uint)sl).CopyTo(paramBytes, 0);
-        BitConverter.GetBytes((uint)quantizedEmb.Shape[1]).CopyTo(paramBytes, 4);
-        var paramsBuffer = _device.CreateBuffer(8, BufferType.Storage, DataType.I32);
-        paramsBuffer.Write(paramBytes);
-        DeferExternal(paramsBuffer); // FIX: temp buffer must be disposed after Flush
-        EmitDispatch("embedding_lookup",
-            [tokenBuf, f32.Buffer, result.Buffer, paramsBuffer], 4,
-            [(uint)sl, 1, 1], "emb_q_lookup");
-        return result;
+        int dModel = quantizedEmb.Shape[0]; // GGUF: ne[0]=innermost (embedding_dim), ne[1]=vocab_size
+        int vocabSize = quantizedEmb.Shape[1];
+        long f32Size = (long)dModel * vocabSize * sizeof(float);
+        if (f32Size <= EmbeddingF32SizeThreshold)
+        {
+            var fullF32 = Dequantize(quantizedEmb);
+            DeferExternal(fullF32);
+            var res = EmbeddingLookup(tokenIds, fullF32, resultName);
+            return res;
+        }
+        // FIX: Flush pending GPU work before reading quantized data.
+        // In Channel mode, the GpuExecutor owns the Vulkan queue — reading
+        // from a GPU buffer without flushing first returns garbage/zeros.
+        Flush();
+        int seqLen = tokenIds.Length;
+        long bytesPerRow = (long)quantizedEmb.Buffer.Size / vocabSize;
+        var packedBytes = new byte[seqLen * bytesPerRow];
+        for (int i = 0; i < seqLen; i++)
+        {
+            ulong byteOffset = (ulong)(tokenIds[i] * bytesPerRow);
+            var rowBytes = quantizedEmb.Buffer.ReadRange<byte>(byteOffset, (int)bytesPerRow);
+            Buffer.BlockCopy(rowBytes, 0, packedBytes, (int)(i * bytesPerRow), (int)bytesPerRow);
+        }
+        var resultData = new float[seqLen * dModel];
+        for (int i = 0; i < seqLen; i++)
+        {
+            int rowOffset = (int)(i * bytesPerRow), destOffset = i * dModel;
+            DequantizeRowCpu(quantizedEmb.DataType, packedBytes, rowOffset, resultData, destOffset, dModel);
+        }
+        return Tensor.FromData(_device, resultData, new TensorShape(new[] { seqLen, dModel }), resultName ?? "embeddings");
     }
 
     public void AllocateArena(ulong sizeBytes, ulong kvCacheBytes = 0) { }
@@ -339,8 +493,40 @@ public class ComputeOps : IDisposable
         return result;
     }
 
+    private const long MaxF32AllocationBytes = 1L * 1024 * 1024 * 1024; // 1 GB
     public Tensor MatMulWeightsLarge(Tensor a, Tensor quantized, string? resultName = null)
-        => MatMulWeights(a, quantized, resultName);
+    {
+        int M = a.Shape[0], K = a.Shape[1], N = quantized.Shape[1];
+        long fullF32 = (long)quantized.Shape.TotalElements * sizeof(float);
+        if (fullF32 <= MaxF32AllocationBytes)
+            return MatMulWeights(a, Dequantize(quantized), resultName);
+        int chunkRows = (int)(MaxF32AllocationBytes / ((long)K * sizeof(float)));
+        chunkRows = Math.Max(256, chunkRows & ~255);
+        int numChunks = (N + chunkRows - 1) / chunkRows;
+        long bytesPerRow = (long)quantized.Buffer.Size / N;
+        var result = Tensor.Create(_device, TensorShape.Matrix(M, N), DataType.F32, resultName ?? "logits");
+        // FIX: Flush before reading quantized bytes from GPU (Channel mode).
+        Flush();
+        for (int c = 0; c < numChunks; c++)
+        {
+            int start = c * chunkRows, end = Math.Min(start + chunkRows, N), actual = end - start;
+            ulong byteStart = (ulong)(start * bytesPerRow);
+            int byteCount = (int)(actual * bytesPerRow);
+            var rawBytes = quantized.Buffer.ReadRange<byte>(byteStart, byteCount);
+            var chunkBuf = _device.CreateBuffer((ulong)rawBytes.Length, BufferType.Storage, DataType.I8);
+            chunkBuf.Write(rawBytes);
+            DeferExternal(chunkBuf);
+            var chunkTensor = new Tensor(chunkBuf, TensorShape.Matrix(actual, K), quantized.DataType, "w_chunk");
+            var chunkF32 = Dequantize(chunkTensor);
+            var chunkF32T = Transpose(chunkF32);
+            DeferExternal(chunkF32);
+            var partialLogits = MatMul(a, chunkF32T, "partial_logits");
+            DeferExternal(chunkF32T);
+            ScatterCols(result, partialLogits, start);
+            DeferExternal(partialLogits);
+        }
+        return result;
+    }
 
     // ═══════════════════════ ELEMENT-WISE ═══════════════════════
 
@@ -722,25 +908,86 @@ public class ComputeOps : IDisposable
         {
             uint groupsPerChunk = MaxGroupsPerDispatch;
             uint numChunks = (totalGroups + groupsPerChunk - 1) / groupsPerChunk;
-            const uint ChunksPerSubBatch = 16;
+
+            // FIX: Reusable offset buffer (matches old version's reusableOffsetBuf).
+            // DeferExternal AFTER loop — Channel Flush() clears deferred list, so
+            // deferring before the loop would dispose the buffer on first Flush()
+            // and crash subsequent iterations with a disposed-buffer access.
+            var offsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+
             for (uint chunk = 0; chunk < numChunks; chunk++)
             {
                 uint chunkStartGroup = chunk * groupsPerChunk;
                 uint chunkEndGroup = Math.Min(chunkStartGroup + groupsPerChunk, totalGroups);
                 uint chunkGroups = chunkEndGroup - chunkStartGroup;
                 uint elementOffset = chunkStartGroup * SuperblockElements;
-                var offsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
                 offsetBuf.Write(new[] { elementOffset });
-                DeferExternal(offsetBuf);
                 EmitDispatch(kernelName,
                     [quantized.Buffer, target.Buffer, offsetBuf], 3,
                     [chunkGroups, 1, 1], "deq_chunk");
 
-                // Flush every ChunksPerSubBatch chunks
-                if ((chunk + 1) % ChunksPerSubBatch == 0 && chunk + 1 < numChunks)
-                    Flush();
+                // FIX: Flush after EVERY chunk (matches old _queue.Flush() per chunk).
+                Flush();
             }
+
+            DeferExternal(offsetBuf); // dispose after ALL chunks complete
         }
+    }
+
+    // ═══════════════════════ ELEMENT-RANGE DEQUANT ═══════════════════════
+
+    /// <summary>
+    /// Dequantize elementCount elements starting at elementOffset from quantized tensor
+    /// into target buffer. The shader writes to target[elementOffset .. elementOffset+elementCount-1],
+    /// so target must be large enough. Uses exactly ceil(elementCount/256) workgroups,
+    /// NOT target.TotalElements/256. Designed for row-wise embedding dequantization:
+    /// call N times with elementOffset=t*dim, elementCount=dim, target=[sl,dim] result tensor.
+    /// Avoids allocating a full-table 4.85 GB F32 buffer.
+    /// </summary>
+    public void DequantizeElements(Tensor quantized, uint elementOffset, uint elementCount, Tensor target)
+    {
+        if (target.DataType != DataType.F32)
+            throw new ArgumentException("Target must be F32");
+
+        if (quantized.DataType == DataType.F32)
+        {
+            var offsetBuf = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+            offsetBuf.Write(new[] { elementOffset });
+            DeferExternal(offsetBuf);
+            var countBuf = MakeParamsBuffer(elementCount);
+            EmitDispatch("copy",
+                [quantized.Buffer, target.Buffer, offsetBuf, countBuf], 4,
+                [(elementCount + 255) / 256, 1, 1], "deq_elems_copy");
+            return;
+        }
+
+        string kernelName = quantized.DataType switch
+        {
+            DataType.Q2_K => "dequant_q2k",
+            DataType.Q3_K => "dequant_q3k",
+            DataType.Q4_K => "dequant_q4k",
+            DataType.Q5_K => "dequant_q5k",
+            DataType.Q6_K => "dequant_q6k",
+            _ => throw new NotSupportedException($"DequantizeElements not supported for {quantized.DataType}")
+        };
+
+        GetOrCreateKernel(kernelName, () => quantized.DataType switch
+        {
+            DataType.Q2_K => ComputeShaders.DequantizeQ2K,
+            DataType.Q3_K => ComputeShaders.DequantizeQ3K,
+            DataType.Q4_K => ComputeShaders.DequantizeQ4K,
+            DataType.Q5_K => ComputeShaders.DequantizeQ5K,
+            DataType.Q6_K => ComputeShaders.DequantizeQ6K,
+            _ => throw new NotSupportedException()
+        });
+
+        uint totalGroups = (elementCount + 255) / 256; // FIX: dispatch based on elementCount, not target size
+        var offsetBuf2 = _device.CreateBuffer(sizeof(uint), BufferType.Storage, DataType.I32);
+        offsetBuf2.Write(new[] { elementOffset });
+        DeferExternal(offsetBuf2);
+        EmitDispatch(kernelName,
+            [quantized.Buffer, target.Buffer, offsetBuf2], 3,
+            [totalGroups, 1, 1], "deq_elems");
     }
 
     // ═══════════════════════ EMBEDDING ═══════════════════════

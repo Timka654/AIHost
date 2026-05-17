@@ -635,10 +635,11 @@ public class ModelManager : IDisposable
         const int SUB_BATCH = 8;
         int dm = t._dModel;
 
-        // FIX: iGPU VRAM is tight: 16.5 GB model + 4.85 GB token_embd scratch
-        // + 2 GB layer scratches ≈ 23.5 GB. Arena must be kept small (512 MB)
-        // to leave room for scratch allocations and temp tensors.
-        long arenaTarget = 512L * 1024 * 1024;
+        // FIX: iGPU VRAM is tight: skip fixed arena pool entirely.
+        // Per-frame scratch is small (~120 MB) and can use ad-hoc Tensor.Create.
+        // 4.85 GB token_embd scratch + 1.6 GB layer scratches + 16.5 GB model
+        // ≈ 23 GB — arena would push it over the edge.
+        long arenaTarget = 0;
 
         // Minimum per-frame scratch (SSM recurrence, wZ padding, temp pool)
         long perFrame = (long)dm * VD * 4L                     // wZ padded (~120 MB)

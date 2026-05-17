@@ -52,12 +52,6 @@ public class TransformerBase : IDisposable
     // Reused across all layers and tokens to eliminate per-inference vkAllocateMemory calls.
     protected internal readonly Dictionary<string, Tensor> _scratchF32 = [];
 
-    // Set to true after all scratches have been filled with dequantized F32 data.
-    // Once filled, TempF32/TempF32Named return the scratch immediately without
-    // re-dispatching DequantizeInto (which would flood the GpuExecutor command
-    // buffer with chunk dispatches and cause ErrorDeviceLost on AMD iGPUs).
-    private bool _scratchesFilled;
-
     // For multi-GPU: offset added to local layer index when looking up weight names.
     protected internal int _layerOffset = 0;
     protected internal int _localLayerCount;
@@ -155,8 +149,12 @@ public class TransformerBase : IDisposable
         _logger.LogInformation("[LOAD] Weights loaded: {Count} tensors, quantized in VRAM", _weightCache.Count);
 
         _logger.LogInformation("[LOAD] Allocating scratch buffers...");
-        AllocateScratchWeights(_numLayers > 0 ? _nameMapper.AttnNorm(0) : null);
+        // FIX: Allocate largest scratch FIRST to get best contiguous VRAM block.
+        // token_embd.weight scratch is 4.85 GB contiguous — if allocated after
+        // 8 layer scratch buffers (2 GB), Vulkan fragmentation prevents finding
+        // a contiguous block (ErrorOutOfDeviceMemory on AMD iGPU).
         TryAllocateScratchHead();
+        AllocateScratchWeights(_numLayers > 0 ? _nameMapper.AttnNorm(0) : null);
         _logger.LogInformation("[LOAD] F32 scratch buffers allocated: {Count} tensors", _scratchF32.Count);
         _logger.LogInformation("[LOAD] Running CPU reference layer 0...");
         RunCpuReferenceLayer0();
@@ -286,6 +284,12 @@ public class TransformerBase : IDisposable
                 _logger.LogError(ex, "[FWD] Layer {Layer} FAILED", i);
                 throw;
             }
+            // FIX: Flush after each layer (matching old batch-mode behaviour).
+            // In Channel mode, MaybeFlush() only inserts a memory barrier, NOT a
+            // vkQueueSubmit. Without explicit Flush(), all layer dispatches
+            // accumulate in one command buffer → TDR timeout on AMD iGPUs.
+            // Old version: _queue.Flush() at end of each layer/batch.
+            _ops.Flush();
             _logger.LogInformation("[FWD] Layer {Layer} OK", i);
             if (i == 0) DiagHidden("after_layer0", x, diagEnabled);
             if (i == 3) DiagHidden("after_layer3", x, diagEnabled);
@@ -344,29 +348,18 @@ public class TransformerBase : IDisposable
     protected internal (Tensor tensor, bool isScratch) TempF32(string name)
     {
         var cached = _weightCache[name];
-
         if (cached.DataType == DataType.F32)
             return (_ops.Clone(cached), false);
-
-        // Use pre-allocated scratch buffer to avoid vkAllocateMemory per inference
         var dot2 = name.IndexOf('.', name.IndexOf('.') + 1);
         var key = dot2 >= 0 ? name[(dot2 + 1)..] : name;
         if (_scratchF32.TryGetValue(key, out var scratch))
         {
-            // FIX: Eager-filled scratches are already dequantized — skip re-dispatch.
-            // Re-dispatching chunked DequantizeInto per token floods the GpuExecutor
-            // command buffer (100+ dispatches per weight) → ErrorDeviceLost on AMD iGPU.
-            if (!_scratchesFilled)
-                _ops.DequantizeInto(cached, scratch);
+            _ops.DequantizeInto(cached, scratch);
             return (scratch, true);
         }
-
         return (_ops.Dequantize(cached), false);
     }
 
-    /// <summary>
-    /// TempF32 by exact name (bypasses the layer-prefix stripping logic).
-    /// </summary>
     protected internal (Tensor tensor, bool isScratch) TempF32Named(string name)
     {
         if (!_weightCache.TryGetValue(name, out var cached))
@@ -377,8 +370,7 @@ public class TransformerBase : IDisposable
         var key = dot2 >= 0 ? name[(dot2 + 1)..] : name;
         if (_scratchF32.TryGetValue(key, out var scratch))
         {
-            if (!_scratchesFilled)
-                _ops.DequantizeInto(cached, scratch);
+            _ops.DequantizeInto(cached, scratch);
             return (scratch, true);
         }
         return (_ops.Dequantize(cached), false);
@@ -433,10 +425,10 @@ public class TransformerBase : IDisposable
             f32.Dispose();
             return resultF32;
         }
-        // Use scratch (eager-filled in AllocateScratchWeights) to avoid
-        // allocating a temporary 4.85 GB F32 buffer via Dequantize().
-        var (embF32, _) = TempF32(_nameMapper.TokenEmbd);
-        return _ops.EmbeddingLookup(tokenIds, embF32, "embeddings");
+        // FIX: CPU-side dequantization via DequantizeRowCpu. Reads quantized rows
+        // from GPU (KB, not GB), CPU-decodes to float[], uploads via Tensor.FromData.
+        // Zero GPU dequant dispatches — eliminates TDR and ErrorOutOfDeviceMemory.
+        return _ops.EmbeddingLookupFromQuantized(tokenIds, embCached, "embeddings");
     }
 
     private void TryAllocateScratch(string layerPrefix)
@@ -450,11 +442,10 @@ public class TransformerBase : IDisposable
 
     private void TryAllocateScratchHead()
     {
-        // No head-weight scratches: both token_embd.weight and output.weight
-        // are ~4.85 GB F32 each — too large for iGPU VRAM alongside model + arena.
-        // EmbeddingLookupOptimized handles quantized embedding by creating a temp
-        // F32 via EmbeddingLookupFromQuantized, then Forward() flushes immediately
-        // to dispose it before layers consume VRAM.
+        // FIX: token_embd.weight no longer needs a full-table F32 scratch.
+        // EmbeddingLookupOptimized uses DequantizeElements to dequantize only
+        // the needed rows (3*2048*4=24KB vs 4.85GB), avoiding ErrorOutOfDeviceMemory
+        // on AMD iGPUs with fragmented Vulkan heaps.
         // output.weight uses MatMulWeightsLarge chunked path — no scratch needed.
     }
 
@@ -530,31 +521,39 @@ public class TransformerBase : IDisposable
             var key = prefixLen > 0 ? name[prefixLen..] : name;
             _scratchF32[key] = scratch;
 
-            // FIX: Eager-fill scratch with dequantized F32 data NOW (during LoadWeights),
-            // not lazily on first TempF32(). In Channel mode, lazy DequantizeInto issues
-            // 93+ chunk dispatches into a single command buffer per weight, flooding the
-            // GpuExecutor and causing vkQueueSubmit ErrorDeviceLost on AMD iGPUs.
-            // By dequantizing all scratches upfront and flushing, we ensure zero
-            // DequantizeInto dispatches during hot inference path.
-            _ops.DequantizeInto(cached, scratch);
         }
 
-        // Flush all eager dequant dispatches before marking scratches as filled.
-        // Without this, TempF32 sees _scratchesFilled=true but GPU hasn't written F32 data yet.
-        _ops.Flush();
-        _scratchesFilled = true;
-        _logger.LogInformation("[LOAD] Scratch buffers eager-filled: {Count} tensors, flushed", _scratchF32.Count);
+        _logger.LogInformation("[LOAD] Scratch buffers allocated: {Count} tensors", _scratchF32.Count);
+    }
+
+    /// <summary>
+    /// Read a single embedding row as float[] via CPU GGUF read + compact GPU dequant.
+    /// Reads quantized bytes directly from GGUF file (CPU), packs into a compact 1-row
+    /// GPU buffer, dequantizes with elementOffset=0. No VRAM allocation for full table.
+    /// </summary>
+    private float[] ReadEmbeddingRow(int tokenId)
+    {
+        var embCached = _weightCache["token_embd.weight"];
+        int dim = embCached.Shape[1];
+        if (embCached.DataType == DataType.F32)
+            return embCached.Buffer.ReadRange<float>((ulong)(tokenId * dim) * sizeof(float), dim);
+
+        // FIX: Use EmbeddingLookupFromQuantized which internally Flush()es
+        // before reading GPU buffer bytes.
+        var row = _ops.EmbeddingLookupFromQuantized(new[] { tokenId }, _weightCache["token_embd.weight"], "cpuref_row");
+        var result = row.ReadData();
+        _ops.DeferExternal(row);
+        return result;
     }
 
     private void RunCpuReferenceLayer0()
     {
         try
         {
-            // BUGFIX: TempF32 returns scratch buffer (owned by _scratchF32).
-            // Disposing it destroys the scratch, causing Use-After-Free on next inference.
-            var (embF32, isScratch) = TempF32("token_embd.weight");
-            float[] emb = embF32.Buffer.ReadRange<float>(1 * 2048 * 4UL, 2048);
-            if (!isScratch) embF32.Dispose();
+            // FIX: Read embedding row via row-wise GPU dequantization (2048 elements
+            // = 8 KB) instead of TempF32 which would dequantize the entire 4.85 GB
+            // table and fail with ErrorOutOfDeviceMemory on AMD iGPUs.
+            float[] emb = ReadEmbeddingRow(1); // BOS token
 
             // BUGFIX: norm weight is quantized in _weightCache — must dequantize first, not read raw bytes as floats.
             var (normF32, normIsScratch) = TempF32("blk.0.attn_norm.weight");

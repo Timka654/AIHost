@@ -193,6 +193,25 @@ public class GGUFReader : IDisposable
         return data;
     }
 
+    /// <summary>
+    /// Read a byte range from a tensor's data in the GGUF file at given offset and length.
+    /// Uses absolute byte offset within the tensor data (not file offset).
+    /// </summary>
+    public byte[] ReadTensorDataRange(GGUFTensorInfo tensor, ulong byteOffset, int byteLength)
+    {
+        _fileStream.Seek((long)(DataOffset + tensor.Offset + byteOffset), SeekOrigin.Begin);
+        byte[] data = new byte[byteLength];
+        int bytesRead = 0;
+        while (bytesRead < byteLength)
+        {
+            int read = _fileStream.Read(data, bytesRead, byteLength - bytesRead);
+            if (read == 0)
+                throw new EndOfStreamException($"Unexpected EOF reading tensor '{tensor.Name}' at offset {byteOffset}");
+            bytesRead += read;
+        }
+        return data;
+    }
+
     private static ulong AlignOffset(ulong offset, ulong alignment)
     {
         return (offset + alignment - 1) & ~(alignment - 1);
