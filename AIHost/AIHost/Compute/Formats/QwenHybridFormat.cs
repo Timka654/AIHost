@@ -143,16 +143,24 @@ public class QwenHybridFormat : ITransformerFormat
         // Qwen3.5: per-head = 12288/48 = 256 = qknDim*2 → fused Q(128)+gate(128)
         // Qwen3.6: per-head = 12288/48 = 256 = qknDim    → Q only, no gate
         // Qwen3Next: detachable gate via attn_gate.weight.
-        bool fusedGate = (qtd / totalHeads) == qknDim * 2;
+        // FIX: qknDim is the Q-norm group size (128), NOT the attention head dimension.
+        // head_dim (hd=256) is the actual attention head size.
+        // Qwen3.5: per-head Q=256, gate=256 → total per-head = 512 = hd*2.
+        // Fused gate means Q and gate are interleaved in the Q projection:
+        // [Q_h0(256), gate_h0(256), Q_h1(256), gate_h1(256), ...]
+        bool fusedGate = (qtd / totalHeads) == hd * 2;
         bool detachableGate = t.HasWeight($"blk.{g}.attn_gate.weight");
         bool ig = fusedGate || detachableGate;
-        int qd = totalHeads * qknDim;  // pure Q part: 48*128=6144 (Qwen3.5), 48*256=12288 (Qwen3.6, no gate)
+        // When gate is fused into Q projection, the deinterleave stride is hd (256),
+        // not qknDim (128, the norm group size). qd = total Q columns = totalHeads * hd.
+        int deintDim = fusedGate ? hd : qknDim;
+        int qd = totalHeads * deintDim;
         // Only log during decode (sl==1): in non-batch mode every MaybeFlush() does a full GPU sync.
         bool dbg = sl == 1 && QwenDbgTrace.Once("TypeB", g);
         if (dbg) QwenDbgTrace.Row0($"rq_raw_g{g}", rq, 16);
         Tensor gq; Tensor? attnOutGate = null; int nqh;
         if (ig) {
-            var rqDi = o.DeinterleaveQGate(rq, (uint)totalHeads, (uint)qknDim, "rqDiB");
+            var rqDi = o.DeinterleaveQGate(rq, (uint)totalHeads, (uint)deintDim, "rqDiB");
             if (dbg) QwenDbgTrace.Row0($"rqDi_g{g}", rqDi, 16);
             if (b) o.DeferExternal(rq); else rq.Dispose();
             gq = o.SliceCols(rqDi, 0, qd, "qpB");
@@ -178,9 +186,14 @@ public class QwenHybridFormat : ITransformerFormat
             o.LayerNormVirtual(K, knW, sl * (K.Shape[1] / kknDim), kknDim);
             if (!knS) o.DeferExternal(knW);
         }
-        // RoPE: use actual head dim from norm weight (qknDim=128), not t._headDim (256 generic).
-        o.ApplyRoPEFull(gq, pos, gq.Shape[1] / qknDim, qknDim, t._ropeFreqBase, t._ropeDimCount);
-        o.ApplyRoPEFull(K, pos, K.Shape[1] / kknDim, kknDim, t._ropeFreqBase, t._ropeDimCount);
+        // FIX: Use hd (attention head_dim=256) for RoPE head dimension.
+        // qknDim/qknDim are norm-group sizes (128), NOT attention head dimensions.
+        // Using qknDim causes RoPE to process each real head as 2 virtual heads,
+        // correctly rotating the first 64 dims (rope_dim=64) per real head,
+        // but then ALSO rotating dims 128-191. The per-head "numHeads" count
+        // must match the actual attention head count, not the norm-group count.
+        o.ApplyRoPEFull(gq, pos, gq.Shape[1] / hd, hd, t._ropeFreqBase, t._ropeDimCount);
+        o.ApplyRoPEFull(K, pos, K.Shape[1] / hd, hd, t._ropeFreqBase, t._ropeDimCount);
         // Diagnostic: log Q/K head-0 magnitude after RoPE for first 4 attention layers.
         // ||Q||² >> 0 = healthy; ≈ 0 or NaN = corrupted by RoPE/norm.
         if (sl == 1 && QwenDbgTrace.Once("RoPE_QK_norm", g))
