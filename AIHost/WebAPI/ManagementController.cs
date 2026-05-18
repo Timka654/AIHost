@@ -607,6 +607,14 @@ public class ManagementController : ControllerBase
     /// <summary>Applies the model's chat template to the DirectChat message.</summary>
     private static string BuildDirectChatPrompt(AIHost.Config.ModelInstance model, ChatRequest request)
     {
+        // FIX: Base/pretrained models (without -Instruct/-Chat/-IT in filename)
+        // do not understand chat templates. Send raw text for completion.
+        var mp = model.Config.ModelPath;
+        if (!mp.Contains("-Instruct", StringComparison.OrdinalIgnoreCase) &&
+            !mp.Contains("-Chat", StringComparison.OrdinalIgnoreCase) &&
+            !mp.Contains("-IT", StringComparison.OrdinalIgnoreCase))
+            return request.Message;
+
         var tokenizer = model.Engine.Tokenizer;
         bool isQwen = tokenizer.GetTokenId("<|im_start|>") >= 0;
         var sb = new System.Text.StringBuilder();
@@ -619,15 +627,7 @@ public class ManagementController : ControllerBase
             if (!string.IsNullOrEmpty(systemText))
                 sb.Append($"<|im_start|>system\n{systemText}<|im_end|>\n");
             sb.Append($"<|im_start|>user\n{request.Message}<|im_end|>\n");
-            // Qwen3-series models require a thinking prefix after the assistant role marker.
-            // Without it the model doesn't know what mode to generate in → garbage output.
-            // Non-thinking mode: inject empty <think></think> block so model skips reasoning
-            // and generates the answer directly. This matches the official chat template with
-            // enable_thinking=false.
-            bool hasThinking = tokenizer.GetTokenId("<think>") >= 0;
-            sb.Append(hasThinking
-                ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                : "<|im_start|>assistant\n");
+            sb.Append("<|im_start|>assistant\n");
         }
         else
         {
