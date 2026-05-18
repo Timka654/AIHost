@@ -294,6 +294,10 @@ public class ModelManager : IDisposable
             Engine = engine,
             Device = perModelDevice,
             SystemMessages = systemMessages,
+            IsChatModel = config.ChatTemplate
+                ?? config.ModelPath.Contains("-Instruct", StringComparison.OrdinalIgnoreCase)
+                || config.ModelPath.Contains("-Chat", StringComparison.OrdinalIgnoreCase)
+                || config.ModelPath.Contains("-IT", StringComparison.OrdinalIgnoreCase),
             LoadedAt = DateTime.UtcNow
         };
 
@@ -654,6 +658,7 @@ public class ModelInstance : IDisposable
     public IInferenceEngine Engine { get; set; } = null!;
     public IComputeDevice? Device { get; set; }
     public List<string> SystemMessages { get; set; } = new();
+    public bool IsChatModel { get; set; }
     public DateTime LoadedAt { get; set; }
 
     // Statistics — all writes go through UpdateStats() which holds _statsLock.

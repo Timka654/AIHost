@@ -133,6 +133,10 @@ public class ModelConfig
     [JsonPropertyName("arena_size_mb")]
     public int? ArenaSizeMb { get; set; }
 
+    /// <summary>Chat template mode: null=auto-detect, true=chat, false=raw completion.</summary>
+    [JsonPropertyName("chat_template")]
+    public bool? ChatTemplate { get; set; }
+
     // ── Multi-GPU settings ────────────────────────────────────────────────────
 
     /// <summary>

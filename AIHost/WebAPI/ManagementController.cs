@@ -607,12 +607,9 @@ public class ManagementController : ControllerBase
     /// <summary>Applies the model's chat template to the DirectChat message.</summary>
     private static string BuildDirectChatPrompt(AIHost.Config.ModelInstance model, ChatRequest request)
     {
-        // FIX: Base/pretrained models (without -Instruct/-Chat/-IT in filename)
-        // do not understand chat templates. Send raw text for completion.
-        var mp = model.Config.ModelPath;
-        if (!mp.Contains("-Instruct", StringComparison.OrdinalIgnoreCase) &&
-            !mp.Contains("-Chat", StringComparison.OrdinalIgnoreCase) &&
-            !mp.Contains("-IT", StringComparison.OrdinalIgnoreCase))
+        // FIX: Base/pretrained models don't understand chat templates.
+        // Send raw message for text completion instead.
+        if (!model.IsChatModel)
             return request.Message;
 
         var tokenizer = model.Engine.Tokenizer;
