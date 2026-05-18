@@ -222,8 +222,11 @@ public class TransformerBase : IDisposable
             // FIX: Force GPU flush before chunked matmul to ensure LayerNorm
             // results on 'x' are visible.
             _ops.Flush();
+            var _tsChunk = GlobalProfiler.Start();
             var chunkedLogits = _ops.MatMulWeightsLarge(x, outWeightCached, "logits");
+            GlobalProfiler.End(_tsChunk, "Fwd.Head.Chunked");
             x.Dispose();
+            GlobalProfiler.End(_ts, "Fwd.Head.Detail");
             return chunkedLogits;
         }
 

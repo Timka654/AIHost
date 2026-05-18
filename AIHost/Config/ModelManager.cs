@@ -294,10 +294,13 @@ public class ModelManager : IDisposable
             Engine = engine,
             Device = perModelDevice,
             SystemMessages = systemMessages,
+            // FIX: Qwen models often have generic GGUF filenames (e.g. qwen3.5-7b-Q6_K.gguf)
+            // without -Instruct/-Chat/-IT. Detect them via chat-template special tokens.
             IsChatModel = config.ChatTemplate
                 ?? config.ModelPath.Contains("-Instruct", StringComparison.OrdinalIgnoreCase)
                 || config.ModelPath.Contains("-Chat", StringComparison.OrdinalIgnoreCase)
-                || config.ModelPath.Contains("-IT", StringComparison.OrdinalIgnoreCase),
+                || config.ModelPath.Contains("-IT", StringComparison.OrdinalIgnoreCase)
+                || engine.Tokenizer.GetTokenId("<|im_start|>") >= 0,
             LoadedAt = DateTime.UtcNow
         };
 

@@ -222,6 +222,11 @@ class WebServer
         };
         logger.LogInformation("✓ Initialized compute device: {DeviceName} ({Provider})", deviceName, computeDevice.ProviderName);
 
+        try { var vkDevs = AIHost.ICompute.Vulkan.VulkanComputeDevice.GetAvailableDevices();
+              logger.LogInformation("Vulkan devices ({Count}):", vkDevs.Length);
+              foreach (var d in vkDevs) logger.LogInformation("  [{Index}] => {Name}", d.Index, d.Name);
+        } catch { }
+
         Directory.CreateDirectory(serverConfig.LogsDirectory);
         Directory.CreateDirectory(serverConfig.CacheDirectory);
         Directory.CreateDirectory(serverConfig.ModelsDirectory);
