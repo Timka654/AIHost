@@ -624,9 +624,10 @@ public class ManagementController : ControllerBase
             if (!string.IsNullOrEmpty(systemText))
                 sb.Append($"<|im_start|>system\n{systemText}<|im_end|>\n");
             sb.Append($"<|im_start|>user\n{request.Message}<|im_end|>\n");
-            // FIX: Qwen chat template ALWAYS requires <think>\n after <|im_start|>assistant\n.
-            // Official Jinja: add_generation_prompt → '<|im_start|>assistant\n<think>\n'
-            // Without it, the model doesn't enter thinking mode and outputs garbage.
+            // Official Qwen Jinja template (from model files):
+            // {%- if add_generation_prompt %}
+            //     {{- '<|im_start|>assistant\n<think>\n' }}
+            // {%- endif %}
             sb.Append("<|im_start|>assistant\n<think>\n");
         }
         else
