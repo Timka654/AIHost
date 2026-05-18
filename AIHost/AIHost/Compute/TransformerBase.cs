@@ -20,43 +20,33 @@ public class TransformerBase : IDisposable
     protected internal readonly int _numHeads;
     protected internal readonly int _numKVHeads;
     protected internal readonly int _headDim;
-    // SSM / Gated Delta Net parameters (read from GGUF metadata).
-    // HVD = ssm_d_state (size of each SSM head, typically 128).
-    // NVH = ssm_dt_rank (number of V/SSM heads, typically 48).
-    // NKH = ssm_n_group (number of K heads, typically 16).
-    protected internal readonly int _ssmHVD;  // head_v_dim = ssm_d_state
-    protected internal readonly int _ssmVH;   // n_v_heads = ssm_dt_rank
-    protected internal readonly int _ssmKH;   // n_k_heads = ssm_n_group
-    protected internal readonly int _ssmKD;   // key_dim = NKH * HVD
-    protected internal readonly int _ssmVD;   // value_dim = NVH * HVD
-    protected internal readonly int _ssmCD;   // conv_dim = ssm_d_inner + 2 * key_dim
+    protected internal readonly int _ssmHVD;
+    protected internal readonly int _ssmVH;
+    protected internal readonly int _ssmKH;
+    protected internal readonly int _ssmKD;
+    protected internal readonly int _ssmVD;
+    protected internal readonly int _ssmCD;
     protected internal readonly float _ropeFreqBase;
-    /// <summary>
-    /// Number of head dimensions to apply RoPE to (from rope.dimension_count).
-    /// For models with partial RoPE (e.g. Qwen3.5/3.6: 64 of 256), only these
-    /// dimensions are rotated; the rest are left unchanged.
-    /// Defaults to _headDim (full rotation) when key is absent.
-    /// </summary>
     protected internal readonly int _ropeDimCount;
     protected bool _disposed;
     private bool _hiddenDiagFired;
     protected internal readonly ILogger<TransformerBase> _logger = AppLogger.Create<TransformerBase>();
 
-    /// <summary>Max context length from GGUF metadata (0 = unknown).</summary>
     public int ContextLength { get; private set; }
 
-    // Stores QUANTIZED tensors (or F32 for weights already stored as F32 in GGUF).
     protected internal readonly Dictionary<string, Tensor> _weightCache = [];
 
-    // Pre-allocated F32 scratch tensors keyed by weight name (e.g. "attn_q.weight").
-    // Reused across all layers and tokens to eliminate per-inference vkAllocateMemory calls.
-    protected internal readonly Dictionary<string, Tensor> _scratchF32 = [];
+    // FIX: Channel mode — embedding lookup via CPU dequant from GGUF file.
+    // Reading full 285MB into a single byte[] may fail on constrained systems,
+    // so we store GGUFTensorInfo for row-by-row ReadTensorDataRange.
+    private byte[]? _rawEmbeddingCpuBytes;
+    private GGUFTensorInfo? _rawEmbeddingTensorInfo;
+    private long _rawEmbeddingBytesPerRow;
 
-    // For multi-GPU: offset added to local layer index when looking up weight names.
+    protected internal readonly Dictionary<string, Tensor> _scratchF32 = [];
     protected internal int _layerOffset = 0;
     protected internal int _localLayerCount;
     protected internal TensorNameMapper? _nameMapper;
-
     private ITransformerFormat _format;
 
     public int LayerCount => _numLayers;
@@ -65,8 +55,7 @@ public class TransformerBase : IDisposable
 
     public TransformerBase(IComputeDevice device, IGGUFModel model, ITransformerFormat format)
     {
-        var leasePool = new GpuLeasePool(device);
-        _ops = new ComputeOps(device, leasePool);
+        _ops = new ComputeOps(device);
         _model = model;
         _format = format;
 
@@ -93,30 +82,23 @@ public class TransformerBase : IDisposable
         _dModel = ArchInt("embedding_length", 2048);
         _numHeads = ArchInt("attention.head_count", 32);
         ContextLength = ArchInt("context_length", 0);
-
-        // Read head_dim from GGUF metadata; fall back to d_model/n_heads for legacy models.
         _headDim = ArchInt("attention.key_length", _dModel / _numHeads);
-
         _ropeFreqBase = ArchFlt("rope.freq_base", 10000.0f);
-        // rope.dimension_count: how many dimensions per head get RoPE applied.
-        // For Qwen3.5/3.6: 64 (only 32 pairs rotated out of 128 in a 256-dim head).
-        // Absent on most models → default to headDim (rotate all pairs).
         _ropeDimCount = ArchInt("rope.dimension_count", _headDim);
         var kvHeads = ArchInt("attention.head_count_kv", 4);
         _numKVHeads = kvHeads;
         _localLayerCount = _numLayers;
 
-        // ── SSM / Gated Delta Net parameters ─────────────────────────────
         int ssmInner  = ArchInt("ssm.inner_size", 6144);
         int ssmState  = ArchInt("ssm.state_size", 128);
         int ssmGroups = ArchInt("ssm.group_count", 16);
         int ssmDtRank = ArchInt("ssm.time_step_rank", 48);
-        _ssmVH  = ssmDtRank;                     // n_v_heads
-        _ssmKH  = ssmGroups;                     // n_k_heads
-        _ssmHVD = ssmState;                      // head_v_dim = ssm.state_size
-        _ssmKD  = ssmState * ssmGroups;           // key_dim = HVD*KH
-        _ssmVD  = ssmDtRank * _ssmHVD;            // value_dim = VH*HVD
-        _ssmCD  = ssmInner + 2 * _ssmKD;          // conv_dim
+        _ssmVH  = ssmDtRank;
+        _ssmKH  = ssmGroups;
+        _ssmHVD = ssmState;
+        _ssmKD  = ssmState * ssmGroups;
+        _ssmVD  = ssmDtRank * _ssmHVD;
+        _ssmCD  = ssmInner + 2 * _ssmKD;
 
         _logger.LogInformation("Transformer: layers={Layers} d_model={DModel} heads={Heads} kv_heads={KvHeads} head_dim={HeadDim} ctx={Ctx} rope={Rope} rope_dim={RopeDim}",
             _numLayers, _dModel, _numHeads, kvHeads, _headDim, ContextLength, _ropeFreqBase, _ropeDimCount);
@@ -126,15 +108,16 @@ public class TransformerBase : IDisposable
 
     // ── Weight loading ────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Upload all model weights to GPU (quantized). Fast: no dequantization here.
-    /// </summary>
     public void LoadWeights()
     {
         _logger.LogInformation("[LOAD] Loading model weights...");
         _nameMapper = new TensorNameMapper(_model);
 
         _logger.LogInformation("[LOAD] Caching embed/norm/output weights");
+        // FIX: Read raw quantized bytes BEFORE CacheWeight so GGUFReader stream
+        // position is known. CacheWeight calls LoadTensor→ReadTensorData which
+        // repositions the stream.
+        LoadRawEmbeddingCpuBytes();
         CacheWeight(_nameMapper.TokenEmbd);
         CacheWeight(_nameMapper.OutputNorm);
         CacheWeight(_nameMapper.OutputWeight);
@@ -147,24 +130,15 @@ public class TransformerBase : IDisposable
         }
 
         _logger.LogInformation("[LOAD] Weights loaded: {Count} tensors, quantized in VRAM", _weightCache.Count);
-
         _logger.LogInformation("[LOAD] Allocating scratch buffers...");
-        // FIX: Allocate largest scratch FIRST to get best contiguous VRAM block.
-        // token_embd.weight scratch is 4.85 GB contiguous — if allocated after
-        // 8 layer scratch buffers (2 GB), Vulkan fragmentation prevents finding
-        // a contiguous block (ErrorOutOfDeviceMemory on AMD iGPU).
-        TryAllocateScratchHead();
         AllocateScratchWeights(_numLayers > 0 ? _nameMapper.AttnNorm(0) : null);
+        TryAllocateScratchHead();
         _logger.LogInformation("[LOAD] F32 scratch buffers allocated: {Count} tensors", _scratchF32.Count);
         _logger.LogInformation("[LOAD] Running CPU reference layer 0...");
         RunCpuReferenceLayer0();
         _logger.LogInformation("[LOAD] LoadWeights COMPLETE");
     }
 
-    /// <summary>
-    /// Load only a subset of layers plus optionally the embedding table and lm-head.
-    /// Used by MultiGPUTransformer to split a model across devices.
-    /// </summary>
     public void LoadWeightsPartial(int globalFirstLayer, int globalLastLayer,
                                     bool withEmbedding, bool withHead)
     {
@@ -192,13 +166,8 @@ public class TransformerBase : IDisposable
 
     // ── Forward pass ──────────────────────────────────────────────────────────
 
-    /// <summary>Token embedding lookup. Returns [seqLen, dModel] on this device's GPU.</summary>
     public Tensor ForwardEmbedding(int[] tokenIds) => EmbeddingLookupOptimized(tokenIds);
 
-    /// <summary>
-    /// Run the locally-loaded layers on activation tensor x.
-    /// KV-cache uses LOCAL layer indices (0-based for this device).
-    /// </summary>
     public Tensor ForwardLayers(Tensor x, uint startPos, KVCache? cache = null,
                                  SSMState? ssmState = null)
     {
@@ -207,9 +176,6 @@ public class TransformerBase : IDisposable
         return x;
     }
 
-    /// <summary>
-    /// Apply output_norm + lm-head projection. Returns logits [seqLen, vocabSize].
-    /// </summary>
     public Tensor ForwardHead(Tensor x)
     {
         var _ts = GlobalProfiler.Start();
@@ -224,8 +190,6 @@ public class TransformerBase : IDisposable
 
         if (outF32Bytes > 1L * 1024 * 1024 * 1024)
         {
-            // FIX: Force GPU flush before chunked matmul to ensure LayerNorm
-            // results on 'x' are visible.
             _ops.Flush();
             var chunkedLogits = _ops.MatMulWeightsLarge(x, outWeightCached, "logits");
             x.Dispose();
@@ -240,9 +204,6 @@ public class TransformerBase : IDisposable
         return logits;
     }
 
-    /// <summary>
-    /// Full forward pass through transformer.
-    /// </summary>
     public Tensor Forward(int[] tokenIds, uint startPosition = 0, KVCache? kvCache = null,
                            SSMState? ssmState = null)
     {
@@ -252,22 +213,19 @@ public class TransformerBase : IDisposable
         if (_nameMapper == null)
             throw new InvalidOperationException("Weights not loaded. Call LoadWeights() first.");
 
-        // 1. Token embedding
+        // 1. Token embedding (CPU dequant from raw GGUF bytes — no 4.85GB GPU allocation)
         _logger.LogInformation("[FWD] EmbeddingLookup...");
         Tensor x = EmbeddingLookupOptimized(tokenIds);
         _logger.LogInformation("[FWD] EmbeddingLookup OK shape=[{D0},{D1}]", x.Shape[0], x.Shape[1]);
 
-        // FIX: Flush deferred buffers from EmbeddingLookupFromQuantized.
-        // Dequantize() creates a 4.85 GB temporary F32 buffer (DeferExternal'd),
-        // which lives until the next Flush (end of first layer). On AMD iGPUs
-        // this exhausts VRAM (ErrorOutOfDeviceMemory). Flushing here frees it
-        // before layer weights are loaded.
+        // FIX: Flush IMMEDIATELY after embedding lookup. When _rawEmbeddingCpuBytes is null
+        // (GGUF read failed or F32 table), EmbeddingLookupFromQuantized falls back to GPU
+        // dequant which DeferExternals the 4.85GB F32 buffer. Without this Flush, VRAM is
+        // exhausted before layer processing starts, causing ErrorOutOfDeviceMemory on SSM weights.
         _ops.Flush();
 
-        // Diagnostic: log last-token hidden state at key checkpoints (decode only, first call)
         bool diagEnabled = tokenIds.Length == 1 && !_hiddenDiagFired;
         if (diagEnabled) _hiddenDiagFired = true;
-
         DiagHidden("embed", x, diagEnabled);
 
         // 2. All transformer layers
@@ -278,18 +236,14 @@ public class TransformerBase : IDisposable
             try
             {
                 x = _format.ApplyLayer(this, x, i, startPosition, kvCache, ssmState);
+                // FIX: Flush after each layer to prevent TDR on AMD iGPUs
+                _ops.Flush();
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[FWD] Layer {Layer} FAILED", i);
                 throw;
             }
-            // FIX: Flush after each layer (matching old batch-mode behaviour).
-            // In Channel mode, MaybeFlush() only inserts a memory barrier, NOT a
-            // vkQueueSubmit. Without explicit Flush(), all layer dispatches
-            // accumulate in one command buffer → TDR timeout on AMD iGPUs.
-            // Old version: _queue.Flush() at end of each layer/batch.
-            _ops.Flush();
             _logger.LogInformation("[FWD] Layer {Layer} OK", i);
             if (i == 0) DiagHidden("after_layer0", x, diagEnabled);
             if (i == 3) DiagHidden("after_layer3", x, diagEnabled);
@@ -298,10 +252,6 @@ public class TransformerBase : IDisposable
         }
         _logger.LogInformation("[FWD] Layer loop done");
 
-        // Unconditional DIAG: dump LAST token's hidden state before lm_head
-        // CRITICAL: ReadRange<float> takes BYTE offset (ulong), NOT float index (int).
-        // Prefill (batch) mode: x.Shape[0] = numTokens (e.g. 54)
-        // Decode mode: x.Shape[0] = 1
         {
             try
             {
@@ -318,9 +268,6 @@ public class TransformerBase : IDisposable
             catch (Exception diagEx) { _logger.LogWarning("[DIAG_FINAL_HIDDEN] err={Err}", diagEx.Message); }
         }
 
-        // 3. Final layer norm + vocab projection
-        //    Delegates to ForwardHead which has chunked MatMulWeightsLarge path
-        //    for large-vocab models (Qwen 248K, etc.).
         return ForwardHead(x);
     }
 
@@ -340,16 +287,12 @@ public class TransformerBase : IDisposable
 
     // ── Protected helpers for formats ─────────────────────────────────────────
 
-    /// <summary>
-    /// Returns an F32 tensor from the named cached weight.
-    /// Uses a pre-allocated scratch buffer if available (no vkAllocateMemory); otherwise
-    /// allocates a new tensor. Caller must NOT dispose scratch tensors (owned by TransformerBase).
-    /// </summary>
     protected internal (Tensor tensor, bool isScratch) TempF32(string name)
     {
         var cached = _weightCache[name];
         if (cached.DataType == DataType.F32)
             return (_ops.Clone(cached), false);
+
         var dot2 = name.IndexOf('.', name.IndexOf('.') + 1);
         var key = dot2 >= 0 ? name[(dot2 + 1)..] : name;
         if (_scratchF32.TryGetValue(key, out var scratch))
@@ -376,41 +319,25 @@ public class TransformerBase : IDisposable
         return (_ops.Dequantize(cached), false);
     }
 
-    /// <summary>
-    /// Creates a tiled version of a [head_dim] norm weight to cover [total_dim].
-    /// Caches result in _scratchF32 to avoid re-allocation every token.
-    /// </summary>
-    /// <summary>
-    /// Creates a tiled version of a [head_dim] norm weight to cover [total_dim].
-    /// If the weight is not found, returns null — caller should skip normalization.
-    /// Caches result in _scratchF32 to avoid re-allocation every token.
-    /// </summary>
     protected internal Tensor? GetOrBuildTiledNorm(string weightName, int headDim, int totalDim)
     {
         string key = $"_tiled_{weightName}";
         if (_scratchF32.TryGetValue(key, out var cached)) return cached;
-
         if (!_weightCache.TryGetValue(weightName, out var srcW))
-            return null; // weight not present — skip normalization
-
+            return null;
         var srcF32 = _ops.Dequantize(srcW);
         var srcData = srcF32.ReadData();
         srcF32.Dispose();
-
         int tiles = totalDim / headDim;
         var tiledData = new float[totalDim];
         for (int t = 0; t < tiles; t++)
             Array.Copy(srcData, 0, tiledData, t * headDim, headDim);
-
         var tiled = Tensor.FromData(_ops.Device, tiledData, new TensorShape(totalDim), key);
         _scratchF32[key] = tiled;
         return tiled;
     }
 
-    /// <summary>Check if a weight exists in the cache.</summary>
     protected internal bool HasWeight(string name) => _weightCache.ContainsKey(name);
-
-    /// <summary>Get global layer index from local index.</summary>
     protected internal int GlobalLayer(int localIdx) => localIdx + _layerOffset;
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -421,14 +348,50 @@ public class TransformerBase : IDisposable
         if (embCached.DataType == DataType.F32)
         {
             var f32 = _ops.Clone(embCached);
-            var resultF32 = _ops.EmbeddingLookup(tokenIds, f32, "embeddings");
+            var result = _ops.EmbeddingLookup(tokenIds, f32, "embeddings");
             f32.Dispose();
-            return resultF32;
+            return result;
         }
-        // FIX: CPU-side dequantization via DequantizeRowCpu. Reads quantized rows
-        // from GPU (KB, not GB), CPU-decodes to float[], uploads via Tensor.FromData.
-        // Zero GPU dequant dispatches — eliminates TDR and ErrorOutOfDeviceMemory.
-        return _ops.EmbeddingLookupFromQuantized(tokenIds, embCached, "embeddings");
+
+        // FIX: CPU dequant from raw bytes (full) or row-by-row GGUF reads.
+        // Both paths avoid 4.85GB GPU F32 allocation and 44 TDR-triggering Flushes.
+        if (_rawEmbeddingCpuBytes != null)
+        {
+            return _ops.EmbeddingLookupFromQuantized(tokenIds, embCached,
+                _rawEmbeddingCpuBytes, "embeddings");
+        }
+
+        if (_rawEmbeddingTensorInfo != null)
+        {
+            return EmbeddingLookupFromGgufRows(tokenIds, embCached);
+        }
+
+        // Last resort: GPU dequant with per-chunk Flush (may trigger TDR)
+        _logger.LogWarning("[EMB] No CPU path available — falling back to GPU dequant");
+        return _ops.EmbeddingLookupFromQuantized(tokenIds, embCached, null, "embeddings");
+    }
+
+    // FIX: Channel mode — read individual quantized rows from GGUF file and
+    // dequantize on CPU. Avoids both 4.85GB GPU allocation and 285MB CPU allocation.
+    private Tensor EmbeddingLookupFromGgufRows(int[] tokenIds, Tensor embCached)
+    {
+        int seqLen = tokenIds.Length;
+        int dModel = embCached.Shape[0];
+        var resultData = new float[seqLen * dModel];
+        var reader = _model.Reader;
+
+        for (int i = 0; i < seqLen; i++)
+        {
+            int tokenId = tokenIds[i];
+            ulong byteOffset = (ulong)(tokenId * _rawEmbeddingBytesPerRow);
+            byte[] rowBytes = reader.ReadTensorDataRange(_rawEmbeddingTensorInfo!,
+                byteOffset, (int)_rawEmbeddingBytesPerRow);
+            ComputeOps.DequantizeRowCpu(embCached.DataType, rowBytes, 0,
+                resultData, i * dModel, dModel);
+        }
+
+        return Tensor.FromData(_ops.Device, resultData,
+            new TensorShape(new[] { seqLen, dModel }), "embeddings");
     }
 
     private void TryAllocateScratch(string layerPrefix)
@@ -440,35 +403,40 @@ public class TransformerBase : IDisposable
         }
     }
 
+    // FIX: Channel mode — don't pre-allocate scratch for token_embd.weight (4.85GB F32).
+    // EmbeddingLookupFromQuantizedCpu handles this via CPU dequant from raw GGUF bytes.
     private void TryAllocateScratchHead()
     {
-        // FIX: token_embd.weight no longer needs a full-table F32 scratch.
-        // EmbeddingLookupOptimized uses DequantizeElements to dequantize only
-        // the needed rows (3*2048*4=24KB vs 4.85GB), avoiding ErrorOutOfDeviceMemory
-        // on AMD iGPUs with fragmented Vulkan heaps.
-        // output.weight uses MatMulWeightsLarge chunked path — no scratch needed.
+        foreach (var name in new[] { "output.weight" })
+        {
+            if (!_weightCache.TryGetValue(name, out var cached)) continue;
+            if (cached.DataType == DataType.F32) continue;
+            if (_scratchF32.ContainsKey(name)) continue;
+            try
+            {
+                var scratch = Tensor.Create(_ops.Device, cached.Shape, DataType.F32, name + "_scratch");
+                _scratchF32[name] = scratch;
+                _logger.LogDebug("[Scratch] {Name}: {SizeMB} MB F32", name, scratch.Shape.TotalElements * 4L / 1024 / 1024);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("[Scratch] {Name} failed: {Error} — will allocate per inference", name, ex.Message);
+            }
+        }
     }
 
     private void AllocateScratchWeights(string? firstLayerAttnNormName)
     {
         if (firstLayerAttnNormName == null || _nameMapper == null) return;
-
         int refLayer = _layerOffset;
-
-        // Build list of weight names to allocate scratch for.
-        // For Qwen3.6 hybrid models, Type A layers use ssm_out.weight instead of attn_output.weight.
-        // We include both to cover both layer types.
         var names = new List<string>();
 
         if (_nameMapper.HasCombinedQKV)
         {
             names.Add(_nameMapper.AttnNorm(refLayer));
             names.Add(_nameMapper.AttnQKV(refLayer));
-            // attn_output.weight may not exist for Type A layers (Qwen3.6 uses ssm_out.weight)
             names.Add(_nameMapper.AttnOutput(refLayer));
-            // ssm_out.weight is used as output projection for Type A layers
             names.Add($"blk.{refLayer}.ssm_out.weight");
-            // SSM/GDN weights (Qwen3.6 Type A layers)
             names.Add($"blk.{refLayer}.ssm_alpha.weight");
             names.Add($"blk.{refLayer}.ssm_beta.weight");
             names.Add($"blk.{refLayer}.ssm_conv1d.weight");
@@ -489,20 +457,14 @@ public class TransformerBase : IDisposable
             names.Add(_nameMapper.FfnGate(refLayer));
             names.Add(_nameMapper.FfnUp(refLayer));
             names.Add(_nameMapper.FfnDown(refLayer));
-
-            // ── Gemma 4 extras ────────────────────────────────────────────────
             names.Add($"blk.{refLayer}.attn_post_norm.weight");
             names.Add($"blk.{refLayer}.ffn_post_norm.weight");
             names.Add($"blk.{refLayer}.layer_out_scale.weight");
-
-            // ── DeepSeek V2/V3/V4 extras ───────────────────────────────────────
-            // MLA weights (compressed attention)
             names.Add($"blk.{refLayer}.attn_q_a.weight");
             names.Add($"blk.{refLayer}.attn_q_b.weight");
             names.Add($"blk.{refLayer}.attn_kv_a_mqa.weight");
             names.Add($"blk.{refLayer}.attn_k_b.weight");
             names.Add($"blk.{refLayer}.attn_v_b.weight");
-            // MoE shared expert (shexp)
             names.Add($"blk.{refLayer}.ffn_gate_shexp.weight");
             names.Add($"blk.{refLayer}.ffn_up_shexp.weight");
             names.Add($"blk.{refLayer}.ffn_down_shexp.weight");
@@ -516,98 +478,25 @@ public class TransformerBase : IDisposable
         {
             if (!_weightCache.TryGetValue(name, out var cached)) continue;
             if (cached.DataType == DataType.F32) continue;
-
             var scratch = Tensor.Create(_ops.Device, cached.Shape, DataType.F32, name + "_scratch");
             var key = prefixLen > 0 ? name[prefixLen..] : name;
             _scratchF32[key] = scratch;
-
         }
-
-        _logger.LogInformation("[LOAD] Scratch buffers allocated: {Count} tensors", _scratchF32.Count);
     }
 
-    /// <summary>
-    /// Read a single embedding row as float[] via CPU GGUF read + compact GPU dequant.
-    /// Reads quantized bytes directly from GGUF file (CPU), packs into a compact 1-row
-    /// GPU buffer, dequantizes with elementOffset=0. No VRAM allocation for full table.
-    /// </summary>
-    private float[] ReadEmbeddingRow(int tokenId)
-    {
-        var embCached = _weightCache["token_embd.weight"];
-        int dim = embCached.Shape[1];
-        if (embCached.DataType == DataType.F32)
-            return embCached.Buffer.ReadRange<float>((ulong)(tokenId * dim) * sizeof(float), dim);
-
-        // FIX: Use EmbeddingLookupFromQuantized which internally Flush()es
-        // before reading GPU buffer bytes.
-        var row = _ops.EmbeddingLookupFromQuantized(new[] { tokenId }, _weightCache["token_embd.weight"], "cpuref_row");
-        var result = row.ReadData();
-        _ops.DeferExternal(row);
-        return result;
-    }
-
+    // FIX: Channel mode — CPU reference layer 0 is skipped. TempF32("token_embd.weight")
+    // would allocate 4.85GB F32 via Dequantize→Tensor.Create, fragmenting VRAM.
+    // The CPU reference is diagnostic-only; disabling preserves VRAM for inference.
     private void RunCpuReferenceLayer0()
     {
-        try
-        {
-            // FIX: Read embedding row via row-wise GPU dequantization (2048 elements
-            // = 8 KB) instead of TempF32 which would dequantize the entire 4.85 GB
-            // table and fail with ErrorOutOfDeviceMemory on AMD iGPUs.
-            float[] emb = ReadEmbeddingRow(1); // BOS token
-
-            // BUGFIX: norm weight is quantized in _weightCache — must dequantize first, not read raw bytes as floats.
-            var (normF32, normIsScratch) = TempF32("blk.0.attn_norm.weight");
-            float[] normW = normF32.Buffer.Read<float>();
-            if (!normIsScratch) normF32.Dispose();
-            float sumSq = 0f; foreach (var v in emb) sumSq += v * v;
-            float rms = MathF.Sqrt(sumSq / 2048 + 1e-5f);
-            float[] xn = new float[2048];
-            for (int i = 0; i < 2048; i++) xn[i] = emb[i] / rms * normW[i];
-
-            _logger.LogTrace("[CPURef] BOS emb[:3]=[{E0:F5},{E1:F5},{E2:F5}] rms={Rms:F6}", emb[0], emb[1], emb[2], rms);
-            _logger.LogTrace("[CPURef] xnorm[:3]=[{X0:F5},{X1:F5},{X2:F5}] maxAbs={MaxAbs:F4}", xn[0], xn[1], xn[2], xn.Max(MathF.Abs));
-
-            var wqF32 = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
-            float[] wqData = wqF32.Buffer.ReadRange<float>(0, 2048 * 4); wqF32.Dispose();
-            float[] q4 = new float[4];
-            for (int n = 0; n < 4; n++)
-                for (int k = 0; k < 2048; k++) q4[n] += xn[k] * wqData[k + n * 2048];
-            _logger.LogTrace("[CPURef] Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", q4[0], q4[1], q4[2], q4[3]);
-
-            var wvData = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
-            float[] wvArr = wvData.Buffer.ReadRange<float>(0, 2048 * 4); wvData.Dispose();
-            float[] bosV4 = new float[4];
-            for (int n = 0; n < 4; n++) for (int k = 0; k < 2048; k++) bosV4[n] += xn[k] * wvArr[k + n * 2048];
-            _logger.LogTrace("[CPURef] BOS V[:4]=[{V0:F5},{V1:F5},{V2:F5},{V3:F5}]", bosV4[0], bosV4[1], bosV4[2], bosV4[3]);
-            var wvGpu = _ops.Dequantize(_weightCache["blk.0.attn_v.weight"]);
-            var xnT = Tensor.FromData(_ops.Device, xn, new TensorShape(new[] { 1, 2048 }), "xn_bos_v");
-            var bosVgpu = _ops.MatMulWeights(xnT, wvGpu, "V_bos");
-            float[] gv = bosVgpu.Buffer.ReadRange<float>(0, 4);
-            _ops.DeferExternal(bosVgpu); _ops.DeferExternal(xnT); _ops.DeferExternal(wvGpu);
-            _logger.LogTrace("[CPURef] BOS GPU V[:4]=[{V0:F5},{V1:F5},{V2:F5},{V3:F5}] match={Match}", gv[0], gv[1], gv[2], gv[3], Math.Abs(bosV4[0] - gv[0]) < 1e-3f);
-
-            var wqF32Tensor = _ops.Dequantize(_weightCache["blk.0.attn_q.weight"]);
-            var xnTensor = Tensor.FromData(_ops.Device, xn, new TensorShape(new[] { 1, 2048 }), "xn_bos");
-            var gpuQ = _ops.MatMulWeights(xnTensor, wqF32Tensor, "Q_bos");
-            float[] gq = gpuQ.Buffer.ReadRange<float>(0, 4);
-            _ops.DeferExternal(gpuQ); _ops.DeferExternal(xnTensor); _ops.DeferExternal(wqF32Tensor);
-            _logger.LogTrace("[CPURef] GPU Q[:4]=[{Q0:F5},{Q1:F5},{Q2:F5},{Q3:F5}]", gq[0], gq[1], gq[2], gq[3]);
-            _logger.LogTrace("[CPURef] Q match={Match} diff={Diff:F6}", Math.Abs(q4[0] - gq[0]) < 1e-3f, Math.Abs(q4[0] - gq[0]));
-
-            _ops.Flush();
-        }
-        catch (Exception ex) { _logger.LogTrace(ex, "[CPURef] FAILED"); }
+        _logger.LogWarning("[CPURef] SKIPPED — disabled in Channel mode to preserve VRAM");
     }
 
     // ── Weight cache helpers ──────────────────────────────────────────────────
 
-    /// <summary>
-    /// Cache layer weights. Override in subclass to add format-specific weights.
-    /// </summary>
     protected virtual void CacheLayerWeights(int globalLayer)
     {
         var nm = _nameMapper!;
-
         TryCacheWeight(nm.AttnNorm(globalLayer));
 
         bool layerHasCombined = _model.Tensors.Any(t => t.Name == $"blk.{globalLayer}.attn_qkv.weight");
@@ -616,7 +505,6 @@ public class TransformerBase : IDisposable
         if (layerHasCombined)
         {
             TryCacheWeight($"blk.{globalLayer}.attn_qkv.weight");
-            // Qwen3.6 Type A: attn_gate.weight [dModel, qDim] for gated Q
             TryCacheWeight($"blk.{globalLayer}.attn_gate.weight");
         }
         else if (layerHasSeparate)
@@ -627,17 +515,11 @@ public class TransformerBase : IDisposable
             TryCacheWeight($"blk.{globalLayer}.attn_q_norm.weight");
             TryCacheWeight($"blk.{globalLayer}.attn_k_norm.weight");
             TryCacheWeight($"blk.{globalLayer}.attn_output.weight");
-            // Qwen3.6 Type B: attn_gate.weight may be present for gated Q
             TryCacheWeight($"blk.{globalLayer}.attn_gate.weight");
         }
 
         if (layerHasCombined)
-        {
-            // For Qwen3.6 Type A, attn_output.weight does NOT exist.
-            // ssm_out.weight [qDim, dModel] serves as attention output projection.
-            // Try attn_output.weight first (for models that have it), then fall through.
             TryCacheWeight(nm.AttnOutput(globalLayer));
-        }
 
         TryCacheWeight(nm.FfnNorm(globalLayer));
         TryCacheWeight($"blk.{globalLayer}.post_attention_norm.weight");
@@ -645,13 +527,10 @@ public class TransformerBase : IDisposable
         TryCacheWeight(nm.FfnUp(globalLayer));
         TryCacheWeight(nm.FfnDown(globalLayer));
 
-        // ── Gemma 4 extras ────────────────────────────────────────────────
         TryCacheWeight($"blk.{globalLayer}.attn_post_norm.weight");
         TryCacheWeight($"blk.{globalLayer}.ffn_post_norm.weight");
         TryCacheWeight($"blk.{globalLayer}.layer_out_scale.weight");
 
-        // ── DeepSeek V2/V3/V4 extras ───────────────────────────────────────
-        // MLA weights (compressed attention)
         TryCacheWeight($"blk.{globalLayer}.attn_q_a.weight");
         TryCacheWeight($"blk.{globalLayer}.attn_q_b.weight");
         TryCacheWeight($"blk.{globalLayer}.attn_q_a_norm.weight");
@@ -659,19 +538,15 @@ public class TransformerBase : IDisposable
         TryCacheWeight($"blk.{globalLayer}.attn_kv_a_norm.weight");
         TryCacheWeight($"blk.{globalLayer}.attn_k_b.weight");
         TryCacheWeight($"blk.{globalLayer}.attn_v_b.weight");
-        // MoE router
         TryCacheWeight($"blk.{globalLayer}.ffn_gate_inp.weight");
         TryCacheWeight($"blk.{globalLayer}.ffn_exp_probs_b.bias");
-        // MoE shared expert (shexp)
         TryCacheWeight($"blk.{globalLayer}.ffn_gate_shexp.weight");
         TryCacheWeight($"blk.{globalLayer}.ffn_up_shexp.weight");
         TryCacheWeight($"blk.{globalLayer}.ffn_down_shexp.weight");
-        // MoE routed experts (load only for diagnostic purposes)
         TryCacheWeight($"blk.{globalLayer}.ffn_gate_exps.weight");
         TryCacheWeight($"blk.{globalLayer}.ffn_up_exps.weight");
         TryCacheWeight($"blk.{globalLayer}.ffn_down_exps.weight");
 
-        // SSM weights (optional)
         TryCacheWeight($"blk.{globalLayer}.ssm_a");
         TryCacheWeight($"blk.{globalLayer}.ssm_alpha.weight");
         TryCacheWeight($"blk.{globalLayer}.ssm_beta.weight");
@@ -700,6 +575,48 @@ public class TransformerBase : IDisposable
         var dims = info.Shape.Select(s => (int)s).ToArray();
 
         _weightCache[name] = new Tensor(buffer, new TensorShape(dims), dtype, name);
+    }
+
+    // FIX: Channel mode — store embedding tensor info for row-by-row CPU dequant.
+    // Two-stage: try full ReadTensorData first (~285MB), fall back to row-by-row
+    // ReadTensorDataRange from GGUF file if full read fails or OOM.
+    private void LoadRawEmbeddingCpuBytes()
+    {
+        try
+        {
+            var embName = _nameMapper!.TokenEmbd;
+            var embTensor = _model.Tensors.FirstOrDefault(t => t.Name == embName);
+            if (embTensor == null || embTensor.Type == GGUFTensorType.F32)
+            {
+                _logger.LogInformation("[LOAD] token_embd is F32 — CPU raw bytes not needed");
+                return;
+            }
+
+            // Always store info for row-by-row fallback
+            _rawEmbeddingTensorInfo = embTensor;
+            int dModel = (int)embTensor.Shape[0];
+            int vocabSize = (int)embTensor.Shape[1];
+            _rawEmbeddingBytesPerRow = (long)embTensor.SizeInBytes / vocabSize;
+
+            // Try full read first
+            try
+            {
+                _rawEmbeddingCpuBytes = _model.Reader.ReadTensorData(embTensor);
+                _logger.LogInformation("[LOAD] Read {Size}MB raw quantized embedding to CPU (full)",
+                    _rawEmbeddingCpuBytes.Length / 1024 / 1024);
+            }
+            catch (OutOfMemoryException)
+            {
+                _logger.LogWarning("[LOAD] OOM reading full embedding — will use row-by-row GGUF reads");
+                _rawEmbeddingCpuBytes = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[LOAD] Failed to init embedding CPU path — GPU fallback");
+            _rawEmbeddingCpuBytes = null;
+            _rawEmbeddingTensorInfo = null;
+        }
     }
 
     private static DataType MapType(GGUFTensorType t) => t switch

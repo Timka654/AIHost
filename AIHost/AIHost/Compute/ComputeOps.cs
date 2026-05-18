@@ -406,38 +406,42 @@ public class ComputeOps : IDisposable
         }
     }
 
-    public unsafe Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedEmb, string? resultName = null)
+    // FIX: Channel mode — GPU dequant of full embedding table allocates 4.85GB F32
+    // in a single vkAllocateMemory call which always fails on AMD iGPU.
+    // CPU-side dequantization from raw GGUF bytes is the only working path.
+    public unsafe Tensor EmbeddingLookupFromQuantized(int[] tokenIds, Tensor quantizedEmb,
+        byte[]? rawQuantizedCpu = null, string? resultName = null)
     {
-        int dModel = quantizedEmb.Shape[0]; // GGUF: ne[0]=innermost (embedding_dim), ne[1]=vocab_size
-        int vocabSize = quantizedEmb.Shape[1];
-        long f32Size = (long)dModel * vocabSize * sizeof(float);
-        if (f32Size <= EmbeddingF32SizeThreshold)
-        {
-            var fullF32 = Dequantize(quantizedEmb);
-            DeferExternal(fullF32);
-            var res = EmbeddingLookup(tokenIds, fullF32, resultName);
-            return res;
-        }
-        // FIX: Flush pending GPU work before reading quantized data.
-        // In Channel mode, the GpuExecutor owns the Vulkan queue — reading
-        // from a GPU buffer without flushing first returns garbage/zeros.
-        Flush();
+        if (rawQuantizedCpu != null && quantizedEmb.DataType != DataType.F32)
+            return EmbeddingLookupFromQuantizedCpu(tokenIds, rawQuantizedCpu,
+                quantizedEmb.DataType, quantizedEmb.Shape[0], quantizedEmb.Shape[1], resultName);
+
+        // Fallback: GPU dequant (works only for small tables or devices with >5GB contiguous VRAM)
+        var embF32 = Dequantize(quantizedEmb, "emb_full");
+        DeferExternal(embF32);
+        return EmbeddingLookup(tokenIds, embF32, resultName);
+    }
+
+    /// <summary>
+    /// CPU-only embedding lookup: dequantize only needed rows from raw GGUF bytes.
+    /// No GPU buffer allocation, no P/Invoke, no VRAM consumption beyond the result tensor.
+    /// </summary>
+    private unsafe Tensor EmbeddingLookupFromQuantizedCpu(int[] tokenIds, byte[] rawQuantizedBytes,
+        DataType dtype, int dModel, int vocabSize, string? resultName)
+    {
         int seqLen = tokenIds.Length;
-        long bytesPerRow = (long)quantizedEmb.Buffer.Size / vocabSize;
-        var packedBytes = new byte[seqLen * bytesPerRow];
-        for (int i = 0; i < seqLen; i++)
-        {
-            ulong byteOffset = (ulong)(tokenIds[i] * bytesPerRow);
-            var rowBytes = quantizedEmb.Buffer.ReadRange<byte>(byteOffset, (int)bytesPerRow);
-            Buffer.BlockCopy(rowBytes, 0, packedBytes, (int)(i * bytesPerRow), (int)bytesPerRow);
-        }
+        long bytesPerRow = rawQuantizedBytes.Length / (long)vocabSize;
         var resultData = new float[seqLen * dModel];
+
         for (int i = 0; i < seqLen; i++)
         {
-            int rowOffset = (int)(i * bytesPerRow), destOffset = i * dModel;
-            DequantizeRowCpu(quantizedEmb.DataType, packedBytes, rowOffset, resultData, destOffset, dModel);
+            int tokenId = tokenIds[i];
+            int rowOffset = (int)(tokenId * bytesPerRow);
+            DequantizeRowCpu(dtype, rawQuantizedBytes, rowOffset, resultData, i * dModel, dModel);
         }
-        return Tensor.FromData(_device, resultData, new TensorShape(new[] { seqLen, dModel }), resultName ?? "embeddings");
+
+        return Tensor.FromData(_device, resultData,
+            new TensorShape(new[] { seqLen, dModel }), resultName ?? "embeddings");
     }
 
     public void AllocateArena(ulong sizeBytes, ulong kvCacheBytes = 0) { }
@@ -493,39 +497,14 @@ public class ComputeOps : IDisposable
         return result;
     }
 
-    private const long MaxF32AllocationBytes = 1L * 1024 * 1024 * 1024; // 1 GB
     public Tensor MatMulWeightsLarge(Tensor a, Tensor quantized, string? resultName = null)
     {
-        int M = a.Shape[0], K = a.Shape[1], N = quantized.Shape[1];
-        long fullF32 = (long)quantized.Shape.TotalElements * sizeof(float);
-        if (fullF32 <= MaxF32AllocationBytes)
-            return MatMulWeights(a, Dequantize(quantized), resultName);
-        int chunkRows = (int)(MaxF32AllocationBytes / ((long)K * sizeof(float)));
-        chunkRows = Math.Max(256, chunkRows & ~255);
-        int numChunks = (N + chunkRows - 1) / chunkRows;
-        long bytesPerRow = (long)quantized.Buffer.Size / N;
-        var result = Tensor.Create(_device, TensorShape.Matrix(M, N), DataType.F32, resultName ?? "logits");
-        // FIX: Flush before reading quantized bytes from GPU (Channel mode).
-        Flush();
-        for (int c = 0; c < numChunks; c++)
-        {
-            int start = c * chunkRows, end = Math.Min(start + chunkRows, N), actual = end - start;
-            ulong byteStart = (ulong)(start * bytesPerRow);
-            int byteCount = (int)(actual * bytesPerRow);
-            var rawBytes = quantized.Buffer.ReadRange<byte>(byteStart, byteCount);
-            var chunkBuf = _device.CreateBuffer((ulong)rawBytes.Length, BufferType.Storage, DataType.I8);
-            chunkBuf.Write(rawBytes);
-            DeferExternal(chunkBuf);
-            var chunkTensor = new Tensor(chunkBuf, TensorShape.Matrix(actual, K), quantized.DataType, "w_chunk");
-            var chunkF32 = Dequantize(chunkTensor);
-            var chunkF32T = Transpose(chunkF32);
-            DeferExternal(chunkF32);
-            var partialLogits = MatMul(a, chunkF32T, "partial_logits");
-            DeferExternal(chunkF32T);
-            ScatterCols(result, partialLogits, start);
-            DeferExternal(partialLogits);
-        }
-        return result;
+        // Dequantize whole table via chunked GPU dispatches. Per-chunk Flush inside
+        // DequantizeInto prevents TDR. Arena=0 frees VRAM for ~5GB F32 allocation.
+        // No CPU readback — safe for Channel mode.
+        var f32 = Dequantize(quantized);
+        DeferExternal(f32);
+        return MatMulWeights(a, f32, resultName);
     }
 
     // ═══════════════════════ ELEMENT-WISE ═══════════════════════
